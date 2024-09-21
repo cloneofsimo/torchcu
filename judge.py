@@ -3,14 +3,13 @@ import subprocess
 import numpy as np
 import torch
 import ctypes
-from typing import Callable, Any
+from typing import Callable
 import os
-import time
 
-def load_pytorch_function(file_path: str) -> Callable:
+def load_pytorch_function(file_path: str, function_name: str) -> Callable:
     """Load the PyTorch function from the given file."""
     module = runpy.run_path(file_path)
-    return module['torch_function']
+    return module[function_name]
 
 def load_function_signature(file_path: str) -> dict:
     """Load the function signature from the given file."""
@@ -20,8 +19,6 @@ def load_function_signature(file_path: str) -> dict:
 def transpile_to_cuda(file_path: str) -> str:
     """Transpile the PyTorch function to CUDA code."""
     output_file = file_path.replace('.py', '.cu')
-    # with open(output_file, 'w') as f:
-    #     f.write(cuda_code)
     return output_file
 
 def compile_cuda(cuda_file: str) -> str:
@@ -85,7 +82,6 @@ def compare_outputs(pytorch_output: torch.Tensor, cuda_output: np.ndarray, rtol:
     """Compare the outputs of PyTorch and CUDA implementations."""
     max_diff = np.max(np.abs(pytorch_output.cpu().numpy() - cuda_output))
     allclose = torch.allclose(pytorch_output.cpu(), torch.tensor(cuda_output), rtol=rtol, atol=atol)
-    print(cuda_output, pytorch_output.cpu())
     return allclose, max_diff
 
 def judge_transpilation(input_file: str, num_tests: int = 10) -> None:
@@ -93,15 +89,16 @@ def judge_transpilation(input_file: str, num_tests: int = 10) -> None:
     print(f"Testing transpilation of {input_file}")
 
     # Load PyTorch function and signature
-    pytorch_func = load_pytorch_function(input_file)
     signature = load_function_signature(input_file)
-    
-    print(signature)
+    function_name = signature[0]
+    pytorch_func = load_pytorch_function(input_file, function_name)
+
+    print(f"Loaded PyTorch function: {function_name} with signature {signature}")
 
     # Transpile and compile CUDA code
     cuda_file = transpile_to_cuda(input_file)
     lib_path = compile_cuda(cuda_file)
-    cuda_func = load_cuda_function(lib_path, 'torch_function')
+    cuda_func = load_cuda_function(lib_path, function_name)
 
     passed_tests = 0
     total_diff = 0
@@ -109,7 +106,6 @@ def judge_transpilation(input_file: str, num_tests: int = 10) -> None:
     for i in range(num_tests):
         # Prepare inputs
         inputs = prepare_inputs(signature)
-        print(inputs)
 
         # Run PyTorch function
         pytorch_output = run_pytorch_function(pytorch_func, inputs)
