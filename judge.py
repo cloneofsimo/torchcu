@@ -11,10 +11,34 @@ def load_pytorch_function(file_path: str, function_name: str) -> Callable:
     module = runpy.run_path(file_path)
     return module[function_name]
 
-def load_function_signature(file_path: str) -> dict:
+def load_function_signature(file_path: str) -> tuple[str, list[tuple[str, tuple, torch.dtype]]]:
     """Load the function signature from the given file."""
     module = runpy.run_path(file_path)
-    return module['function_signature']
+    name, *args = module['function_signature']
+    # validate the args follow the format
+    # ('name', (shape,), dtype)
+
+    for arg in args:
+        if not isinstance(arg, tuple):
+            raise ValueError(f"Invalid argument: {arg}")
+
+        if len(arg) != 3:
+            raise ValueError(f"Invalid argument: {arg}")
+
+        if not isinstance(arg[0], str):
+            raise ValueError(f"Invalid argument: {arg}")
+
+        if not isinstance(arg[1], tuple):
+            raise ValueError(f"Invalid argument: {arg}")
+        if len(arg[1]) < 1:
+            raise ValueError(f"Invalid argument: {arg}")
+        if not all(isinstance(dim, int) for dim in arg[1]):
+            raise ValueError(f"Invalid argument: {arg}")
+
+        if not isinstance(arg[2], torch.dtype):
+            raise ValueError(f"Invalid argument: {arg}")
+
+    return name, args
 
 def transpile_to_cuda(file_path: str) -> str:
     """Transpile the PyTorch function to CUDA code."""
@@ -30,7 +54,7 @@ def compile_cuda(cuda_file: str) -> str:
 def prepare_inputs(signature: list) -> list:
     """Prepare input tensors based on the function signature."""
     inputs = {}
-    for arg in signature[1:]:
+    for arg in signature:
         if isinstance(arg, tuple):
             inputs[arg[0]] = torch.randn(arg[1], dtype=arg[2])
         else:
@@ -43,20 +67,25 @@ def run_pytorch_function(func: Callable, inputs: dict) -> torch.Tensor:
         return func(**inputs)
 
 
-def load_cuda_function(lib_path: str, function_name: str):
+def load_cuda_function(lib_path: str, function_name: str, signature: list) -> Callable:
     lib_path = os.path.abspath(lib_path)
     lib = ctypes.CDLL(lib_path)
     func = getattr(lib, function_name)
-    func.argtypes = [
-        ctypes.c_int,  # num_args
-        ctypes.POINTER(ctypes.c_float),  # input_tensor
-        ctypes.c_int,  # input_tensor_dim0
-        ctypes.c_int,  # input_tensor_dim1
-        ctypes.POINTER(ctypes.c_float),  # weight
-        ctypes.c_int,  # weight_dim0
-        ctypes.c_int,  # weight_dim1
-        ctypes.POINTER(ctypes.c_float)  # output
+    args = [
+        ctypes.c_int # num_args
     ]
+
+    # ('input_tensor', (4, 4), torch.float32)
+    # ('weight', (4, 4), torch.float32)
+    # ('other', (2, 4, 4), torch.float32)
+    for arg in signature:
+        arg_name, arg_shape, arg_dtype = arg
+        
+        args.append(ctypes.POINTER(ctypes.c_float))
+        for dim in arg_shape:
+            args.append(ctypes.c_int)
+
+    func.argtypes = args
     func.restype = None
     return func
 
@@ -89,8 +118,7 @@ def judge_transpilation(input_file: str, num_tests: int = 10) -> None:
     print(f"Testing transpilation of {input_file}")
 
     # Load PyTorch function and signature
-    signature = load_function_signature(input_file)
-    function_name = signature[0]
+    function_name, signature = load_function_signature(input_file)
     pytorch_func = load_pytorch_function(input_file, function_name)
 
     print(f"Loaded PyTorch function: {function_name} with signature {signature}")
@@ -98,7 +126,7 @@ def judge_transpilation(input_file: str, num_tests: int = 10) -> None:
     # Transpile and compile CUDA code
     cuda_file = transpile_to_cuda(input_file)
     lib_path = compile_cuda(cuda_file)
-    cuda_func = load_cuda_function(lib_path, function_name)
+    cuda_func = load_cuda_function(lib_path, function_name, signature)
 
     passed_tests = 0
     total_diff = 0
@@ -106,6 +134,7 @@ def judge_transpilation(input_file: str, num_tests: int = 10) -> None:
     for i in range(num_tests):
         # Prepare inputs
         inputs = prepare_inputs(signature)
+        print(f"Running test {i+1} with inputs:\n{inputs}")
 
         # Run PyTorch function
         pytorch_output = run_pytorch_function(pytorch_func, inputs)
