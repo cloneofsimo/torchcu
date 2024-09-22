@@ -52,6 +52,7 @@ def load_function_signature(file_path: str) -> tuple[str, list[tuple[str, tuple,
 
     return name, args
 
+
 def transpile_to_cuda(file_path: str) -> Path:
     """Transpile the PyTorch function to CUDA code."""
     output_file = Path(file_path).with_suffix('.cu')
@@ -147,7 +148,6 @@ def judge_transpilation(input_file: Path, num_tests: int = 10) -> None:
     for i in range(num_tests):
         # Prepare inputs
         inputs = prepare_inputs(signature)
-        print(f"Running test {i+1} with inputs:\n{inputs}")
 
         # Run PyTorch function
         pytorch_output = run_pytorch_function(pytorch_func, inputs)
