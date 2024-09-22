@@ -26,21 +26,14 @@ The answer format should be like below:
 ```python
 import torch
 
-def <function_name>(<parameter_name>: torch.Tensor) -> torch.Tensor:
+def <function_name>(<parameter_name>: torch.Tensor, <parameter_name>: torch.Tensor, ...) -> torch.Tensor:
     # Your code here
 ```
 
-Example:
-### Perform a simple linear transformation and activation using bfloat16.
-```python
-import torch
-
-def torch_function(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    input_bf16 = input_tensor.to(torch.bfloat16)
-    weight_bf16 = weight.to(torch.bfloat16)
-    output = torch.matmul(input_bf16, weight_bf16.t())
-    return torch.relu(output).to(torch.float32)
-```
+4. Make it not too simple.
+The function should not be too simple like adding two tensors.
+It should have some complexity like using multiple operations or functions.
+Refer to the examples at the top.
 
 Make sure the function takes and returns torch tensors and is self-contained.
 Also, your example should have following concepts:
@@ -544,6 +537,10 @@ def generate_functions(
             continue
 
         filepath = f"{output_py_dir}/{reference_model}_{name}.py"
+        if os.path.exists(filepath):
+            filepath = (
+                f"{output_py_dir}/{reference_model}_{name}_{random.randint(0, 1000)}.py"
+            )
         with open(filepath, "w") as f:
             f.write(code)
         filepaths.append(filepath)
