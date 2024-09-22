@@ -1,36 +1,33 @@
 
 import torch
-import torch.nn.functional as F
-from torch.fft import fft, ifft
-from scipy.ndimage import binary_closing
+import torch.fft
 
-def torch_closing_conv_ifft(input_tensor: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+def conv_fft_bfloat16_function(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
-    Perform a morphological closing operation on the input tensor followed by a convolution and inverse FFT.
+    Performs convolution using FFT with bfloat16 precision.
     """
-    # Convert to binary for morphological closing
-    binary_tensor = (input_tensor > 0).float()
+    input_bf16 = input_tensor.to(torch.bfloat16)
+    weight_bf16 = weight.to(torch.bfloat16)
+    
+    # FFT Padding
+    input_padded = torch.fft.fft(torch.nn.functional.pad(input_bf16, (weight.shape[2] // 2, weight.shape[2] // 2)), dim=2)
+    weight_padded = torch.fft.fft(weight_bf16, dim=2)
 
-    # Perform morphological closing using SciPy
-    closing = binary_closing(binary_tensor.cpu().numpy())
-    closing_tensor = torch.from_numpy(closing).to(input_tensor.device)
+    # Frequency-domain multiplication
+    output_fft = input_padded * weight_padded.unsqueeze(0)
 
-    # Convolution using FFT (frequency domain)
-    input_fft = fft(closing_tensor)
-    kernel_fft = fft(kernel)
-    output_fft = input_fft * kernel_fft
-    output = ifft(output_fft)
-
-    # Return real part of the inverse FFT
-    return output.real
+    # Inverse FFT
+    output = torch.fft.ifft(output_fft, dim=2).real.to(torch.float32)
+    
+    return output
 
 function_signature = {
-    "name": "torch_closing_conv_ifft",
+    "name": "conv_fft_bfloat16_function",
     "inputs": [
-        ((16, 16, 16), torch.float32),  # Example shape
-        ((3, 3, 3), torch.float32),   # Example shape
+        ((1, 4, 8), torch.float32),  # (batch, channels, input_size)
+        ((1, 4, 3), torch.float32)   # (out_channels, in_channels, kernel_size)
     ],
     "outputs": [
-        ((16, 16, 16), torch.float32),
+        ((1, 4, 10), torch.float32) # (batch, out_channels, output_size)
     ]
 }

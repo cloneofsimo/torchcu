@@ -1,37 +1,40 @@
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
-def torch_prewitt_dropout_inplace(input_tensor: torch.Tensor, p: float) -> torch.Tensor:
+class Cutout(nn.Module):
+    def __init__(self, size):
+        super(Cutout, self).__init__()
+        self.size = size
+
+    def forward(self, x):
+        n_batch, _, h, w = x.size()
+        y = torch.zeros_like(x)
+        mask = torch.ones_like(x)
+        for batch_idx in range(n_batch):
+            # Cutout random region
+            x0 = torch.randint(0, h, (1,))
+            y0 = torch.randint(0, w, (1,))
+            x1 = torch.clamp(x0 + self.size, 0, h)
+            y1 = torch.clamp(y0 + self.size, 0, w)
+            mask[batch_idx, :, x0:x1, y0:y1] = 0
+            y[batch_idx] = x[batch_idx] * mask[batch_idx]
+        return y
+
+def cutout_function(input_tensor: torch.Tensor) -> torch.Tensor:
     """
-    Applies Prewitt gradient operator and dropout inplace to an input tensor.
+    Applies cutout to an input tensor.
     """
-    # Prewitt kernel
-    kernel_x = torch.tensor([[-1, 0, 1],
-                            [-1, 0, 1],
-                            [-1, 0, 1]], dtype=torch.float32)
-    kernel_y = torch.tensor([[-1, -1, -1],
-                            [ 0,  0,  0],
-                            [ 1,  1,  1]], dtype=torch.float32)
-
-    # Apply Prewitt operator using convolution
-    grad_x = F.conv2d(input_tensor, kernel_x.unsqueeze(0).unsqueeze(0), padding=1)
-    grad_y = F.conv2d(input_tensor, kernel_y.unsqueeze(0).unsqueeze(0), padding=1)
-
-    # Calculate gradient magnitude
-    grad_magnitude = torch.sqrt(grad_x.pow(2) + grad_y.pow(2))
-
-    # Apply dropout inplace
-    F.dropout(grad_magnitude, p=p, inplace=True)
-    return grad_magnitude
+    cutout = Cutout(size=16)
+    return cutout(input_tensor)
 
 function_signature = {
-    "name": "torch_prewitt_dropout_inplace",
+    "name": "cutout_function",
     "inputs": [
-        ((1, 1, 4, 4), torch.float32),  # Example input shape
-        (float, )
+        ((1, 3, 32, 32), torch.float32)
     ],
     "outputs": [
-        ((1, 1, 4, 4), torch.float32),  # Example output shape
+        ((1, 3, 32, 32), torch.float32)
     ]
 }

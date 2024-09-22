@@ -1,31 +1,27 @@
 
 import torch
-import torch.fft
-from torch.fft import rfft, irfft
+import torch.nn.functional as F
 
-def torch_double_linear_hilbert_inplace(input_tensor: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor) -> torch.Tensor:
+def gaussian_maxpool_function(input_tensor: torch.Tensor, kernel_size: int, stride: int) -> torch.Tensor:
     """
-    Performs a double linear transformation with Hilbert transform in between, modifies the input tensor inplace.
+    Applies a Gaussian blur to the input tensor followed by a 1D max pooling operation.
     """
-    input_tensor = input_tensor.to(torch.complex64)
-    output = torch.matmul(input_tensor, weight1.t())
-    output = torch.fft.fft(output, dim=1)
-    output[:, :output.size(1) // 2] = 0.0 + 0.0j  # Zero out negative frequencies
-    output = torch.fft.ifft(output, dim=1)
-    output = torch.matmul(output, weight2.t())
-    output = output.to(torch.float32)
-    input_tensor.copy_(output)
-    return input_tensor
+    # Gaussian blur
+    input_tensor = F.gaussian_blur(input_tensor, kernel_size=kernel_size, sigma=1.0)
+
+    # 1D max pooling with specified stride
+    output_tensor = F.max_pool1d(input_tensor, kernel_size=kernel_size, stride=stride)
+    return output_tensor
 
 
 function_signature = {
-    "name": "torch_double_linear_hilbert_inplace",
+    "name": "gaussian_maxpool_function",
     "inputs": [
-        ((4, 4), torch.float32),
-        ((4, 4), torch.float32),
-        ((4, 4), torch.float32)
+        ((1, 16, 32), torch.float32),
+        (3, torch.int32),
+        (2, torch.int32),
     ],
     "outputs": [
-        ((4, 4), torch.float32)
+        ((1, 16, 16), torch.float32),
     ]
 }

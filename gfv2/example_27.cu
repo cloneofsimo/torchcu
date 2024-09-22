@@ -2,14 +2,23 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <device_launch_parameters.h>
-#include <complex>
-#include <vector>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
 
-#include "cutlass.h"
+#include "cutlass/cutlass.h"
+#include "cutlass/conv/kernel.h"
+
+#include "cutlass/gemm/gemm.h"
+#include "cutlass/gemm/device/gemm_operation.h"
+#include "cutlass/epilogue/threadblock/epilogue_threadblock.h"
+#include "cutlass/epilogue/threadblock/linear_combine.h"
+
+#include "cutlass/util/tensor_view.h"
+
+using namespace cutlass;
 
 // Helper function to convert float to half
 __device__ __forceinline__ half float_to_half(float f) {
-    return __float2half_rn(f);
+    return __float2half(f);
 }
 
 // Helper function to convert half to float
@@ -17,65 +26,97 @@ __device__ __forceinline__ float half_to_float(half h) {
     return __half2float(h);
 }
 
-// CUDA kernel for 2D wavelet transform using Cutlass
-__global__ void wavelet_transform_kernel(const float* input_tensor, half* output_tensor, int batch_size, int height, int width) {
-    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (batch_idx < batch_size && row < height && col < width) {
-        // Calculate the complex frequency representation using FFT
-        cutlass::complex<float> complex_input = cutlass::complex<float>(input_tensor[batch_idx * height * width + row * width + col], 0.0f);
+// CUDA kernel for triplet loss with attention (using cutlass for efficient matrix multiplication)
+template <typename T>
+__global__ void triplet_loss_with_attention_kernel(const T* anchor, const T* positive, const T* negative, 
+                                                    const T* attention_weights, T* output, int batch_size, int embedding_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size) {
+        // Apply attention weights
+        T weighted_anchor[embedding_dim];
+        T weighted_positive[embedding_dim];
+        T weighted_negative[embedding_dim];
 
-        // Apply the 'db4' wavelet filter (assuming 'db4' is implemented)
-        // Example using a simple scaling factor for demonstration
-        complex_input *= 1.0f + 0.5f * cutlass::complex<float>(0.0f, 1.0f);
+        for (int j = 0; j < embedding_dim; ++j) {
+            weighted_anchor[j] = anchor[i * embedding_dim + j] * attention_weights[i];
+            weighted_positive[j] = positive[i * embedding_dim + j] * attention_weights[i];
+            weighted_negative[j] = negative[i * embedding_dim + j] * attention_weights[i];
+        }
 
-        // Convert complex output to half-precision
-        output_tensor[batch_idx * height * width * 2 + row * width * 2 + col * 2] = float_to_half(complex_input.real());
-        output_tensor[batch_idx * height * width * 2 + row * width * 2 + col * 2 + 1] = float_to_half(complex_input.imag());
+        // Calculate squared distances
+        T distance_ap = 0.0f;
+        T distance_an = 0.0f;
+
+        for (int j = 0; j < embedding_dim; ++j) {
+            distance_ap += (weighted_anchor[j] - weighted_positive[j]) * (weighted_anchor[j] - weighted_positive[j]);
+            distance_an += (weighted_anchor[j] - weighted_negative[j]) * (weighted_anchor[j] - weighted_negative[j]);
+        }
+
+        // Apply margin ranking loss
+        output[i] = (distance_an < distance_ap + 1.0f) ? 0.0f : distance_ap - distance_an + 1.0f;
     }
 }
 
 extern "C" {
 
-void torch_wavelet_transform_2d(int num_args, ...) {
+void triplet_loss_with_attention(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
-    // Extract input tensor
-    const float* input_tensor = va_arg(args, const float*);
-    int batch_size = va_arg(args, int);
-    int height = va_arg(args, int);
-    int width = va_arg(args, int);
+    const float* anchor = va_arg(args, const float*);
+    int anchor_dim0 = va_arg(args, int);
+    int anchor_dim1 = va_arg(args, int);
 
-    // Extract output tensor (assuming it's preallocated)
-    half* output_tensor = va_arg(args, half*);
+    const float* positive = va_arg(args, const float*);
+    int positive_dim0 = va_arg(args, int);
+    int positive_dim1 = va_arg(args, int);
+
+    const float* negative = va_arg(args, const float*);
+    int negative_dim0 = va_arg(args, int);
+    int negative_dim1 = va_arg(args, int);
+
+    const float* attention_weights = va_arg(args, const float*);
+    int attention_weights_dim0 = va_arg(args, int);
+    int attention_weights_dim1 = va_arg(args, int);
+
+    float* output = va_arg(args, float*);
 
     va_end(args);
 
+    int batch_size = anchor_dim0;
+    int embedding_dim = anchor_dim1;
+
     // Allocate device memory
-    float *d_input;
-    half *d_output;
-    cudaMalloc(&d_input, batch_size * height * width * sizeof(float));
-    cudaMalloc(&d_output, batch_size * height * width * 2 * sizeof(half));
+    float *d_anchor, *d_positive, *d_negative, *d_attention_weights, *d_output;
+    cudaMalloc(&d_anchor, batch_size * embedding_dim * sizeof(float));
+    cudaMalloc(&d_positive, batch_size * embedding_dim * sizeof(float));
+    cudaMalloc(&d_negative, batch_size * embedding_dim * sizeof(float));
+    cudaMalloc(&d_attention_weights, batch_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * sizeof(float));
 
     // Copy input data to device
-    cudaMemcpy(d_input, input_tensor, batch_size * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_anchor, anchor, batch_size * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_positive, positive, batch_size * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_negative, negative, batch_size * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_attention_weights, attention_weights, batch_size * sizeof(float), cudaMemcpyHostToDevice);
 
     // Launch kernel
-    dim3 threadsPerBlock(16, 16, 1);
-    dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                   (height + threadsPerBlock.y - 1) / threadsPerBlock.y,
-                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
 
-    wavelet_transform_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, batch_size, height, width);
+    triplet_loss_with_attention_kernel<float><<<numBlocks, threadsPerBlock>>>(
+        d_anchor, d_positive, d_negative, d_attention_weights, d_output, batch_size, embedding_dim
+    );
 
     // Copy result back to host
-    cudaMemcpy(output_tensor, d_output, batch_size * height * width * 2 * sizeof(half), cudaMemcpyDeviceToHost);
+    cudaMemcpy(output, d_output, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Free device memory
-    cudaFree(d_input);
+    cudaFree(d_anchor);
+    cudaFree(d_positive);
+    cudaFree(d_negative);
+    cudaFree(d_attention_weights);
     cudaFree(d_output);
 }
 

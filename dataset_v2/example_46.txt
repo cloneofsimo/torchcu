@@ -1,0 +1,411 @@
+```python
+import torch
+import torch.nn as nn
+
+class FeatureMixingBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.relu = nn.ReLU()
+        self.norm = nn.LayerNorm(out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.relu(x)
+        x = self.norm(x)
+        return x
+
+class TransformerDecoder(nn.Module):
+    def __init__(self, d_model, nhead, num_decoder_layers, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.decoder_layers = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout), num_decoder_layers)
+        self.linear = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None, tgt_key_padding_mask=None, memory_key_padding_mask=None):
+        x = self.decoder_layers(tgt, memory, tgt_mask=tgt_mask, memory_mask=memory_mask, tgt_key_padding_mask=tgt_key_padding_mask, memory_key_padding_mask=memory_key_padding_mask)
+        x = self.norm(self.linear(x))
+        return x
+
+def mixed_transformer_decoder_with_pooling(input_tensor: torch.Tensor, memory_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Performs feature mixing, adaptive pooling, and transformer decoding.
+
+    Args:
+        input_tensor (torch.Tensor): Input tensor of shape (batch_size, in_channels, seq_len).
+        memory_tensor (torch.Tensor): Memory tensor of shape (batch_size, d_model, seq_len).
+
+    Returns:
+        torch.Tensor: Output tensor of shape (batch_size, d_model, seq_len).
+    """
+
+    # Feature Mixing
+    mixing_block = FeatureMixingBlock(input_tensor.size(1), 128)
+    mixed_input = mixing_block(input_tensor.to(torch.int8))
+    mixed_input = mixed_input.to(torch.float32)
+
+    # Adaptive Pooling
+    pooled_input = nn.AdaptiveAvgPool1d(1)(mixed_input)
+    pooled_input = pooled_input.squeeze(-1)
+
+    # Transformer Decoder
+    decoder = TransformerDecoder(128, 4, 2)
+    output = decoder(pooled_input, memory_tensor)
+
+    return output
+
+function_signature = {
+    "name": "mixed_transformer_decoder_with_pooling",
+    "inputs": [
+        ((10, 100, 20), torch.float32),
+        ((10, 128, 20), torch.float32)
+    ],
+    "outputs": [
+        ((10, 128, 20), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+#define THREADS_PER_BLOCK 16
+#define BLOCKS_PER_GRID(N) ((N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK)
+
+// Feature Mixing Block
+__global__ void feature_mixing_block_kernel(const int8_t* input, float* output, int batch_size, int in_channels, int seq_len, int out_channels) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * out_channels * seq_len) {
+        int batch = i / (out_channels * seq_len);
+        int channel = (i % (out_channels * seq_len)) / seq_len;
+        int pos = (i % (out_channels * seq_len)) % seq_len;
+
+        float sum = 0.0f;
+        for (int j = 0; j < in_channels; ++j) {
+            sum += input[(batch * in_channels * seq_len) + (j * seq_len) + pos];
+        }
+        output[i] = sum;
+    }
+}
+
+// Adaptive Average Pooling 1D
+__global__ void adaptive_avg_pool1d_kernel(const float* input, float* output, int batch_size, int in_channels, int seq_len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * in_channels) {
+        int batch = i / in_channels;
+        int channel = i % in_channels;
+        float sum = 0.0f;
+        for (int j = 0; j < seq_len; ++j) {
+            sum += input[(batch * in_channels * seq_len) + (channel * seq_len) + j];
+        }
+        output[i] = sum / seq_len;
+    }
+}
+
+// Transformer Decoder Layer
+__global__ void transformer_decoder_layer_kernel(const float* tgt, const float* memory, float* output, int batch_size, int d_model, int seq_len, int nhead, float dropout) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * d_model * seq_len) {
+        int batch = i / (d_model * seq_len);
+        int pos = (i % (d_model * seq_len)) / d_model;
+        int dim = i % d_model;
+
+        // Simplified multihead attention (assuming no masking)
+        float sum = 0.0f;
+        for (int k = 0; k < seq_len; ++k) {
+            float dot = 0.0f;
+            for (int j = 0; j < d_model; ++j) {
+                dot += tgt[(batch * d_model * seq_len) + (j * seq_len) + k] * memory[(batch * d_model * seq_len) + (j * seq_len) + pos];
+            }
+            sum += dot;
+        }
+        sum /= nhead; // Average over heads (simplified)
+        sum *= (1.0f - dropout); // Apply dropout (simplified)
+
+        output[i] = sum + tgt[i];
+    }
+}
+
+// Linear Layer
+__global__ void linear_layer_kernel(const float* input, float* output, int batch_size, int in_features, int out_features) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * out_features) {
+        int batch = i / out_features;
+        int dim = i % out_features;
+        float sum = 0.0f;
+        for (int j = 0; j < in_features; ++j) {
+            sum += input[(batch * in_features) + j];
+        }
+        output[i] = sum;
+    }
+}
+
+// Layer Normalization
+__global__ void layer_norm_kernel(const float* input, float* output, int batch_size, int features, float gamma, float beta) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * features) {
+        int batch = i / features;
+        int dim = i % features;
+
+        float sum = 0.0f;
+        for (int j = 0; j < features; ++j) {
+            sum += input[(batch * features) + j];
+        }
+        float mean = sum / features;
+
+        float variance = 0.0f;
+        for (int j = 0; j < features; ++j) {
+            variance += (input[(batch * features) + j] - mean) * (input[(batch * features) + j] - mean);
+        }
+        variance /= features;
+
+        output[i] = gamma * (input[i] - mean) / sqrtf(variance + 1e-5f) + beta;
+    }
+}
+
+extern "C" {
+
+void mixed_transformer_decoder_with_pooling(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    const float* memory_tensor = va_arg(args, const float*);
+    int memory_tensor_dim0 = va_arg(args, int);
+    int memory_tensor_dim1 = va_arg(args, int);
+    int memory_tensor_dim2 = va_arg(args, int);
+
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    int8_t* d_input;
+    float* d_mixed_input, *d_pooled_input, *d_output;
+    cudaMalloc(&d_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * sizeof(int8_t));
+    cudaMalloc(&d_mixed_input, input_tensor_dim0 * 128 * input_tensor_dim2 * sizeof(float));
+    cudaMalloc(&d_pooled_input, input_tensor_dim0 * 128 * sizeof(float));
+    cudaMalloc(&d_output, input_tensor_dim0 * 128 * input_tensor_dim2 * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mixed_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_output, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Feature Mixing
+    feature_mixing_block_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128 * input_tensor_dim2), THREADS_PER_BLOCK>>>(
+        d_input, d_mixed_input, input_tensor_dim0, input_tensor_dim1, input_tensor_dim2, 128
+    );
+
+    // Adaptive Average Pooling 1D
+    adaptive_avg_pool1d_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128), THREADS_PER_BLOCK>>>(
+        d_mixed_input, d_pooled_input, input_tensor_dim0, 128, input_tensor_dim2
+    );
+
+    // Transformer Decoder (Simplified for demonstration)
+    for (int layer = 0; layer < 2; ++layer) {
+        transformer_decoder_layer_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128 * input_tensor_dim2), THREADS_PER_BLOCK>>>(
+            d_pooled_input, memory_tensor, d_output, input_tensor_dim0, 128, input_tensor_dim2, 4, 0.1f // Dropout simplified
+        );
+        // Linear Layer
+        linear_layer_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128), THREADS_PER_BLOCK>>>(
+            d_output, d_pooled_input, input_tensor_dim0, 128, 128
+        );
+        // Layer Normalization
+        layer_norm_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128), THREADS_PER_BLOCK>>>(
+            d_pooled_input, d_output, input_tensor_dim0, 128, 1.0f, 0.0f // Assuming default gamma and beta
+        );
+    }
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, input_tensor_dim0 * 128 * input_tensor_dim2 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_mixed_input);
+    cudaFree(d_pooled_input);
+    cudaFree(d_output);
+}
+
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+#define THREADS_PER_BLOCK 16
+#define BLOCKS_PER_GRID(N) ((N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK)
+
+// Feature Mixing Block
+__global__ void feature_mixing_block_kernel(const int8_t* input, float* output, int batch_size, int in_channels, int seq_len, int out_channels) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * out_channels * seq_len) {
+        int batch = i / (out_channels * seq_len);
+        int channel = (i % (out_channels * seq_len)) / seq_len;
+        int pos = (i % (out_channels * seq_len)) % seq_len;
+
+        float sum = 0.0f;
+        for (int j = 0; j < in_channels; ++j) {
+            sum += input[(batch * in_channels * seq_len) + (j * seq_len) + pos];
+        }
+        output[i] = sum;
+    }
+}
+
+// Adaptive Average Pooling 1D
+__global__ void adaptive_avg_pool1d_kernel(const float* input, float* output, int batch_size, int in_channels, int seq_len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * in_channels) {
+        int batch = i / in_channels;
+        int channel = i % in_channels;
+        float sum = 0.0f;
+        for (int j = 0; j < seq_len; ++j) {
+            sum += input[(batch * in_channels * seq_len) + (channel * seq_len) + j];
+        }
+        output[i] = sum / seq_len;
+    }
+}
+
+// Transformer Decoder Layer
+__global__ void transformer_decoder_layer_kernel(const float* tgt, const float* memory, float* output, int batch_size, int d_model, int seq_len, int nhead, float dropout) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * d_model * seq_len) {
+        int batch = i / (d_model * seq_len);
+        int pos = (i % (d_model * seq_len)) / d_model;
+        int dim = i % d_model;
+
+        // Simplified multihead attention (assuming no masking)
+        float sum = 0.0f;
+        for (int k = 0; k < seq_len; ++k) {
+            float dot = 0.0f;
+            for (int j = 0; j < d_model; ++j) {
+                dot += tgt[(batch * d_model * seq_len) + (j * seq_len) + k] * memory[(batch * d_model * seq_len) + (j * seq_len) + pos];
+            }
+            sum += dot;
+        }
+        sum /= nhead; // Average over heads (simplified)
+        sum *= (1.0f - dropout); // Apply dropout (simplified)
+
+        output[i] = sum + tgt[i];
+    }
+}
+
+// Linear Layer
+__global__ void linear_layer_kernel(const float* input, float* output, int batch_size, int in_features, int out_features) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * out_features) {
+        int batch = i / out_features;
+        int dim = i % out_features;
+        float sum = 0.0f;
+        for (int j = 0; j < in_features; ++j) {
+            sum += input[(batch * in_features) + j];
+        }
+        output[i] = sum;
+    }
+}
+
+// Layer Normalization
+__global__ void layer_norm_kernel(const float* input, float* output, int batch_size, int features, float gamma, float beta) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * features) {
+        int batch = i / features;
+        int dim = i % features;
+
+        float sum = 0.0f;
+        for (int j = 0; j < features; ++j) {
+            sum += input[(batch * features) + j];
+        }
+        float mean = sum / features;
+
+        float variance = 0.0f;
+        for (int j = 0; j < features; ++j) {
+            variance += (input[(batch * features) + j] - mean) * (input[(batch * features) + j] - mean);
+        }
+        variance /= features;
+
+        output[i] = gamma * (input[i] - mean) / sqrtf(variance + 1e-5f) + beta;
+    }
+}
+
+extern "C" {
+
+void mixed_transformer_decoder_with_pooling(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    const float* memory_tensor = va_arg(args, const float*);
+    int memory_tensor_dim0 = va_arg(args, int);
+    int memory_tensor_dim1 = va_arg(args, int);
+    int memory_tensor_dim2 = va_arg(args, int);
+
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    int8_t* d_input;
+    float* d_mixed_input, *d_pooled_input, *d_output;
+    cudaMalloc(&d_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * sizeof(int8_t));
+    cudaMalloc(&d_mixed_input, input_tensor_dim0 * 128 * input_tensor_dim2 * sizeof(float));
+    cudaMalloc(&d_pooled_input, input_tensor_dim0 * 128 * sizeof(float));
+    cudaMalloc(&d_output, input_tensor_dim0 * 128 * input_tensor_dim2 * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mixed_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_output, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Feature Mixing
+    feature_mixing_block_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128 * input_tensor_dim2), THREADS_PER_BLOCK>>>(
+        d_input, d_mixed_input, input_tensor_dim0, input_tensor_dim1, input_tensor_dim2, 128
+    );
+
+    // Adaptive Average Pooling 1D
+    adaptive_avg_pool1d_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128), THREADS_PER_BLOCK>>>(
+        d_mixed_input, d_pooled_input, input_tensor_dim0, 128, input_tensor_dim2
+    );
+
+    // Transformer Decoder (Simplified for demonstration)
+    for (int layer = 0; layer < 2; ++layer) {
+        transformer_decoder_layer_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128 * input_tensor_dim2), THREADS_PER_BLOCK>>>(
+            d_pooled_input, memory_tensor, d_output, input_tensor_dim0, 128, input_tensor_dim2, 4, 0.1f // Dropout simplified
+        );
+        // Linear Layer
+        linear_layer_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128), THREADS_PER_BLOCK>>>(
+            d_output, d_pooled_input, input_tensor_dim0, 128, 128
+        );
+        // Layer Normalization
+        layer_norm_kernel<<<BLOCKS_PER_GRID(input_tensor_dim0 * 128), THREADS_PER_BLOCK>>>(
+            d_pooled_input, d_output, input_tensor_dim0, 128, 1.0f, 0.0f // Assuming default gamma and beta
+        );
+    }
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, input_tensor_dim0 * 128 * input_tensor_dim2 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_mixed_input);
+    cudaFree(d_pooled_input);
+    cudaFree(d_output);
+}
+
+}
+```

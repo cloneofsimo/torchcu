@@ -1,0 +1,146 @@
+```python
+import torch
+
+def instance_norm_bf16_function(input_tensor: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps: float) -> torch.Tensor:
+    """
+    Performs instance normalization on the input tensor using bfloat16.
+    """
+    input_bf16 = input_tensor.to(torch.bfloat16)
+    gamma_bf16 = gamma.to(torch.bfloat16)
+    beta_bf16 = beta.to(torch.bfloat16)
+
+    mean = input_bf16.mean(dim=1, keepdim=True)
+    var = input_bf16.var(dim=1, keepdim=True, unbiased=False)
+    std = torch.sqrt(var + eps).to(torch.bfloat16)
+    output = (input_bf16 - mean) / std
+    output = output * gamma_bf16 + beta_bf16
+    return output.to(torch.float32)
+
+function_signature = {
+    "name": "instance_norm_bfloat16_function",
+    "inputs": [
+        ((4, 4, 4), torch.float32),
+        ((4,), torch.float32),
+        ((4,), torch.float32),
+        (float,)
+    ],
+    "outputs": [
+        ((4, 4, 4), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for instance normalization using bfloat16
+__global__ void instance_norm_kernel_bf16(const float* input_tensor, const float* gamma, const float* beta, float eps, float* output, 
+                                        int batch_size, int channels, int height, int width) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int batch = index / (channels * height * width);
+    int c = (index % (channels * height * width)) / (height * width);
+    int h = (index % (height * width)) / width;
+    int w = index % width;
+
+    if (index < batch_size * channels * height * width) {
+        float sum = 0.0f;
+        for (int i = 0; i < height * width; ++i) {
+            sum += input_tensor[batch * channels * height * width + c * height * width + i];
+        }
+        float mean = sum / (height * width);
+
+        float var_sum = 0.0f;
+        for (int i = 0; i < height * width; ++i) {
+            var_sum += (input_tensor[batch * channels * height * width + c * height * width + i] - mean) * (input_tensor[batch * channels * height * width + c * height * width + i] - mean);
+        }
+        float var = var_sum / (height * width);
+        float std = sqrtf(var + eps);
+
+        __nv_bfloat16 a = float_to_bfloat16(input_tensor[batch * channels * height * width + c * height * width + h * width + w]);
+        __nv_bfloat16 b = float_to_bfloat16(mean);
+        __nv_bfloat16 d = float_to_bfloat16(std);
+        __nv_bfloat16 e = float_to_bfloat16(gamma[c]);
+        __nv_bfloat16 f = float_to_bfloat16(beta[c]);
+
+        output[batch * channels * height * width + c * height * width + h * width + w] = bfloat16_to_float(__hmul(__hmul(__hsub(a, b), __hdiv(e, d)), f));
+    }
+}
+
+extern "C" {
+
+void instance_norm_bfloat16_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    // Extract gamma tensor
+    const float* gamma = va_arg(args, const float*);
+    int gamma_dim0 = va_arg(args, int);
+
+    // Extract beta tensor
+    const float* beta = va_arg(args, const float*);
+    int beta_dim0 = va_arg(args, int);
+
+    // Extract eps
+    float eps = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int channels = input_tensor_dim1;
+    int height = input_tensor_dim2;
+    int width = input_tensor_dim2;
+
+    // Allocate device memory
+    float *d_input, *d_gamma, *d_beta, *d_output;
+    cudaMalloc(&d_input, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_gamma, channels * sizeof(float));
+    cudaMalloc(&d_beta, channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * channels * height * width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_gamma, gamma, channels * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_beta, beta, channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size * channels * height * width + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    instance_norm_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_gamma, d_beta, eps, d_output, batch_size, channels, height, width
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * channels * height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_gamma);
+    cudaFree(d_beta);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

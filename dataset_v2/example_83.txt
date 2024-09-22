@@ -1,0 +1,185 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def spectral_contrast_int8_function(input_tensor: torch.Tensor, filter_length: int, num_filters: int,
+                                    kernel_size: int, dilation: int,
+                                    contrast_gain: float, contrast_bias: float,
+                                    min_value: float, max_value: float) -> torch.Tensor:
+    """
+    Applies spectral contrast normalization to an input tensor using int8 precision.
+    """
+    # Convert to int8
+    input_tensor = input_tensor.to(torch.int8)
+    # Apply spectral contrast
+    output = torch.nn.functional.spectral_contrast(
+        input_tensor, 
+        filter_length=filter_length, 
+        num_filters=num_filters,
+        kernel_size=kernel_size,
+        dilation=dilation,
+        contrast_gain=contrast_gain,
+        contrast_bias=contrast_bias,
+        min_value=min_value,
+        max_value=max_value
+    )
+    # Clip to range
+    output = torch.clip(output, min_value, max_value)
+    # Convert back to fp32
+    return output.to(torch.float32)
+
+function_signature = {
+    "name": "spectral_contrast_int8_function",
+    "inputs": [
+        ((10, 10, 10), torch.int8),  # Example input tensor shape
+        (10, torch.int32),  # filter_length
+        (10, torch.int32),  # num_filters
+        (3, torch.int32),  # kernel_size
+        (2, torch.int32),  # dilation
+        (1.0, torch.float32),  # contrast_gain
+        (0.0, torch.float32),  # contrast_bias
+        (0.0, torch.float32),  # min_value
+        (1.0, torch.float32),  # max_value
+    ],
+    "outputs": [
+        ((10, 10, 10), torch.float32),  # Example output tensor shape
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for spectral contrast
+__global__ void spectral_contrast_kernel(const int8_t* input, half* output,
+                                      int filter_length, int num_filters,
+                                      int kernel_size, int dilation,
+                                      float contrast_gain, float contrast_bias,
+                                      float min_value, float max_value,
+                                      int batch_size, int seq_length, int feature_dim) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int f = blockIdx.y * blockDim.y + threadIdx.y;
+    int t = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (b < batch_size && f < feature_dim && t < seq_length) {
+        int filter_start = max(0, t - (kernel_size - 1) * dilation);
+        int filter_end = min(seq_length, t + (kernel_size - 1) * dilation + 1);
+
+        // Calculate mean and variance over filter window
+        float mean = 0.0f;
+        float variance = 0.0f;
+        int filter_count = 0;
+        for (int i = filter_start; i < filter_end; i++) {
+            mean += input[b * seq_length * feature_dim + i * feature_dim + f];
+            filter_count++;
+        }
+        mean /= filter_count;
+        for (int i = filter_start; i < filter_end; i++) {
+            variance += (input[b * seq_length * feature_dim + i * feature_dim + f] - mean) * (input[b * seq_length * feature_dim + i * feature_dim + f] - mean);
+        }
+        variance /= filter_count;
+
+        // Apply spectral contrast
+        float spectral_contrast = contrast_gain * (input[b * seq_length * feature_dim + t * feature_dim + f] - mean) / sqrt(variance + 1e-6);
+        spectral_contrast += contrast_bias;
+
+        // Clip and convert to half
+        output[b * seq_length * feature_dim + t * feature_dim + f] = float_to_half(fmaxf(fminf(spectral_contrast, max_value), min_value));
+    }
+}
+
+extern "C" {
+
+void spectral_contrast_int8_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const int8_t* input = va_arg(args, const int8_t*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+    int input_dim2 = va_arg(args, int);
+
+    // Extract filter_length
+    const int* filter_length = va_arg(args, const int*);
+    int filter_length_size = va_arg(args, int);
+
+    // Extract num_filters
+    const int* num_filters = va_arg(args, const int*);
+    int num_filters_size = va_arg(args, int);
+
+    // Extract kernel_size
+    const int* kernel_size = va_arg(args, const int*);
+    int kernel_size_size = va_arg(args, int);
+
+    // Extract dilation
+    const int* dilation = va_arg(args, const int*);
+    int dilation_size = va_arg(args, int);
+
+    // Extract contrast_gain
+    const float* contrast_gain = va_arg(args, const float*);
+    int contrast_gain_size = va_arg(args, int);
+
+    // Extract contrast_bias
+    const float* contrast_bias = va_arg(args, const float*);
+    int contrast_bias_size = va_arg(args, int);
+
+    // Extract min_value
+    const float* min_value = va_arg(args, const float*);
+    int min_value_size = va_arg(args, int);
+
+    // Extract max_value
+    const float* max_value = va_arg(args, const float*);
+    int max_value_size = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory for half-precision output
+    half* d_output;
+    cudaMalloc(&d_output, input_dim0 * input_dim1 * input_dim2 * sizeof(half));
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32, 1); // Adjust block size as needed
+    dim3 numBlocks((input_dim0 + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (input_dim2 + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (input_dim1 + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    spectral_contrast_kernel<<<numBlocks, threadsPerBlock>>>(
+        input, d_output, 
+        filter_length[0], num_filters[0], 
+        kernel_size[0], dilation[0],
+        contrast_gain[0], contrast_bias[0],
+        min_value[0], max_value[0],
+        input_dim0, input_dim1, input_dim2
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, input_dim0 * input_dim1 * input_dim2 * sizeof(half), cudaMemcpyDeviceToHost);
+    cudaMemcpy(output, d_output, input_dim0 * input_dim1 * input_dim2 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

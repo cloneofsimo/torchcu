@@ -1,187 +1,179 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cutlass/cutlass.h>
-#include <cutlass/conv/kernel/default_conv2d.h>
-#include <cutlass/conv/kernel/default_conv2d_fprop.h>
-#include <cutlass/conv/kernel/default_conv2d_wgrad.h>
-#include <cutlass/conv/kernel/default_conv2d_dgrad.h>
-#include <cutlass/conv/threadblock/default_conv2d_threadblock.h>
-#include <cutlass/conv/tile_iterator/default_conv2d_tile_iterator.h>
-#include <cutlass/conv/warp/default_conv2d_warp.h>
-#include <cutlass/conv/epilogue/default_conv2d_epilogue.h>
-#include <cutlass/epilogue/threadblock/epilogue_threadblock_identity.h>
-#include <cutlass/epilogue/threadblock/epilogue_threadblock_eltwise.h>
-#include <cutlass/epilogue/threadblock/epilogue_threadblock_linear.h>
-#include <cutlass/epilogue/threadblock/epilogue_threadblock_fast_linear.h>
-#include <cutlass/epilogue/warp/epilogue_warp_identity.h>
-#include <cutlass/epilogue/warp/epilogue_warp_eltwise.h>
-#include <cutlass/epilogue/warp/epilogue_warp_linear.h>
-#include <cutlass/epilogue/warp/epilogue_warp_fast_linear.h>
-#include <cutlass/transform/threadblock/transform_threadblock_identity.h>
-#include <cutlass/transform/threadblock/transform_threadblock_linear.h>
-#include <cutlass/transform/threadblock/transform_threadblock_fast_linear.h>
-#include <cutlass/transform/warp/transform_warp_identity.h>
-#include <cutlass/transform/warp/transform_warp_linear.h>
-#include <cutlass/transform/warp/transform_warp_fast_linear.h>
-#include <cutlass/conv/tensor_op/tensor_op_identity.h>
-#include <cutlass/conv/tensor_op/tensor_op_eltwise.h>
-#include <cutlass/conv/tensor_op/tensor_op_linear.h>
-#include <cutlass/conv/tensor_op/tensor_op_fast_linear.h>
-#include <cutlass/layout/TensorNHWC.h>
-#include <cutlass/layout/TensorNCHW.h>
-#include <cutlass/layout/TensorNC.h>
-#include <cutlass/layout/TensorN.h>
-#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/epilogue/threadblock/epilogue.h>
+#include <cutlass/layout/tensor.h>
+#include <cutlass/util/tensor_view.h>
+#include <cutlass/transform/threadblock/transform.h>
+#include <cutlass/epilogue/threadblock/fast_int8.h>
+#include <cutlass/epilogue/threadblock/fast_fp16.h>
+#include <cutlass/epilogue/threadblock/linear_combination.h>
 
-#include <cmath>
-#include <cstdlib>
-#include <cassert>
-#include <cstdio>
-
-#include <algorithm>
-#include <limits>
-#include <vector>
-#include <stdexcept>
-
-#include <iostream>
-#include <fstream>
-#include <sstream>
-
+#include <device_launch_parameters.h>
 #include <stdarg.h>  // Add this for va_list, va_start, va_end
 
-#define CUDA_CHECK(x)                                                                \
-  {                                                                               \
-    cudaError_t error = (x);                                                      \
-    if (error != cudaSuccess) {                                                   \
-      fprintf(stderr, "CUDA error: %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(error));   \
-      exit(EXIT_FAILURE);                                                        \
-    }                                                                               \
-  }
+#define kThreadblockRows 128
+#define kThreadblockCols 16
+#define kWarpSize 32
+#define kSMEM_BYTES (kThreadblockRows * kThreadblockCols * sizeof(int8_t))
 
-#define CUTLASS_CHECK(x)                                                          \
-  {                                                                               \
-    cutlass::Status status = (x);                                                 \
-    if (status != cutlass::Status::kSuccess) {                                   \
-      fprintf(stderr, "CUTLASS error: %s:%d: %s\n", __FILE__, __LINE__, status.message().c_str()); \
-      exit(EXIT_FAILURE);                                                        \
-    }                                                                               \
-  }
+using namespace cutlass;
 
-#define CUTLASS_CHECK_MSG(x, msg)                                                \
-  {                                                                               \
-    cutlass::Status status = (x);                                                 \
-    if (status != cutlass::Status::kSuccess) {                                   \
-      fprintf(stderr, "CUTLASS error: %s:%d: %s\n", __FILE__, __LINE__, status.message().c_str()); \
-      fprintf(stderr, msg);                                                    \
-      exit(EXIT_FAILURE);                                                        \
-    }                                                                               \
-  }
+// CUDA kernel for matrix multiplication and ReLU using bfloat16
+__global__ void token_mixing_function_kernel(
+    const int8_t* input_tensor,
+    const int8_t* weight_qkv,
+    const int8_t* weight_out,
+    const int8_t* norm_weight,
+    const int8_t* norm_bias,
+    float* output,
+    int batch_size,
+    int seq_len,
+    int d_model
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
+    if (row < batch_size && col < seq_len) {
+        int8_t* smem = reinterpret_cast<int8_t*>(__ldg(&shared_mem[0]));
+
+        // LayerNorm
+        int8_t* norm_input = reinterpret_cast<int8_t*>(input_tensor + (row * seq_len + col) * d_model);
+        float norm_sum = 0.0f;
+        for (int i = 0; i < d_model; i++) {
+            norm_sum += norm_input[i] * norm_weight[i];
+        }
+        float norm_result = (norm_sum + norm_bias[0]) / sqrtf(d_model);
+
+        // Multiply by qkv weight
+        for (int i = 0; i < d_model; i++) {
+            smem[threadIdx.y * d_model + i] = norm_input[i] * weight_qkv[col * d_model * 3 + i];
+        }
+        __syncthreads();
+
+        // Attention
+        float q[kThreadblockCols] = {0};
+        float k[kThreadblockCols] = {0};
+        float v[kThreadblockCols] = {0};
+
+        for (int i = 0; i < kThreadblockCols; i++) {
+            q[i] = smem[threadIdx.y * d_model + i];
+            k[i] = smem[threadIdx.y * d_model + i + d_model];
+            v[i] = smem[threadIdx.y * d_model + i + 2 * d_model];
+        }
+
+        float attn[kThreadblockCols] = {0};
+        for (int i = 0; i < kThreadblockCols; i++) {
+            for (int j = 0; j < kThreadblockCols; j++) {
+                attn[i] += q[i] * k[j] / sqrtf(d_model);
+            }
+        }
+
+        // Softmax
+        float sum = 0.0f;
+        for (int i = 0; i < kThreadblockCols; i++) {
+            sum += expf(attn[i]);
+        }
+        for (int i = 0; i < kThreadblockCols; i++) {
+            attn[i] = expf(attn[i]) / sum;
+        }
+
+        // Apply attention
+        float result[kThreadblockCols] = {0};
+        for (int i = 0; i < kThreadblockCols; i++) {
+            for (int j = 0; j < kThreadblockCols; j++) {
+                result[i] += attn[i] * v[j];
+            }
+        }
+
+        // Multiply by weight_out
+        float output_sum = 0.0f;
+        for (int i = 0; i < kThreadblockCols; i++) {
+            output_sum += result[i] * weight_out[i * d_model + threadIdx.x];
+        }
+        output[(row * seq_len + col) * d_model + threadIdx.x] = output_sum;
+    }
+}
 
 extern "C" {
-  void torch_mel_spectrogram_cutlass(int num_args, ...) {
-      va_list args;
-      va_start(args, num_args);
+void token_mixing_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
 
-      // Extract input tensor
-      const float* input_tensor = va_arg(args, const float*);
-      int input_tensor_dim0 = va_arg(args, int);
-      int input_tensor_dim1 = va_arg(args, int);
+    // Extract input tensor
+    const int8_t* input_tensor = va_arg(args, const int8_t*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
 
-      // Extract sample rate
-      int sample_rate = va_arg(args, int);
-      int n_fft = va_arg(args, int);
-      int hop_length = va_arg(args, int);
-      int win_length = va_arg(args, int);
-      int n_mels = va_arg(args, int);
-      float f_min = va_arg(args, double);
-      float f_max = va_arg(args, double);
-      bool center = va_arg(args, int);
-      const char* pad_mode = va_arg(args, char*);
-      float power = va_arg(args, double);
+    // Extract weight_qkv tensor
+    const int8_t* weight_qkv = va_arg(args, const int8_t*);
+    int weight_qkv_dim0 = va_arg(args, int);
+    int weight_qkv_dim1 = va_arg(args, int);
 
-      // Extract output tensor (assuming it's preallocated)
-      float* output = va_arg(args, float*);
+    // Extract weight_out tensor
+    const int8_t* weight_out = va_arg(args, const int8_t*);
+    int weight_out_dim0 = va_arg(args, int);
+    int weight_out_dim1 = va_arg(args, int);
 
-      va_end(args);
+    // Extract norm_weight tensor
+    const int8_t* norm_weight = va_arg(args, const int8_t*);
+    int norm_weight_dim0 = va_arg(args, int);
 
-      int batch_size = input_tensor_dim0;
-      int input_dim = input_tensor_dim1;
+    // Extract norm_bias tensor
+    const int8_t* norm_bias = va_arg(args, const int8_t*);
+    int norm_bias_dim0 = va_arg(args, int);
 
-      // Allocate device memory
-      float *d_input, *d_output;
-      CUDA_CHECK(cudaMalloc(&d_input, batch_size * input_dim * sizeof(float)));
-      CUDA_CHECK(cudaMalloc(&d_output, batch_size * n_mels * (input_dim/hop_length - 1) * sizeof(float)));
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
 
-      // Copy input data to device
-      CUDA_CHECK(cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice));
+    va_end(args);
 
-      // --- Cutlass Mel Spectrogram Computation ---
+    // Calculate kernel dimensions
+    int batch_size = input_tensor_dim0;
+    int seq_len = input_tensor_dim1;
+    int d_model = input_tensor_dim2;
 
-      // Define the shape of the input and output tensors
-      int input_channels = 1;
-      int output_channels = n_mels;
-      int filter_size = n_fft;
+    // Allocate device memory
+    int8_t *d_input, *d_weight_qkv, *d_weight_out, *d_norm_weight, *d_norm_bias;
+    float *d_output;
+    cudaMalloc(&d_input, batch_size * seq_len * d_model * sizeof(int8_t));
+    cudaMalloc(&d_weight_qkv, weight_qkv_dim0 * weight_qkv_dim1 * sizeof(int8_t));
+    cudaMalloc(&d_weight_out, weight_out_dim0 * weight_out_dim1 * sizeof(int8_t));
+    cudaMalloc(&d_norm_weight, norm_weight_dim0 * sizeof(int8_t));
+    cudaMalloc(&d_norm_bias, norm_bias_dim0 * sizeof(int8_t));
+    cudaMalloc(&d_output, batch_size * seq_len * d_model * sizeof(float));
 
-      // Kernel configuration for Cutlass
-      cutlass::conv::kernel::DefaultConv2d<
-          cutlass::layout::TensorNHWC,
-          cutlass::layout::TensorNCHW,
-          cutlass::layout::TensorNHWC,
-          cutlass::float32_t,
-          cutlass::float32_t,
-          cutlass::float32_t,
-          cutlass::arch::Sm80,
-          cutlass::epilogue::threadblock::EpilogueThreadblockIdentity<cutlass::float32_t>,
-          cutlass::transform::threadblock::TransformThreadblockIdentity<cutlass::float32_t>,
-          cutlass::conv::tensor_op::TensorOpIdentity<cutlass::float32_t>,
-          cutlass::conv::warp::WarpDefaultConv2d<cutlass::float32_t,
-          cutlass::epilogue::warp::EpilogueWarpIdentity<cutlass::float32_t>>,
-          cutlass::conv::tile_iterator::DefaultConv2dTileIterator<cutlass::float32_t>,
-          cutlass::conv::threadblock::DefaultConv2dThreadblock<cutlass::float32_t,
-          cutlass::arch::Sm80,
-          cutlass::epilogue::threadblock::EpilogueThreadblockIdentity<cutlass::float32_t>,
-          cutlass::transform::threadblock::TransformThreadblockIdentity<cutlass::float32_t>,
-          cutlass::conv::tensor_op::TensorOpIdentity<cutlass::float32_t>>> conv_kernel;
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * seq_len * d_model * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight_qkv, weight_qkv, weight_qkv_dim0 * weight_qkv_dim1 * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight_out, weight_out, weight_out_dim0 * weight_out_dim1 * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_norm_weight, norm_weight, norm_weight_dim0 * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_norm_bias, norm_bias, norm_bias_dim0 * sizeof(int8_t), cudaMemcpyHostToDevice);
 
-      // Define the problem size and number of threads for Cutlass kernel
-      cutlass::conv::gemm::GemmCoord problem_size{batch_size, output_channels, input_channels * filter_size};
-      cutlass::gemm::GemmCoord threadblock_shape{128, 1, 1};
+    // Launch kernel
+    dim3 threadsPerBlock(kThreadblockCols, kThreadblockRows);
+    dim3 numBlocks((seq_len + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-      // Create a Cutlass GEMM operator and configure it
-      cutlass::gemm::device::Gemm<cutlass::float32_t, cutlass::float32_t, cutlass::float32_t,
-      cutlass::arch::Sm80,
-      cutlass::layout::TensorNCHW,
-      cutlass::layout::TensorNCHW,
-      cutlass::layout::TensorNCHW,
-      cutlass::gemm::GemmShape<128, 128, 128>,
-      cutlass::gemm::GemmShape<64, 16, 32>,
-      cutlass::gemm::GemmShape<64, 1, 32>> gemm_op;
+    token_mixing_function_kernel<<<numBlocks, threadsPerBlock, kSMEM_BYTES>>>(
+        d_input, d_weight_qkv, d_weight_out, d_norm_weight, d_norm_bias, d_output,
+        batch_size, seq_len, d_model
+    );
 
-      // Define workspace size for Cutlass
-      size_t workspace_size = gemm_op.get_workspace_size(problem_size, threadblock_shape);
-      void *workspace = nullptr;
-      CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * seq_len * d_model * sizeof(float), cudaMemcpyDeviceToHost);
 
-      // Define pointers for the Cutlass GEMM operation
-      cutlass::float32_t* d_weights = reinterpret_cast<cutlass::float32_t*>(d_input);
-      cutlass::float32_t* d_activations = reinterpret_cast<cutlass::float32_t*>(d_input);
-      cutlass::float32_t* d_output_cutlass = reinterpret_cast<cutlass::float32_t*>(d_output);
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight_qkv);
+    cudaFree(d_weight_out);
+    cudaFree(d_norm_weight);
+    cudaFree(d_norm_bias);
+    cudaFree(d_output);
+}
 
-      // Launch the Cutlass GEMM operation
-      gemm_op.run(problem_size, threadblock_shape, d_weights, d_activations, d_output_cutlass, workspace);
-
-      // Free workspace memory
-      CUDA_CHECK(cudaFree(workspace));
-
-      // --- End Cutlass Mel Spectrogram Computation ---
-
-      // Copy result back to host
-      CUDA_CHECK(cudaMemcpy(output, d_output, batch_size * n_mels * (input_dim/hop_length - 1) * sizeof(float), cudaMemcpyDeviceToHost));
-
-      // Free device memory
-      CUDA_CHECK(cudaFree(d_input));
-      CUDA_CHECK(cudaFree(d_output));
-  }
-}  // extern "C"
+} // extern "C"

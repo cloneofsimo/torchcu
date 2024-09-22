@@ -1,52 +1,34 @@
 
 import torch
-import torch.nn.functional as F
+from torch import Tensor
+from torch.linalg import cholesky
+from torch.nn.functional import pairwise_distance
+import cutlass
 
-def torch_transformer_decoder_fp16_function(input_tensor: torch.Tensor, 
-                                           memory_tensor: torch.Tensor,
-                                           query_tensor: torch.Tensor, 
-                                           key_tensor: torch.Tensor, 
-                                           value_tensor: torch.Tensor) -> torch.Tensor:
+def cholesky_hamming_layer_scaling(input_tensor: Tensor, weight: Tensor, scale_factor: float) -> Tensor:
     """
-    Performs a Transformer decoder step with FP16 precision.
+    Performs Cholesky decomposition on the input tensor, calculates pairwise Hamming distance between the input and weight,
+    and applies layer scaling decay with the given factor.
     """
-    input_fp16 = input_tensor.to(torch.float16)
-    memory_fp16 = memory_tensor.to(torch.float16)
-    query_fp16 = query_tensor.to(torch.float16)
-    key_fp16 = key_tensor.to(torch.float16)
-    value_fp16 = value_tensor.to(torch.float16)
+    # Cholesky decomposition
+    chol_input = cholesky(input_tensor)
 
-    # Multi-head attention with memory
-    attention_output = F.multihead_attention(
-        query_fp16, memory_fp16, memory_fp16, 
-        attn_mask=None,
-        key_padding_mask=None,
-        add_zero_attn=False,
-        kdim=None,
-        vdim=None,
-        dropout=0.0,
-        training=False,
-        need_weights=False
-    )
+    # Pairwise Hamming distance
+    hamming_dist = pairwise_distance(chol_input, weight, p=1)  # Hamming distance is L1 norm
 
-    # Combine input and attention output
-    decoder_input = input_fp16 + attention_output[0]
+    # Layer scaling decay
+    scaled_hamming = hamming_dist * (1 - scale_factor)
 
-    # Feedforward network
-    decoder_output = F.linear(decoder_input, weight=torch.ones(1, 1, dtype=torch.float16).cuda())
-
-    return decoder_output.to(torch.float32)
+    return scaled_hamming.to(torch.bfloat16)
 
 function_signature = {
-    "name": "torch_transformer_decoder_fp16_function",
+    "name": "cholesky_hamming_layer_scaling",
     "inputs": [
-        ((1, 5, 10), torch.float32),
-        ((1, 10, 10), torch.float32),
-        ((1, 5, 10), torch.float32),
-        ((1, 10, 10), torch.float32),
-        ((1, 10, 10), torch.float32)
+        ((8, 8), torch.float32),
+        ((8, 8), torch.float32),
+        ((), torch.float32)
     ],
     "outputs": [
-        ((1, 5, 1), torch.float32),
+        ((8, 8), torch.bfloat16)
     ]
 }

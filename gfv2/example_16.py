@@ -1,46 +1,31 @@
 
 import torch
-import torch.nn.functional as F
-from torch.nn.parameter import Parameter
 
-def torch_lightweight_conv_hardshrink_masked_attention_fp16_int8(
-    input_tensor: torch.Tensor, 
-    weight: torch.Tensor, 
-    bias: torch.Tensor, 
-    mask: torch.Tensor, 
-    threshold: float
-) -> tuple[torch.Tensor, torch.Tensor]:
+def permute_round_grad_accumulate_bf16(input_tensor: torch.Tensor, weight: torch.Tensor, scale: float) -> torch.Tensor:
     """
-    Performs a lightweight convolution, applies hard shrink activation, 
-    and then applies masked attention using int8 precision.
+    Performs the following operations:
+    1. Permutes the input tensor.
+    2. Rounds the permuted tensor to nearest integer.
+    3. Performs a matrix multiplication with the weight tensor in bfloat16.
+    4. Accumulates the gradient with the scaled weight tensor.
+    5. Returns the result in fp32.
     """
-    # Convert input and weight to fp16
-    input_tensor_fp16 = input_tensor.to(torch.float16)
-    weight_fp16 = weight.to(torch.float16)
-
-    # Perform lightweight convolution using int8
-    output_int8 = F.conv2d(input_tensor_fp16, weight_fp16, bias=bias, groups=1, padding=1).to(torch.int8)
-
-    # Apply hard shrink activation
-    output_fp16 = F.hardshrink(output_int8.to(torch.float16), lambd=threshold)
-
-    # Apply masked attention
-    output_masked = output_fp16 * mask
-
-    # Return both output tensor and the masked output tensor
-    return output_masked, output_fp16
+    input_tensor_permuted = input_tensor.permute(1, 0, 2)
+    input_tensor_rounded = torch.round(input_tensor_permuted).to(torch.bfloat16)
+    weight_bf16 = weight.to(torch.bfloat16)
+    output = torch.matmul(input_tensor_rounded, weight_bf16.t())
+    output.backward(torch.ones_like(output))
+    weight.grad.data += scale * weight.grad.data
+    return output.to(torch.float32)
 
 function_signature = {
-    "name": "torch_lightweight_conv_hardshrink_masked_attention_fp16_int8",
+    "name": "permute_round_grad_accumulate_bf16",
     "inputs": [
-        ((1, 16, 32, 32), torch.float32),
-        ((8, 16, 3, 3), torch.float32),
-        ((8,), torch.float32),
-        ((1, 1, 32, 32), torch.float32),
-        (0.5, torch.float32),
+        ((2, 3, 4), torch.float32),
+        ((4, 5), torch.float32),
+        (torch.float32)
     ],
     "outputs": [
-        ((1, 8, 32, 32), torch.float16),
-        ((1, 8, 32, 32), torch.float16)
+        ((2, 5), torch.float32),
     ]
 }

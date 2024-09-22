@@ -153,7 +153,7 @@ def make_exmample(use_these_concepts=["flash attention", "sort", "linear"]):
         prompt
         + "\n\n Also, your example should have following concepts: "
         + ", ".join(use_these_concepts)
-        + "Return Only One Example. For cuda code, cutlass or cudnn if possible to optimize further. DO NOT SKIP SINGLE LINE. IMPLELEMT EVERYTHING."
+        + "Return Only One Example. For cuda code, try your very best to come up with fastest code. DO NOT SKIP SINGLE LINE. IMPLELEMT EVERYTHING."
     )
     response = model.generate_content(prompt_with_concepts)
     return response.text
@@ -580,7 +580,7 @@ def make_set_of_examples(num_examples: int = 4000, output_dir: str = "example_da
         "unstructured_sparsity"
     ]
     
-    important_concepts = ['fp32', 'bf16', 'fp16', 'int8', 'backward', 'forward', 'inplace', 'cutlass', 'cudnn', 'pure cu']
+    important_concepts = ['fp32', 'bf16', 'fp16', 'int8', 'backward', 'forward', 'inplace', 'pure cu']
 
     # append on the existing ones
     os.makedirs(output_dir, exist_ok=True)

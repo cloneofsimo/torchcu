@@ -1,68 +1,44 @@
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda import cudnn
 
-class ModelPruningInterpolateAudioDecompression(nn.Module):
-    def __init__(self, in_channels, out_channels, pruning_ratio=0.5, interpolation_mode='linear', scale_factor=2):
-        super(ModelPruningInterpolateAudioDecompression, self).__init__()
-        self.pruning_ratio = pruning_ratio
-        self.interpolation_mode = interpolation_mode
-        self.scale_factor = scale_factor
+def gumbel_softmax_hardsigmoid_envelope_threshold(input_tensor: torch.Tensor, weights: torch.Tensor, threshold: float) -> torch.Tensor:
+    """
+    Applies Gumbel-Softmax, hardsigmoid, signal envelope, and thresholding to an input tensor.
 
-        # Define convolutional layer with pruning
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.prune_conv(self.conv, self.pruning_ratio)
+    Args:
+        input_tensor (torch.Tensor): Input tensor with shape (batch_size, features).
+        weights (torch.Tensor): Weights tensor with shape (features, output_features).
+        threshold (float): Threshold value for the final output.
 
-        # Define interpolation layer
-        self.interpolate = nn.Upsample(scale_factor=self.scale_factor, mode=self.interpolation_mode)
+    Returns:
+        torch.Tensor: Output tensor with shape (batch_size, output_features) after applying all operations.
+    """
 
-        # Define audio decompression layer
-        self.decompression = nn.Sequential(
-            nn.Linear(out_channels * 4 * 4, 1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, 16000)  # Assuming 16kHz audio output
-        )
+    # Gumbel-Softmax
+    gumbel_noise = torch.rand_like(input_tensor)
+    gumbel_noise = -torch.log(-torch.log(gumbel_noise))
+    gumbel_output = F.softmax((input_tensor + gumbel_noise) / 1.0, dim=-1)  # Temperature set to 1.0
 
-    def prune_conv(self, layer, ratio):
-        # Prune weights
-        for n, m in layer.named_modules():
-            if isinstance(m, nn.Conv2d):
-                prune.random_unstructured(m, name="weight", amount=ratio)
+    # Hardsigmoid
+    hardsigmoid_output = F.hardsigmoid(torch.matmul(gumbel_output, weights))
 
-    def forward(self, x):
-        # Convert input to bfloat16
-        x = x.to(torch.bfloat16)
+    # Signal Envelope
+    envelope_output = torch.abs(hardsigmoid_output)
 
-        # Convolution with pruning
-        x = self.conv(x)
+    # Thresholding
+    threshold_output = (envelope_output > threshold).float()
 
-        # Interpolation
-        x = self.interpolate(x)
-
-        # Flatten for audio decompression
-        x = x.view(x.size(0), -1)
-
-        # Audio decompression
-        x = self.decompression(x)
-
-        # Convert output to float32
-        x = x.to(torch.float32)
-
-        return x
-
-# Example usage:
-model = ModelPruningInterpolateAudioDecompression(in_channels=3, out_channels=16)
-input_tensor = torch.randn(1, 3, 2, 2)
-output_tensor = model(input_tensor)
+    return threshold_output
 
 function_signature = {
-    "name": "model_pruning_interpolate_audio_decompression",
+    "name": "gumbel_softmax_hardsigmoid_envelope_threshold",
     "inputs": [
-        ((1, 3, 2, 2), torch.float32)
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((), torch.float32),
     ],
     "outputs": [
-        ((1, 16000), torch.float32)
+        ((4, 4), torch.float32),
     ]
 }

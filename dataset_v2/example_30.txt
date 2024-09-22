@@ -1,0 +1,344 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def process_audio_features(input_tensor: torch.Tensor, var_tensor: torch.Tensor, 
+                           bandwidth: int, pad_value: float) -> torch.Tensor:
+    """
+    Processes audio features by applying variance normalization, spectral bandwidth filtering, 
+    and replication padding.
+
+    Args:
+        input_tensor: Input audio features (B, T, F), where B is batch size, T is time, and F is features.
+        var_tensor: Variance tensor (B, F), representing variance for each feature.
+        bandwidth: Spectral bandwidth for filtering.
+        pad_value: Value to use for replication padding.
+
+    Returns:
+        Processed audio features (B, T, F).
+    """
+    # Variance Normalization
+    input_tensor = input_tensor / var_tensor.unsqueeze(1)
+
+    # Spectral Bandwidth Filtering
+    input_tensor = torch.fft.rfft(input_tensor, dim=1)
+    frequencies = torch.fft.rfftfreq(input_tensor.shape[1], d=1.0)
+    mask = frequencies <= bandwidth
+    input_tensor = input_tensor * mask.unsqueeze(0).unsqueeze(-1).to(input_tensor.dtype)
+    input_tensor = torch.fft.irfft(input_tensor, dim=1)
+
+    # Replication Padding
+    input_tensor = F.pad(input_tensor, (0, 0, 0, 0, bandwidth, bandwidth), 'replicate', pad_value)
+
+    return input_tensor.to(torch.float16)
+
+function_signature = {
+    "name": "process_audio_features",
+    "inputs": [
+        ((10, 100, 256), torch.float32),
+        ((10, 256), torch.float32),
+        (10, torch.int32),
+        (1.0, torch.float32)
+    ],
+    "outputs": [
+        ((10, 110, 256), torch.float16)
+    ]
+}
+```
+
+```cpp
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+#include <cutlass/cutlass.h>
+#include <cutlass/epilogue/threadblock/linear_combination.h>
+#include <cutlass/epilogue/threadblock/multiply_add.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/device/gemm_config.h>
+#include <cutlass/layout/tensor.h>
+#include <cutlass/matrix_multiply/kernel.h>
+#include <cutlass/matrix_multiply/threadblock/mma_policy.h>
+#include <cutlass/matrix_multiply/threadblock/warp_mma_policy.h>
+#include <cutlass/util/host_tensor.h>
+#include <cutlass/util/tensor_view.h>
+#include <cutlass/util/type_traits.h>
+
+// Helper functions for bfloat16 conversions
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for replication padding
+__global__ void replication_padding_kernel(const float* input_tensor, float* output_tensor, 
+                                          int batch_size, int time, int features, int bandwidth, 
+                                          float pad_value) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < time + 2 * bandwidth) {
+        int input_col = col;
+        if (col < bandwidth) {
+            input_col = 0;
+        } else if (col >= time + bandwidth) {
+            input_col = time - 1;
+        }
+        output_tensor[row * (time + 2 * bandwidth) + col] = input_tensor[row * time + input_col];
+    }
+}
+
+// CUDA kernel for variance normalization
+__global__ void variance_normalization_kernel(const float* input_tensor, const float* var_tensor, 
+                                             float* output_tensor, int batch_size, int time, int features) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < time * features) {
+        int feature_index = col % features;
+        output_tensor[row * time * features + col] = input_tensor[row * time * features + col] /
+                                                   var_tensor[row * features + feature_index];
+    }
+}
+
+// CUDA kernel for spectral bandwidth filtering
+__global__ void spectral_bandwidth_filtering_kernel(const float* input_tensor, float* output_tensor, 
+                                                    int batch_size, int time, int features, 
+                                                    int bandwidth) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < time * features) {
+        int feature_index = col % features;
+        // Apply filtering only for the first half of the frequencies (real part)
+        if (col / features < time / 2) {
+            output_tensor[row * time * features + col] = input_tensor[row * time * features + col];
+        } else if (col / features >= time / 2 + bandwidth) {
+            output_tensor[row * time * features + col] = 0.0f;
+        } else {
+            output_tensor[row * time * features + col] = 0.0f;
+        }
+    }
+}
+
+// Cutlass GEMM structure for FFT computation
+template <typename T>
+struct FFTGemm {
+    // Define GEMM configuration
+    using ElementA = T;
+    using ElementB = T;
+    using ElementC = T;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+
+    // Set up threadblock and warp-level MMA policies
+    using ThreadblockMMA = cutlass::gemm::threadblock::MmaPolicy<
+        cutlass::gemm::threadblock::GemmShape<16, 16, 16>,
+        cutlass::gemm::threadblock::GemmShape<16, 16, 16>,
+        cutlass::gemm::threadblock::MmaPolicy::kDefault, 
+        cutlass::gemm::threadblock::MmaPolicy::kDefault
+    >;
+
+    using WarpMMA = cutlass::gemm::threadblock::WarpMmaPolicy<
+        cutlass::gemm::threadblock::GemmShape<8, 8, 8>,
+        cutlass::gemm::threadblock::GemmShape<8, 8, 8>, 
+        cutlass::gemm::threadblock::WarpMmaPolicy::kDefault, 
+        cutlass::gemm::threadblock::WarpMmaPolicy::kDefault
+    >;
+
+    // Define GEMM kernel configuration
+    using GemmConfig = cutlass::gemm::device::GemmConfig<
+        cutlass::gemm::device::GemmShape<128, 128, 128>, 
+        cutlass::gemm::device::GemmShape<128, 128, 128>,
+        cutlass::gemm::device::GemmShape<16, 16, 16>,
+        cutlass::gemm::device::GemmShape<16, 16, 16>,
+        LayoutA, 
+        LayoutB, 
+        LayoutC,
+        ThreadblockMMA, 
+        WarpMMA,
+        cutlass::gemm::threadblock::EpiloguePolicy<
+            cutlass::gemm::threadblock::LinearCombination, 
+            cutlass::gemm::threadblock::LinearCombination::kDefault
+        >,
+        cutlass::epilogue::threadblock::MultiplyAdd
+    >;
+};
+
+// Function to perform the FFT using Cutlass GEMM
+template <typename T>
+void perform_fft(const T* input_tensor, T* output_tensor, int batch_size, int time, int features) {
+    // Define GEMM types
+    using Gemm = cutlass::gemm::Kernel<
+        FFTGemm<T>::ElementA,
+        FFTGemm<T>::ElementB,
+        FFTGemm<T>::ElementC,
+        FFTGemm<T>::LayoutA,
+        FFTGemm<T>::LayoutB,
+        FFTGemm<T>::LayoutC,
+        FFTGemm<T>::ThreadblockMMA,
+        FFTGemm<T>::WarpMMA,
+        FFTGemm<T>::GemmConfig
+    >;
+
+    // Allocate device memory for input, output, and weights
+    T* d_input, *d_output, *d_weight;
+    cudaMalloc(&d_input, batch_size * time * features * sizeof(T));
+    cudaMalloc(&d_output, batch_size * time * features * sizeof(T));
+    cudaMalloc(&d_weight, time * time * sizeof(T));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * time * features * sizeof(T), cudaMemcpyHostToDevice);
+
+    // Generate weights for FFT on device
+    int threads_per_block = 256;
+    int blocks_per_grid = (time + threads_per_block - 1) / threads_per_block;
+    cudaLaunchKernel(
+        [](const T* weight, int time) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx < time) {
+                weight[idx] = expf(-2.0f * M_PI * 1.0f * idx / time * 1i);
+            }
+        }, 
+        blocks_per_grid, 1, 1, 
+        threads_per_block, 1, 1, 
+        0, 0, d_weight, time
+    );
+
+    // Launch GEMM kernel for FFT
+    cutlass::gemm::GemmPlan<
+        Gemm, 
+        typename Gemm::Arguments,
+        cutlass::gemm::GemmPlan::kDefault
+    > plan;
+    plan.initialize(
+        batch_size, 
+        time, 
+        features,
+        d_input, 
+        time, 
+        time, 
+        d_weight, 
+        d_output
+    );
+    plan.execute();
+
+    // Copy result back to host
+    cudaMemcpy(output_tensor, d_output, batch_size * time * features * sizeof(T), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_weight);
+}
+
+// CUDA kernel for inverse FFT
+__global__ void inverse_fft_kernel(const float* input_tensor, float* output_tensor, 
+                                      int batch_size, int time, int features) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < time * features) {
+        int feature_index = col % features;
+        output_tensor[row * time * features + col] = input_tensor[row * time * features + col] /
+                                                       time;
+    }
+}
+
+extern "C" {
+    
+void process_audio_features(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    const float* var_tensor = va_arg(args, const float*);
+    int var_tensor_dim0 = va_arg(args, int);
+    int var_tensor_dim1 = va_arg(args, int);
+
+    int bandwidth = va_arg(args, int);
+
+    float pad_value = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output_tensor = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int time = input_tensor_dim1;
+    int features = input_tensor_dim2;
+    int padded_time = time + 2 * bandwidth;
+
+    // Allocate device memory for input, output, variance, and intermediate tensors
+    float *d_input, *d_var, *d_output, *d_normalized, *d_fft, *d_filtered, *d_padded;
+    cudaMalloc(&d_input, batch_size * time * features * sizeof(float));
+    cudaMalloc(&d_var, batch_size * features * sizeof(float));
+    cudaMalloc(&d_output, batch_size * padded_time * features * sizeof(float));
+    cudaMalloc(&d_normalized, batch_size * time * features * sizeof(float));
+    cudaMalloc(&d_fft, batch_size * time * features * sizeof(float));
+    cudaMalloc(&d_filtered, batch_size * time * features * sizeof(float));
+    cudaMalloc(&d_padded, batch_size * padded_time * features * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * time * features * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_var, var_tensor, batch_size * features * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Variance normalization
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((time * features + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    variance_normalization_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_var, d_normalized, batch_size, time, features
+    );
+
+    // Forward FFT
+    perform_fft(d_normalized, d_fft, batch_size, time, features);
+
+    // Spectral bandwidth filtering
+    spectral_bandwidth_filtering_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_fft, d_filtered, batch_size, time, features, bandwidth
+    );
+
+    // Inverse FFT
+    inverse_fft_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_filtered, d_padded, batch_size, time, features
+    );
+
+    // Replication padding
+    numBlocks = ((padded_time + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    replication_padding_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_padded, d_output, batch_size, time, features, bandwidth, pad_value
+    );
+
+    // Convert output to fp16
+    cudaMemcpy(output_tensor, d_output, batch_size * padded_time * features * sizeof(float), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < batch_size * padded_time * features; i++) {
+        output_tensor[i] = __float2half_rn(output_tensor[i]);
+    }
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_var);
+    cudaFree(d_output);
+    cudaFree(d_normalized);
+    cudaFree(d_fft);
+    cudaFree(d_filtered);
+    cudaFree(d_padded);
+}
+
+}  // extern "C"
+```

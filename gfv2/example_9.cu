@@ -2,102 +2,134 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <device_launch_parameters.h>
-#include <math.h>
+#include <stdarg.h>
 
-#include "cutlass/cutlass.h"
-#include "cutlass/fast_math.h"
-#include "cutlass/util/tensor_view.h"
-#include "cutlass/util/tensor_ref.h"
+#include "cutlass.h"
+#include "cutlass/conv/kernel.h"
+#include "cutlass/conv/conv2d_problem_size.h"
 
-// Helper function to convert float to half
-__device__ __forceinline__ half float_to_half(float f) {
-    return __float2half_rn(f);
-}
-
-// Helper function to convert half to float
-__device__ __forceinline__ float half_to_float(half h) {
-    return __half2float(h);
-}
-
-// CUDA kernel for Mel-spectrogram calculation
-__global__ void mel_spectrogram_kernel(
-    const float* audio_tensor, 
-    const float* mel_filter, 
-    float* mel_spectrogram, 
-    int batch_size, 
-    int n_fft, 
-    int n_mels, 
-    int n_frames) {
-    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
-    int frame_idx = blockIdx.y * blockDim.y + threadIdx.y;
-    int mel_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (batch_idx < batch_size && frame_idx < n_frames && mel_idx < n_mels) {
-        float sum = 0.0f;
-        for (int freq_idx = 0; freq_idx < n_fft // 2 + 1; ++freq_idx) {
-            // Note: this is assuming n_fft is even. You'll need to adjust this for odd n_fft
-            half audio_val = float_to_half(audio_tensor[batch_idx * n_frames * (n_fft // 2 + 1) + frame_idx * (n_fft // 2 + 1) + freq_idx]);
-            half mel_val = float_to_half(mel_filter[mel_idx * (n_fft // 2 + 1) + freq_idx]);
-
-            sum += half_to_float(__hmul(audio_val, audio_val)) * half_to_float(mel_val);
-        }
-        mel_spectrogram[batch_idx * n_mels * n_frames + mel_idx * n_frames + frame_idx] = log1pf(sum);
-    }
-}
+using namespace cutlass;
 
 extern "C" {
 
-void torch_mel_spectrogram_function(int num_args, ...) {
+void conv3d_fp16_function(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
     // Extract input tensor
-    const float* audio_tensor = va_arg(args, const float*);
-    int audio_tensor_dim0 = va_arg(args, int);
-    int audio_tensor_dim1 = va_arg(args, int);
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+    int input_tensor_dim4 = va_arg(args, int);
 
-    // Extract mel filter tensor
-    const float* mel_filter = va_arg(args, const float*);
-    int mel_filter_dim0 = va_arg(args, int);
-    int mel_filter_dim1 = va_arg(args, int);
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+    int weight_dim3 = va_arg(args, int);
+    int weight_dim4 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
 
     // Extract output tensor (assuming it's preallocated)
-    float* mel_spectrogram = va_arg(args, float*);
+    float* output = va_arg(args, float*);
 
     va_end(args);
 
-    int batch_size = audio_tensor_dim0;
-    int n_frames = audio_tensor_dim1 / (mel_filter_dim1 - 1); 
-    int n_fft = mel_filter_dim1 * 2 - 1; // Assuming n_fft is even
-    int n_mels = mel_filter_dim0;
+    int batch_size = input_tensor_dim0;
+    int in_channels = input_tensor_dim1;
+    int in_height = input_tensor_dim2;
+    int in_width = input_tensor_dim3;
+    int in_depth = input_tensor_dim4;
+
+    int out_channels = weight_dim0;
+    int kernel_height = weight_dim2;
+    int kernel_width = weight_dim3;
+    int kernel_depth = weight_dim4;
 
     // Allocate device memory
-    float *d_audio_tensor, *d_mel_filter, *d_mel_spectrogram;
-    cudaMalloc(&d_audio_tensor, batch_size * audio_tensor_dim1 * sizeof(float));
-    cudaMalloc(&d_mel_filter, mel_filter_dim0 * mel_filter_dim1 * sizeof(float));
-    cudaMalloc(&d_mel_spectrogram, batch_size * n_mels * n_frames * sizeof(float));
+    float *d_input, *d_weight, *d_bias, *d_output;
+    cudaMalloc(&d_input, batch_size * in_channels * in_height * in_width * in_depth * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * in_channels * kernel_height * kernel_width * kernel_depth * sizeof(float));
+    cudaMalloc(&d_bias, out_channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * in_height * in_width * in_depth * sizeof(float));
 
     // Copy input data to device
-    cudaMemcpy(d_audio_tensor, audio_tensor, batch_size * audio_tensor_dim1 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_mel_filter, mel_filter, mel_filter_dim0 * mel_filter_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * in_height * in_width * in_depth * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, out_channels * in_channels * kernel_height * kernel_width * kernel_depth * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, out_channels * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Launch kernel
-    dim3 threadsPerBlock(16, 16, 1);
-    dim3 numBlocks((n_mels + threadsPerBlock.x - 1) / threadsPerBlock.x, 
-                   (n_frames + threadsPerBlock.y - 1) / threadsPerBlock.y,
-                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    // Cutlass conv3d configuration
+    // Note: this assumes a simple conv3d with stride=1 and padding=1
+    // Customize this based on your specific needs.
+    int N = batch_size;
+    int K = out_channels;
+    int C = in_channels;
+    int H = in_height;
+    int W = in_width;
+    int D = in_depth;
+    int R = kernel_height;
+    int S = kernel_width;
+    int T = kernel_depth;
+    int stride_h = 1;
+    int stride_w = 1;
+    int stride_d = 1;
+    int pad_h = 1;
+    int pad_w = 1;
+    int pad_d = 1;
 
-    mel_spectrogram_kernel<<<numBlocks, threadsPerBlock>>>(
-        d_audio_tensor, d_mel_filter, d_mel_spectrogram, batch_size, n_fft, n_mels, n_frames
+    // Define Cutlass problem size
+    conv::Conv2dProblemSize problem_size(
+        N, K, C,
+        H, W,
+        R, S,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        H, W
+    );
+
+    // Define Cutlass kernel
+    // Note: You may need to adjust the template parameters based on your architecture and preferences.
+    cutlass::conv::kernel::Conv2d<
+        cutlass::layout::TensorNHWC,
+        cutlass::layout::TensorNHWC,
+        cutlass::layout::TensorNHWC,
+        cutlass::epilogue::threadblock::Linear,
+        cutlass::arch::Sm75,
+        cutlass::float16_t,
+        cutlass::float16_t,
+        cutlass::float16_t,
+        cutlass::float16_t,
+        cutlass::float16_t,
+        cutlass::float16_t
+    > conv_kernel;
+
+    // Define Cutlass workspace
+    cutlass::conv::Conv2dWorkspace<cutlass::float16_t> workspace(problem_size);
+
+    // Launch Cutlass conv3d
+    conv_kernel.run(
+        d_input,
+        d_weight,
+        d_output,
+        d_bias,
+        problem_size,
+        workspace
     );
 
     // Copy result back to host
-    cudaMemcpy(mel_spectrogram, d_mel_spectrogram, batch_size * n_mels * n_frames * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(output, d_output, batch_size * out_channels * in_height * in_width * in_depth * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Free device memory
-    cudaFree(d_audio_tensor);
-    cudaFree(d_mel_filter);
-    cudaFree(d_mel_spectrogram);
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
 }
 
 }  // extern "C"

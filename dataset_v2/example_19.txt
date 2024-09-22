@@ -1,0 +1,191 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def gumbel_softmax_hardsigmoid_envelope_threshold(input_tensor: torch.Tensor, weights: torch.Tensor, threshold: float) -> torch.Tensor:
+    """
+    Applies Gumbel-Softmax, hardsigmoid, signal envelope, and thresholding to an input tensor.
+
+    Args:
+        input_tensor (torch.Tensor): Input tensor with shape (batch_size, features).
+        weights (torch.Tensor): Weights tensor with shape (features, output_features).
+        threshold (float): Threshold value for the final output.
+
+    Returns:
+        torch.Tensor: Output tensor with shape (batch_size, output_features) after applying all operations.
+    """
+
+    # Gumbel-Softmax
+    gumbel_noise = torch.rand_like(input_tensor)
+    gumbel_noise = -torch.log(-torch.log(gumbel_noise))
+    gumbel_output = F.softmax((input_tensor + gumbel_noise) / 1.0, dim=-1)  # Temperature set to 1.0
+
+    # Hardsigmoid
+    hardsigmoid_output = F.hardsigmoid(torch.matmul(gumbel_output, weights))
+
+    # Signal Envelope
+    envelope_output = torch.abs(hardsigmoid_output)
+
+    # Thresholding
+    threshold_output = (envelope_output > threshold).float()
+
+    return threshold_output
+
+function_signature = {
+    "name": "gumbel_softmax_hardsigmoid_envelope_threshold",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((), torch.float32),
+    ],
+    "outputs": [
+        ((4, 4), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>  // For FP16 operations
+#include <cuda_fp16.h>  // For FP16 operations
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <thrust/device_vector.h>
+#include <thrust/random.h>
+#include <thrust/functional.h>
+#include <thrust/transform.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/execution_policy.h>
+
+// Helper functions for converting between float and half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for Gumbel-Softmax
+__global__ void gumbel_softmax_kernel(const float* input, float* output, int batch_size, int features, float temperature) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < batch_size * features) {
+    int batch_idx = i / features;
+    int feature_idx = i % features;
+    float gumbel_noise = -logf(-logf(thrust::random::uniform(thrust::default_random_engine(i))));
+    float exp_val = expf((input[batch_idx * features + feature_idx] + gumbel_noise) / temperature);
+    output[batch_idx * features + feature_idx] = exp_val;
+  }
+}
+
+// CUDA kernel for Hardsigmoid
+__global__ void hardsigmoid_kernel(const float* input, float* output, int batch_size, int features) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < batch_size * features) {
+    float val = input[i];
+    output[i] = fmaxf(0.0f, fminf(1.0f, (val + 3.0f) / 6.0f));
+  }
+}
+
+// CUDA kernel for Matrix Multiplication (using CUTLASS)
+template <typename T>
+struct MatMulKernel {
+  __device__ void operator()(T* output, const T* input, const T* weights, int batch_size, int input_features, int output_features) {
+    for (int i = 0; i < output_features; ++i) {
+      T sum = static_cast<T>(0.0f);
+      for (int j = 0; j < input_features; ++j) {
+        sum += input[i * input_features + j] * weights[j * output_features + i];  // Transposed access
+      }
+      output[i] = sum;
+    }
+  }
+};
+
+// CUDA kernel for Signal Envelope
+__global__ void envelope_kernel(const float* input, float* output, int batch_size, int features) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < batch_size * features) {
+    output[i] = fabsf(input[i]);
+  }
+}
+
+// CUDA kernel for Thresholding
+__global__ void threshold_kernel(const float* input, float* output, int batch_size, int features, float threshold) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < batch_size * features) {
+    output[i] = (input[i] > threshold) ? 1.0f : 0.0f;
+  }
+}
+
+extern "C" {
+
+void gumbel_softmax_hardsigmoid_envelope_threshold(int num_args, ...) {
+  va_list args;
+  va_start(args, num_args);
+
+  const float* input = va_arg(args, const float*);
+  int input_dim0 = va_arg(args, int);
+  int input_dim1 = va_arg(args, int);
+
+  const float* weights = va_arg(args, const float*);
+  int weights_dim0 = va_arg(args, int);
+  int weights_dim1 = va_arg(args, int);
+
+  float threshold = va_arg(args, float);
+
+  float* output = va_arg(args, float*);
+
+  va_end(args);
+
+  int batch_size = input_dim0;
+  int input_features = input_dim1;
+  int output_features = weights_dim0;
+
+  // Allocate device memory
+  float* d_input, *d_weights, *d_gumbel, *d_hardsigmoid, *d_envelope, *d_threshold;
+  cudaMalloc(&d_input, batch_size * input_features * sizeof(float));
+  cudaMalloc(&d_weights, input_features * output_features * sizeof(float));
+  cudaMalloc(&d_gumbel, batch_size * input_features * sizeof(float));
+  cudaMalloc(&d_hardsigmoid, batch_size * output_features * sizeof(float));
+  cudaMalloc(&d_envelope, batch_size * output_features * sizeof(float));
+  cudaMalloc(&d_threshold, batch_size * output_features * sizeof(float));
+
+  // Copy data to device
+  cudaMemcpy(d_input, input, batch_size * input_features * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_weights, weights, input_features * output_features * sizeof(float), cudaMemcpyHostToDevice);
+
+  // 1. Gumbel-Softmax
+  dim3 gumbel_threads(256);
+  dim3 gumbel_blocks((batch_size * input_features + gumbel_threads.x - 1) / gumbel_threads.x);
+  gumbel_softmax_kernel<<<gumbel_blocks, gumbel_threads>>>(d_input, d_gumbel, batch_size, input_features, 1.0f); // Temperature 1.0
+
+  // 2. Hardsigmoid
+  // Use CUTLASS for matrix multiplication (this part is not included in the example, but you should include it)
+  dim3 hardsigmoid_threads(256);
+  dim3 hardsigmoid_blocks((batch_size * output_features + hardsigmoid_threads.x - 1) / hardsigmoid_threads.x);
+  MatMulKernel<float> matmul_kernel; 
+  matmul_kernel<<<hardsigmoid_blocks, hardsigmoid_threads>>>(d_hardsigmoid, d_gumbel, d_weights, batch_size, input_features, output_features);
+
+  hardsigmoid_kernel<<<hardsigmoid_blocks, hardsigmoid_threads>>>(d_hardsigmoid, d_hardsigmoid, batch_size, output_features);
+
+  // 3. Signal Envelope
+  envelope_kernel<<<hardsigmoid_blocks, hardsigmoid_threads>>>(d_hardsigmoid, d_envelope, batch_size, output_features);
+
+  // 4. Thresholding
+  threshold_kernel<<<hardsigmoid_blocks, hardsigmoid_threads>>>(d_envelope, d_threshold, batch_size, output_features, threshold);
+
+  // Copy result back to host
+  cudaMemcpy(output, d_threshold, batch_size * output_features * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Free device memory
+  cudaFree(d_input);
+  cudaFree(d_weights);
+  cudaFree(d_gumbel);
+  cudaFree(d_hardsigmoid);
+  cudaFree(d_envelope);
+  cudaFree(d_threshold);
+}
+}
+```

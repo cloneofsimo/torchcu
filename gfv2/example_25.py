@@ -1,27 +1,33 @@
 
 import torch
 import torch.nn.functional as F
+from torch.nn import Conv1d
+from torch.cuda import amp
 
-def torch_box_filter_function(input_tensor: torch.Tensor, kernel_size: int) -> torch.Tensor:
+def gradient_scaling_interpolate_conv1d_fft(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, 
+                                              scale: float = 1.0) -> torch.Tensor:
     """
-    Applies a box filter (average pooling) to the input tensor.
-
-    Args:
-        input_tensor: The input tensor to filter.
-        kernel_size: The size of the box filter kernel.
-
-    Returns:
-        The filtered tensor.
+    Performs a 1D convolution using FFT, scales gradients, interpolates, and applies elementwise sum with bias.
     """
-    return F.avg_pool2d(input_tensor, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+    with amp.autocast(enabled=True, dtype=torch.bfloat16):
+        # Conv1D with FFT
+        output = F.conv1d(input_tensor, weight, bias=bias, padding='same', groups=1)
+        # Gradient Scaling
+        output = output * scale
+        # Interpolation (assume linear interpolation)
+        output = F.interpolate(output, scale_factor=2, mode='linear', align_corners=False)
+        # Elementwise Sum with Bias
+        output = output + bias
+    return output
 
 function_signature = {
-    "name": "torch_box_filter_function",
+    "name": "gradient_scaling_interpolate_conv1d_fft",
     "inputs": [
-        ((1, 3, 32, 32), torch.float32),
-        (1, torch.int32),
+        ((1, 16, 128), torch.float32), 
+        ((16, 16, 5), torch.float32), 
+        ((16,), torch.float32)
     ],
     "outputs": [
-        ((1, 3, 32, 32), torch.float32),
+        ((1, 16, 256), torch.float32), 
     ]
 }

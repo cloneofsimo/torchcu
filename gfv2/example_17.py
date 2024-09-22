@@ -2,46 +2,31 @@
 import torch
 import torch.nn.functional as F
 
-def torch_cosine_embedding_rms_loss_fp16(input1: torch.Tensor, input2: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def grid_sampler_elu_spectral_rolloff_function(input_tensor: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     """
-    Computes the cosine embedding loss with root mean square energy (RMSE) normalization
-    and uses fp16 precision for intermediate calculations.
-    
-    Args:
-        input1 (torch.Tensor): First input tensor with shape (batch_size, embedding_dim).
-        input2 (torch.Tensor): Second input tensor with shape (batch_size, embedding_dim).
-        labels (torch.Tensor): Target labels with shape (batch_size,).
-        
-    Returns:
-        torch.Tensor: The cosine embedding loss with RMSE normalization.
+    Performs grid sampling, applies ELU activation, and calculates spectral rolloff.
     """
-    input1_fp16 = input1.to(torch.float16)
-    input2_fp16 = input2.to(torch.float16)
-    
-    # Compute RMSE normalization
-    rmse1 = torch.sqrt(torch.mean(input1_fp16 * input1_fp16, dim=1, keepdim=True))
-    rmse2 = torch.sqrt(torch.mean(input2_fp16 * input2_fp16, dim=1, keepdim=True))
+    # Perform grid sampling
+    sampled_tensor = F.grid_sample(input_tensor.to(torch.float16), grid.to(torch.float16), mode='bilinear', padding_mode='border', align_corners=True)
 
-    # Normalize inputs
-    input1_normalized = input1_fp16 / rmse1
-    input2_normalized = input2_fp16 / rmse2
-    
-    # Compute cosine similarity
-    cosine_similarity = F.cosine_similarity(input1_normalized, input2_normalized, dim=1)
-    
-    # Calculate cosine embedding loss
-    loss = F.cosine_embedding_loss(input1_normalized, input2_normalized, labels)
-    
-    return loss.to(torch.float32)
+    # Apply ELU activation
+    output = F.elu(sampled_tensor)
+
+    # Calculate spectral rolloff
+    spectral_rolloff = torch.fft.rfft(output, dim=1)
+    spectral_rolloff = torch.abs(spectral_rolloff)
+    rolloff = torch.sum(spectral_rolloff, dim=1) / torch.sum(output, dim=1)
+
+    return rolloff.to(torch.float32)
+
 
 function_signature = {
-    "name": "torch_cosine_embedding_rms_loss_fp16",
+    "name": "grid_sampler_elu_spectral_rolloff_function",
     "inputs": [
-        ((4, 128), torch.float32),  # Shape of input1
-        ((4, 128), torch.float32),  # Shape of input2
-        ((4,), torch.int64)       # Shape of labels
+        ((1, 1, 10, 10), torch.float32),
+        ((1, 1, 10, 2), torch.float32)
     ],
     "outputs": [
-        ((), torch.float32),  # Shape of the loss scalar
+        ((1, 10), torch.float32),
     ]
 }

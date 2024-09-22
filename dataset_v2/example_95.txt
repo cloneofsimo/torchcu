@@ -1,0 +1,111 @@
+## func.py
+
+```python
+import torch
+
+def binary_cross_entropy_fp16(input_tensor: torch.Tensor, target_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates binary cross-entropy loss between input and target tensors using fp16.
+    """
+    input_fp16 = input_tensor.to(torch.float16)
+    target_fp16 = target_tensor.to(torch.float16)
+    loss = torch.nn.functional.binary_cross_entropy(input_fp16, target_fp16)
+    return loss.to(torch.float32)
+
+function_signature = {
+    "name": "binary_cross_entropy_fp16",
+    "inputs": [
+        ((10, 10), torch.float32),
+        ((10, 10), torch.float32),
+    ],
+    "outputs": [
+        ((1,), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f); // Round to nearest even
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for binary cross-entropy loss calculation
+__global__ void binary_cross_entropy_kernel_fp16(const float* input_tensor, const float* target_tensor, float* output,
+                                                int batch_size, int num_features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < batch_size * num_features) {
+        int batch_idx = idx / num_features;
+        int feature_idx = idx % num_features;
+
+        half input_val = float_to_half(input_tensor[batch_idx * num_features + feature_idx]);
+        half target_val = float_to_half(target_tensor[batch_idx * num_features + feature_idx]);
+
+        // Calculate binary cross-entropy
+        output[0] += half_to_float(-(target_val * __logf(input_val) + (1.0f - target_val) * __logf(1.0f - input_val)));
+    }
+}
+
+extern "C" {
+
+void binary_cross_entropy_fp16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    const float* target_tensor = va_arg(args, const float*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int num_features = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_target, *d_output;
+    cudaMalloc(&d_input, batch_size * num_features * sizeof(float));
+    cudaMalloc(&d_target, batch_size * num_features * sizeof(float));
+    cudaMalloc(&d_output, sizeof(float)); // Only one float for the loss value
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * num_features * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target_tensor, batch_size * num_features * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size * num_features + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    binary_cross_entropy_kernel_fp16<<<numBlocks, threadsPerBlock>>>(d_input, d_target, d_output, batch_size, num_features);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_target);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

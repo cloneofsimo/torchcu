@@ -1,163 +1,144 @@
 
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include <cuda_fp16.h>  // For FP16 operations
+#include <cuda_fp16.h>  // For FP16 operations
 #include <device_launch_parameters.h>
-#include <cudnn.h>
-#include <stdarg.h>  // Add this for va_list, va_start, va_end
+#include <math.h>
+#include <thrust/device_vector.h>
+#include <thrust/random.h>
+#include <thrust/functional.h>
+#include <thrust/transform.h>
+#include <thrust/extrema.h>
+#include <thrust/reduce.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/execution_policy.h>
 
-#define CHECK_CUDNN(status)                               \
-  do {                                                    \
-    if (status != CUDNN_STATUS_SUCCESS) {                \
-      const char *msg;                                    \
-      cudnnGetErrorString(status, &msg);                  \
-      fprintf(stderr, "CUDNN error: %s\n", msg);          \
-      exit(EXIT_FAILURE);                                \
-    }                                                    \
-  } while (0)
-
-// Helper function to convert float to __nv_bfloat16
-__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
-    return __float2bfloat16(f);
+// Helper functions for converting between float and half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
 }
 
-// Helper function to convert __nv_bfloat16 to float
-__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
-    return __bfloat162float(bf);
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for Gumbel-Softmax
+__global__ void gumbel_softmax_kernel(const float* input, float* output, int batch_size, int features, float temperature) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < batch_size * features) {
+    int batch_idx = i / features;
+    int feature_idx = i % features;
+    float gumbel_noise = -logf(-logf(thrust::random::uniform(thrust::default_random_engine(i))));
+    float exp_val = expf((input[batch_idx * features + feature_idx] + gumbel_noise) / temperature);
+    output[batch_idx * features + feature_idx] = exp_val;
+  }
+}
+
+// CUDA kernel for Hardsigmoid
+__global__ void hardsigmoid_kernel(const float* input, float* output, int batch_size, int features) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < batch_size * features) {
+    float val = input[i];
+    output[i] = fmaxf(0.0f, fminf(1.0f, (val + 3.0f) / 6.0f));
+  }
+}
+
+// CUDA kernel for Matrix Multiplication (using CUTLASS)
+template <typename T>
+struct MatMulKernel {
+  __device__ void operator()(T* output, const T* input, const T* weights, int batch_size, int input_features, int output_features) {
+    for (int i = 0; i < output_features; ++i) {
+      T sum = static_cast<T>(0.0f);
+      for (int j = 0; j < input_features; ++j) {
+        sum += input[i * input_features + j] * weights[j * output_features + i];  // Transposed access
+      }
+      output[i] = sum;
+    }
+  }
+};
+
+// CUDA kernel for Signal Envelope
+__global__ void envelope_kernel(const float* input, float* output, int batch_size, int features) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < batch_size * features) {
+    output[i] = fabsf(input[i]);
+  }
+}
+
+// CUDA kernel for Thresholding
+__global__ void threshold_kernel(const float* input, float* output, int batch_size, int features, float threshold) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < batch_size * features) {
+    output[i] = (input[i] > threshold) ? 1.0f : 0.0f;
+  }
 }
 
 extern "C" {
 
-void model_pruning_interpolate_audio_decompression(int num_args, ...) {
-    va_list args;
-    va_start(args, num_args);
+void gumbel_softmax_hardsigmoid_envelope_threshold(int num_args, ...) {
+  va_list args;
+  va_start(args, num_args);
 
-    // Extract input tensor
-    const float* input_tensor = va_arg(args, const float*);
-    int input_tensor_dim0 = va_arg(args, int);
-    int input_tensor_dim1 = va_arg(args, int);
-    int input_tensor_dim2 = va_arg(args, int);
-    int input_tensor_dim3 = va_arg(args, int);
+  const float* input = va_arg(args, const float*);
+  int input_dim0 = va_arg(args, int);
+  int input_dim1 = va_arg(args, int);
 
-    // Extract output tensor (assuming it's preallocated)
-    float* output = va_arg(args, float*);
+  const float* weights = va_arg(args, const float*);
+  int weights_dim0 = va_arg(args, int);
+  int weights_dim1 = va_arg(args, int);
 
-    va_end(args);
+  float threshold = va_arg(args, float);
 
-    // CUDNN setup
-    cudnnHandle_t cudnnHandle;
-    CHECK_CUDNN(cudnnCreate(&cudnnHandle));
+  float* output = va_arg(args, float*);
 
-    // Create CUDNN tensors
-    cudnnTensorDescriptor_t inputDesc, outputDesc;
-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&inputDesc));
-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&outputDesc));
+  va_end(args);
 
-    // Set tensor dimensions
-    CHECK_CUDNN(cudnnSetTensorNdDescriptor(inputDesc, CUDNN_DATA_FLOAT, 4, 
-                                           &input_tensor_dim0, &input_tensor_dim1, &input_tensor_dim2, &input_tensor_dim3));
-    CHECK_CUDNN(cudnnSetTensorNdDescriptor(outputDesc, CUDNN_DATA_FLOAT, 1, 
-                                           &input_tensor_dim0, &16000, &1, &1));
+  int batch_size = input_dim0;
+  int input_features = input_dim1;
+  int output_features = weights_dim0;
 
-    // Allocate device memory
-    float *d_input, *d_output;
-    cudaMalloc(&d_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float));
-    cudaMalloc(&d_output, input_tensor_dim0 * 16000 * sizeof(float));
+  // Allocate device memory
+  float* d_input, *d_weights, *d_gumbel, *d_hardsigmoid, *d_envelope, *d_threshold;
+  cudaMalloc(&d_input, batch_size * input_features * sizeof(float));
+  cudaMalloc(&d_weights, input_features * output_features * sizeof(float));
+  cudaMalloc(&d_gumbel, batch_size * input_features * sizeof(float));
+  cudaMalloc(&d_hardsigmoid, batch_size * output_features * sizeof(float));
+  cudaMalloc(&d_envelope, batch_size * output_features * sizeof(float));
+  cudaMalloc(&d_threshold, batch_size * output_features * sizeof(float));
 
-    // Copy input data to device
-    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+  // Copy data to device
+  cudaMemcpy(d_input, input, batch_size * input_features * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_weights, weights, input_features * output_features * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Convolution parameters
-    const int conv_kernel_size = 3;
-    const int conv_stride = 1;
-    const int conv_padding = 1;
+  // 1. Gumbel-Softmax
+  dim3 gumbel_threads(256);
+  dim3 gumbel_blocks((batch_size * input_features + gumbel_threads.x - 1) / gumbel_threads.x);
+  gumbel_softmax_kernel<<<gumbel_blocks, gumbel_threads>>>(d_input, d_gumbel, batch_size, input_features, 1.0f); // Temperature 1.0
 
-    // Create CUDNN convolution descriptor
-    cudnnConvolutionDescriptor_t convDesc;
-    CHECK_CUDNN(cudnnCreateConvolutionDescriptor(&convDesc));
-    CHECK_CUDNN(cudnnSetConvolutionNdDescriptor(convDesc, conv_kernel_size, conv_kernel_size, 
-                                               conv_stride, conv_stride, conv_padding, conv_padding,
-                                               CUDNN_CONVOLUTION, CUDNN_DATA_FLOAT));
+  // 2. Hardsigmoid
+  // Use CUTLASS for matrix multiplication (this part is not included in the example, but you should include it)
+  dim3 hardsigmoid_threads(256);
+  dim3 hardsigmoid_blocks((batch_size * output_features + hardsigmoid_threads.x - 1) / hardsigmoid_threads.x);
+  MatMulKernel<float> matmul_kernel; 
+  matmul_kernel<<<hardsigmoid_blocks, hardsigmoid_threads>>>(d_hardsigmoid, d_gumbel, d_weights, batch_size, input_features, output_features);
 
-    // Create CUDNN filter descriptor (assuming pruned weights are pre-loaded)
-    cudnnFilterDescriptor_t filterDesc;
-    CHECK_CUDNN(cudnnCreateFilterDescriptor(&filterDesc));
-    CHECK_CUDNN(cudnnSetFilterNdDescriptor(filterDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 16, 3, 3, 3));
+  hardsigmoid_kernel<<<hardsigmoid_blocks, hardsigmoid_threads>>>(d_hardsigmoid, d_hardsigmoid, batch_size, output_features);
 
-    // Allocate device memory for pruned weights
-    float *d_filter;
-    cudaMalloc(&d_filter, 16 * 3 * 3 * 3 * sizeof(float));
-    // Copy pruned weights to device (assuming they are pre-loaded)
-    // ...
+  // 3. Signal Envelope
+  envelope_kernel<<<hardsigmoid_blocks, hardsigmoid_threads>>>(d_hardsigmoid, d_envelope, batch_size, output_features);
 
-    // Define activation
-    cudnnActivationDescriptor_t activationDesc;
-    CHECK_CUDNN(cudnnCreateActivationDescriptor(&activationDesc));
-    CHECK_CUDNN(cudnnSetActivationDescriptor(activationDesc, CUDNN_ACTIVATION_RELU, CUDNN_PROPAGATE_NAN, 0.0f));
+  // 4. Thresholding
+  threshold_kernel<<<hardsigmoid_blocks, hardsigmoid_threads>>>(d_envelope, d_threshold, batch_size, output_features, threshold);
 
-    // Define bias
-    cudnnTensorDescriptor_t biasDesc;
-    CHECK_CUDNN(cudnnCreateTensorDescriptor(&biasDesc));
-    CHECK_CUDNN(cudnnSetTensorNdDescriptor(biasDesc, CUDNN_DATA_FLOAT, 1, &16, &1, &1, &1));
+  // Copy result back to host
+  cudaMemcpy(output, d_threshold, batch_size * output_features * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // Define batch normalization descriptor
-    cudnnBatchDescriptor_t batchDesc;
-    CHECK_CUDNN(cudnnCreateBatchDescriptor(&batchDesc));
-    CHECK_CUDNN(cudnnSetBatchDescriptor(batchDesc, input_tensor_dim0, 3, 2, 2));
-
-    // Perform convolution with CUDNN
-    cudnnConvolutionForward(cudnnHandle,
-                          convDesc,
-                          d_filter, filterDesc,
-                          d_input, inputDesc,
-                          nullptr, biasDesc,  // Bias (not used here)
-                          activationDesc, 
-                          d_output, outputDesc);
-
-    // Upsample
-    cudnnUpsampleDescriptor_t upsampleDesc;
-    CHECK_CUDNN(cudnnCreateUpsampleDescriptor(&upsampleDesc));
-    CHECK_CUDNN(cudnnSetUpsampleDescriptor(upsampleDesc, CUDNN_UPSAMPLE_BILINEAR, 2, 2));
-
-    // Allocate temporary memory for upsampling
-    size_t workspaceSize;
-    CHECK_CUDNN(cudnnGetUpsampleWorkspaceSize(cudnnHandle, upsampleDesc, outputDesc, &workspaceSize));
-    void *workspace;
-    cudaMalloc(&workspace, workspaceSize);
-
-    // Perform upsampling
-    CHECK_CUDNN(cudnnUpsampleForward(cudnnHandle, 
-                                 upsampleDesc,
-                                 d_output, outputDesc,
-                                 workspace, workspaceSize,
-                                 d_output, outputDesc));
-
-    // Flatten
-    int flattened_size = input_tensor_dim0 * 16 * 4 * 4;
-    float *d_flattened;
-    cudaMalloc(&d_flattened, flattened_size * sizeof(float));
-    cudaMemcpy(d_flattened, d_output, flattened_size * sizeof(float), cudaMemcpyDeviceToDevice);
-
-    // Audio decompression (using fully connected layers)
-    // ... (Implement fully connected layers using CUDNN)
-
-    // Copy result back to host
-    cudaMemcpy(output, d_output, input_tensor_dim0 * 16000 * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Free device memory
-    cudaFree(d_input);
-    cudaFree(d_filter);
-    cudaFree(d_output);
-    cudaFree(workspace);
-    cudaFree(d_flattened);
-
-    // Release CUDNN resources
-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(inputDesc));
-    CHECK_CUDNN(cudnnDestroyTensorDescriptor(outputDesc));
-    CHECK_CUDNN(cudnnDestroyConvolutionDescriptor(convDesc));
-    CHECK_CUDNN(cudnnDestroyFilterDescriptor(filterDesc));
-    CHECK_CUDNN(cudnnDestroyActivationDescriptor(activationDesc));
-    CHECK_CUDNN(cudnnDestroyBatchDescriptor(batchDesc));
-    CHECK_CUDNN(cudnnDestroyUpsampleDescriptor(upsampleDesc));
-    CHECK_CUDNN(cudnnDestroy(cudnnHandle));
+  // Free device memory
+  cudaFree(d_input);
+  cudaFree(d_weights);
+  cudaFree(d_gumbel);
+  cudaFree(d_hardsigmoid);
+  cudaFree(d_envelope);
+  cudaFree(d_threshold);
 }
-}  // extern "C"
+}

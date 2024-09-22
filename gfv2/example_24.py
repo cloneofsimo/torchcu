@@ -1,47 +1,49 @@
 
 import torch
-import torch.nn as nn
-import torch.cuda.amp as amp
+import torch.nn.functional as F
+from torch.cuda.amp import autocast
 
-class MyModule(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(MyModule, self).__init__()
-        self.linear1 = nn.Linear(input_size, hidden_size)
-        self.linear2 = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = torch.relu(x)
-        x = self.linear2(x)
-        return x
-
-def torch_int8_gradient_clipping_function(input_tensor: torch.Tensor, model: MyModule, 
-                                          clip_value: float) -> torch.Tensor:
+def audio_resynthesis_bf16(
+    spectrogram: torch.Tensor, 
+    mel_basis: torch.Tensor, 
+    stft_params: dict
+) -> torch.Tensor:
     """
-    Performs a forward pass through a model with int8 quantization,
-    applies gradient clipping, and returns the output tensor.
+    Resynthesizes audio from a spectrogram using bfloat16 for optimized performance.
+
+    Args:
+        spectrogram (torch.Tensor): The input spectrogram tensor of shape (batch_size, n_fft // 2 + 1, frames).
+        mel_basis (torch.Tensor): The mel basis matrix of shape (n_mels, n_fft // 2 + 1).
+        stft_params (dict): A dictionary containing STFT parameters:
+            - n_fft (int): The FFT size.
+            - hop_length (int): The hop length.
+            - window (str or torch.Tensor): The window function (e.g., "hann").
+
+    Returns:
+        torch.Tensor: The resynthesized audio tensor of shape (batch_size, frames * hop_length).
     """
-    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
-        with torch.no_grad():
-            input_int8 = input_tensor.to(torch.int8)
-            output = model(input_int8)
-            output = output.to(torch.float32)
+    with autocast():
+        # Convert spectrogram to mel-spectrogram
+        mel_spectrogram = torch.matmul(mel_basis, spectrogram)
 
-            # Gradient Clipping
-            for name, param in model.named_parameters():
-                torch.nn.utils.clip_grad_norm_(param, clip_value)
+        # Invert mel-spectrogram to spectrogram (using inverse mel basis)
+        spectrogram = torch.matmul(torch.linalg.pinv(mel_basis), mel_spectrogram)
 
-    return output
+        # Perform inverse STFT
+        audio = torch.istft(spectrogram,
+                           n_fft=stft_params["n_fft"],
+                           hop_length=stft_params["hop_length"],
+                           window=stft_params["window"])
+    return audio.to(torch.float32)
 
 function_signature = {
-    "name": "torch_int8_gradient_clipping_function",
+    "name": "audio_resynthesis_bf16",
     "inputs": [
-        ((10, 10), torch.float32),
-        (MyModule, None),
-        ((1,), torch.float32)
+        ((16, 257, 256), torch.float32),
+        ((80, 257), torch.float32),
+        {"n_fft": 1024, "hop_length": 256, "window": "hann"}
     ],
     "outputs": [
-        ((10, 10), torch.float32),
+        ((16, 65536), torch.float32)
     ]
 }
-

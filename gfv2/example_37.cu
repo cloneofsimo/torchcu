@@ -1,0 +1,204 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/epilogue/threadblock/linear_combination.h>
+#include <cutlass/transform/threadblock/predicated_tile_store.h>
+#include <cutlass/fast_math.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Define the threadblock shape for GEMM
+constexpr int kThreadblockRows = 128;
+constexpr int kThreadblockCols = 128;
+
+// Helper function for pixel unshuffle (downscale_factor = 2)
+__global__ void pixel_unshuffle_kernel(const half* input, half* output, int batch, int channels, int in_height, int in_width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (idx < in_width && idy < in_height) {
+        int in_offset = (batch * channels * in_height + idy) * in_width + idx;
+        int out_offset = (batch * channels * (in_height / 2) + idy / 2) * (in_width / 2) + idx / 2;
+        output[out_offset] = input[in_offset];
+    }
+}
+
+// Mixup operation on the output tensor
+__global__ void mixup_kernel(const half* output, const half* target, half* output_mixed, float lambda, int batch, int channels, int height, int width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (idx < width && idy < height) {
+        int offset = (batch * channels * height + idy) * width + idx;
+        output_mixed[offset] = __fmaf_rn(lambda, output[offset], (1.0f - lambda) * target[offset]);
+    }
+}
+
+// Element-wise equality comparison and backward pass
+__global__ void eq_backward_kernel(const half* output_mixed, const half* target, half* grad_input, int batch, int channels, int height, int width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (idx < width && idy < height) {
+        int offset = (batch * channels * height + idy) * width + idx;
+        grad_input[offset] = (output_mixed[offset] == target[offset]) ? 1.0f : 0.0f;
+    }
+}
+
+// Structure to store the GEMM configuration
+struct GemmConfig {
+    cutlass::gemm::GemmCoord problem_size;
+    cutlass::gemm::GemmShape grid_shape;
+    cutlass::gemm::GemmShape warp_shape;
+    cutlass::gemm::GemmShape threadblock_shape;
+};
+
+// Function to launch the GEMM kernel using Cutlass
+template <typename Element, typename Layout>
+void launch_gemm_kernel(const GemmConfig& config, const Element* A, const Element* B, Element* C, int batch_size, int C_out, int C_in) {
+    // Define the data types and layout for the GEMM operation
+    using ElementA = Element;
+    using ElementB = Element;
+    using ElementC = Element;
+
+    using LayoutA = Layout;
+    using LayoutB = cutlass::layout::RowMajor;
+    using LayoutC = Layout;
+
+    // Define the GEMM operator using Cutlass
+    using Operator = cutlass::gemm::Gemm<
+        cutlass::gemm::GemmOperation::kGemm,  // GEMM operation
+        cutlass::gemm::GemmShape<kThreadblockRows, kThreadblockCols>,  // Threadblock shape
+        cutlass::gemm::GemmShape<1, 1>,  // Warp shape
+        cutlass::layout::RowMajor,  // Layout for A
+        cutlass::layout::RowMajor,  // Layout for B
+        cutlass::layout::RowMajor,  // Layout for C
+        cutlass::epilogue::threadblock::LinearCombination<
+            ElementC,  // Element type for C
+            cutlass::epilogue::threadblock::LinearCombinationMode::kAccumulate,
+            cutlass::epilogue::threadblock::LinearCombinationOp::kAdd,
+            cutlass::epilogue::threadblock::LinearCombinationScale::kNone,
+            ElementC  // Element type for alpha and beta
+        >,  // Epilogue
+        cutlass::transform::threadblock::PredicatedTileStore<
+            ElementC,
+            LayoutC,
+            cutlass::transform::threadblock::PredicatedTileStoreMode::kUnique
+        >  // Transform
+    >;
+
+    // Define the GEMM plan
+    using Plan = cutlass::gemm::GemmPlan<Operator>;
+
+    // Allocate memory for the GEMM plan
+    Plan plan;
+
+    // Initialize the GEMM plan
+    plan.initialize(config.problem_size, config.grid_shape, config.warp_shape, config.threadblock_shape);
+
+    // Launch the GEMM kernel
+    plan.launch(A, B, C, batch_size, C_out, C_in);
+}
+
+extern "C" {
+    void fused_linear_pixel_unshuffle_mixup_eq_fp16_backward(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        // Extract input tensors
+        const float* input_tensor = va_arg(args, const float*);
+        int input_tensor_dim0 = va_arg(args, int);
+        int input_tensor_dim1 = va_arg(args, int);
+        int input_tensor_dim2 = va_arg(args, int);
+        int input_tensor_dim3 = va_arg(args, int);
+
+        const float* weight = va_arg(args, const float*);
+        int weight_dim0 = va_arg(args, int);
+        int weight_dim1 = va_arg(args, int);
+
+        const float* bias = va_arg(args, const float*);
+        int bias_dim0 = va_arg(args, int);
+
+        float mixup_lambda = va_arg(args, float);
+
+        const float* target_tensor = va_arg(args, const float*);
+        int target_tensor_dim0 = va_arg(args, int);
+        int target_tensor_dim1 = va_arg(args, int);
+        int target_tensor_dim2 = va_arg(args, int);
+        int target_tensor_dim3 = va_arg(args, int);
+
+        // Extract output tensors
+        float* output_mixed = va_arg(args, float*);
+        float* grad_input = va_arg(args, float*);
+
+        va_end(args);
+
+        // Allocate device memory for fp16 tensors
+        half* d_input;
+        half* d_weight;
+        half* d_bias;
+        half* d_output;
+        half* d_target;
+        half* d_output_mixed;
+        half* d_grad_input;
+
+        cudaMalloc(&d_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(half));
+        cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * sizeof(half));
+        cudaMalloc(&d_bias, bias_dim0 * sizeof(half));
+        cudaMalloc(&d_output, input_tensor_dim0 * weight_dim0 * input_tensor_dim2 * input_tensor_dim3 * sizeof(half));
+        cudaMalloc(&d_target, target_tensor_dim0 * target_tensor_dim1 * target_tensor_dim2 * target_tensor_dim3 * sizeof(half));
+        cudaMalloc(&d_output_mixed, target_tensor_dim0 * target_tensor_dim1 * target_tensor_dim2 * target_tensor_dim3 * sizeof(half));
+        cudaMalloc(&d_grad_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(half));
+
+        // Copy input data to device (fp16)
+        cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_bias, bias, bias_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_target, target_tensor, target_tensor_dim0 * target_tensor_dim1 * target_tensor_dim2 * target_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+
+        // GEMM using Cutlass
+        GemmConfig gemm_config;
+        gemm_config.problem_size = {input_tensor_dim1, weight_dim0, input_tensor_dim1};
+        gemm_config.grid_shape = {
+            (input_tensor_dim0 * weight_dim0 + kThreadblockCols - 1) / kThreadblockCols,
+            (input_tensor_dim2 * input_tensor_dim3 + kThreadblockRows - 1) / kThreadblockRows
+        };
+        gemm_config.warp_shape = {1, 1};
+        gemm_config.threadblock_shape = {kThreadblockRows, kThreadblockCols};
+
+        launch_gemm_kernel<half, cutlass::layout::RowMajor>(gemm_config, d_input, d_weight, d_output, input_tensor_dim0, weight_dim0, input_tensor_dim1);
+
+        // Add bias (element-wise)
+        const int bias_size = bias_dim0 * input_tensor_dim0 * input_tensor_dim2 * input_tensor_dim3;
+        cudaMemcpy(d_output + bias_size, d_bias, bias_size * sizeof(half), cudaMemcpyDeviceToDevice);
+
+        // Pixel unshuffle using CUDA kernel
+        const int output_height = input_tensor_dim2 / 2;
+        const int output_width = input_tensor_dim3 / 2;
+        pixel_unshuffle_kernel<<<(output_width + 31) / 32, (output_height + 31) / 32>>>(
+            d_output, d_output, input_tensor_dim0, weight_dim0, output_height, output_width);
+
+        // Mixup using CUDA kernel
+        mixup_kernel<<<(output_width + 31) / 32, (output_height + 31) / 32>>>(
+            d_output, d_target, d_output_mixed, mixup_lambda, input_tensor_dim0, weight_dim0, output_height, output_width);
+
+        // Element-wise equality comparison and backward pass using CUDA kernel
+        eq_backward_kernel<<<(output_width + 31) / 32, (output_height + 31) / 32>>>(
+            d_output_mixed, d_target, d_grad_input, input_tensor_dim0, weight_dim0, output_height, output_width);
+
+        // Copy output tensors back to host
+        cudaMemcpy(output_mixed, d_output_mixed, target_tensor_dim0 * target_tensor_dim1 * target_tensor_dim2 * target_tensor_dim3 * sizeof(half), cudaMemcpyDeviceToHost);
+        cudaMemcpy(grad_input, d_grad_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(half), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_weight);
+        cudaFree(d_bias);
+        cudaFree(d_output);
+        cudaFree(d_target);
+        cudaFree(d_output_mixed);
+        cudaFree(d_grad_input);
+    }
+}

@@ -2,40 +2,43 @@
 import torch
 import torch.nn.functional as F
 
-def torch_wavelet_transform_2d(input_tensor: torch.Tensor, wavelet: str = 'db4') -> torch.Tensor:
+def triplet_loss_with_attention(anchor: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor, 
+                                 attention_weights: torch.Tensor) -> torch.Tensor:
     """
-    Applies a 2D wavelet transform to an input tensor using PyTorch.
+    Computes the triplet loss with attention weights.
 
     Args:
-        input_tensor (torch.Tensor): The input tensor to transform.
-        wavelet (str, optional): The wavelet family to use. Defaults to 'db4'.
+        anchor: (batch_size, embedding_dim) Anchor embeddings.
+        positive: (batch_size, embedding_dim) Positive embeddings.
+        negative: (batch_size, embedding_dim) Negative embeddings.
+        attention_weights: (batch_size, 1) Attention weights for each sample.
 
     Returns:
-        torch.Tensor: The wavelet transform of the input tensor.
+        loss: (1,) The triplet loss.
     """
-    # Check if input tensor has at least 2 dimensions
-    if len(input_tensor.shape) < 2:
-        raise ValueError("Input tensor must have at least 2 dimensions")
 
-    # Apply wavelet transform using PyTorch's built-in function
-    transformed_tensor = torch.stft(input_tensor, n_fft=input_tensor.shape[-1], hop_length=input_tensor.shape[-1] // 2,
-                                    win_length=input_tensor.shape[-1], window=torch.hann_window(input_tensor.shape[-1]),
-                                    center=False, return_complex=False)
+    # Apply attention weights to embeddings
+    anchor = anchor * attention_weights
+    positive = positive * attention_weights
+    negative = negative * attention_weights
 
-    # Extract real and imaginary components of the transformed tensor
-    real_part = transformed_tensor[:, :, 0, :]
-    imag_part = transformed_tensor[:, :, 1, :]
+    # Calculate distances
+    distance_ap = torch.sum((anchor - positive)**2, dim=1, keepdim=True)
+    distance_an = torch.sum((anchor - negative)**2, dim=1, keepdim=True)
 
-    # Combine real and imaginary parts into a single tensor
-    return torch.stack([real_part, imag_part], dim=-1)
+    # Apply margin ranking loss
+    loss = F.margin_ranking_loss(distance_an, distance_ap, margin=1.0)
+    return loss
 
 function_signature = {
-    "name": "torch_wavelet_transform_2d",
+    "name": "triplet_loss_with_attention",
     "inputs": [
-        ((16, 16), torch.float32),
+        ((16, 128), torch.float32),
+        ((16, 128), torch.float32),
+        ((16, 128), torch.float32),
+        ((16, 1), torch.float32)
     ],
     "outputs": [
-        ((16, 16, 2), torch.float32),
+        ((1,), torch.float32),
     ]
 }
-

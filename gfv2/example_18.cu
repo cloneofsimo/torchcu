@@ -1,130 +1,188 @@
 
-#include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <cutlass.h>
 #include <device_launch_parameters.h>
-#include <stdarg.h>
-#include <complex>
 
-// Include Cutlass for efficient matrix multiplication
-#include "cutlass/cutlass.h"
+#define CUTLASS_CHECK(status)                                          \
+    do {                                                             \
+        if (status != cutlass::Status::kSuccess) {                   \
+            std::cerr << "Cutlass error: " << #status << std::endl; \
+            exit(EXIT_FAILURE);                                     \
+        }                                                             \
+    } while (0)
 
-// Helper function to convert float to half
-__device__ __forceinline__ half float_to_half(float f) {
-    return __float2half_rn(f);
-}
+// Structure to hold input/output tensors
+struct Tensor {
+    float *data;
+    int size;
+    int stride;
+};
 
-// Helper function to convert half to float
-__device__ __forceinline__ float half_to_float(half h) {
-    return __half2float(h);
-}
-
-// CUDA kernel for double linear transform with Hilbert transform in between
-__global__ void double_linear_hilbert_kernel(const float* input_tensor, const float* weight1, const float* weight2,
-                                           float* output, int m, int n, int k) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < m && col < n) {
-        float sum1 = 0.0f;
-        for (int i = 0; i < k; ++i) {
-            sum1 += input_tensor[row * k + i] * weight1[col * k + i];
-        }
-
-        // Apply Hilbert transform in frequency domain
-        std::complex<float> complex_sum(sum1, 0.0f);
-        complex_sum = std::polar(std::abs(complex_sum), std::arg(complex_sum) * 2); // Double the angle
-
-        float sum2 = 0.0f;
-        for (int i = 0; i < k; ++i) {
-            sum2 += complex_sum.real() * weight2[col * k + i];
-        }
-        output[row * n + col] = sum2;
-    }
-}
-
-// CUDA kernel for Cutlass matrix multiplication (optimized for bfloat16)
+// Function to perform Gaussian blur using CUTLASS
 template <typename T>
-__global__ void cutlass_matmul_kernel(const T* input_tensor, const T* weight, T* output,
-                                      int m, int n, int k) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void gaussian_blur_kernel(const Tensor& input, Tensor& output, int kernel_size, float sigma) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (row < m && col < n) {
-        T sum = 0.0f;
-        for (int i = 0; i < k; ++i) {
-            sum += input_tensor[row * k + i] * weight[col * k + i];
+    // Calculate the Gaussian filter weights
+    float* weights = (float*)malloc(kernel_size * sizeof(float));
+    for (int k = 0; k < kernel_size; k++) {
+        weights[k] = exp(-(k - kernel_size / 2) * (k - kernel_size / 2) / (2 * sigma * sigma));
+    }
+
+    // Normalize the filter weights
+    float sum = 0.0f;
+    for (int k = 0; k < kernel_size; k++) {
+        sum += weights[k];
+    }
+    for (int k = 0; k < kernel_size; k++) {
+        weights[k] /= sum;
+    }
+
+    // Apply Gaussian blur
+    float sum_value = 0.0f;
+    for (int k = 0; k < kernel_size; k++) {
+        if (i - kernel_size / 2 + k >= 0 && i - kernel_size / 2 + k < input.size) {
+            sum_value += weights[k] * input.data[i - kernel_size / 2 + k];
         }
-        output[row * n + col] = sum;
+    }
+
+    output.data[i] = sum_value;
+    free(weights);
+}
+
+// Function to perform max pooling with Cutlass
+template <typename T>
+void max_pool1d_cutlass(const Tensor& input, Tensor& output, int kernel_size, int stride) {
+    // Define CUTLASS types
+    using ElementA = cutlass::half_t;
+    using ElementB = cutlass::half_t;
+    using ElementC = cutlass::half_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::RowMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using ArchTag = cutlass::arch::Sm75;
+
+    // Define CUTLASS matrix types
+    cutlass::MatrixDescription<ElementA, LayoutA> matrixA = {input.size, 1};
+    cutlass::MatrixDescription<ElementB, LayoutB> matrixB = {kernel_size, 1};
+    cutlass::MatrixDescription<ElementC, LayoutC> matrixC = {(input.size - kernel_size + 1) / stride, 1};
+
+    // Define CUTLASS GEMM operation
+    cutlass::gemm::GemmOperation<
+        cutlass::gemm::GemmOperation::kGemm,
+        cutlass::gemm::GemmOperation::kGemm,
+        ElementA, ElementB, ElementC,
+        LayoutA, LayoutB, LayoutC,
+        cutlass::epilogue::Default,
+        cutlass::threadblock::GemmShape<16, 16, 32>,
+        cutlass::warp::GemmShape<4, 4, 4>,
+        cutlass::threadblock::GemmShape<16, 16, 32>,
+        cutlass::warp::GemmShape<4, 4, 4>,
+        ArchTag
+    > gemm_op;
+
+    // Define CUTLASS threadblock layout
+    cutlass::gemm::GemmProblem<ElementA, ElementB, ElementC> problem {
+        matrixA, matrixB,
+        matrixC,
+        cutlass::gemm::kNoTrans, cutlass::gemm::kNoTrans,
+        gemm_op.getEpilogue(),
+        /*warpCount=*/1,
+        /*threadblockCount=*/1
+    };
+
+    // Allocate workspace for CUTLASS GEMM
+    size_t workspace_size = gemm_op.getWorkspaceSize(problem);
+    void* workspace = malloc(workspace_size);
+
+    // Define CUTLASS GEMM context
+    cutlass::gemm::Gemm<
+        cutlass::gemm::GemmOperation::kGemm,
+        cutlass::gemm::GemmOperation::kGemm,
+        ElementA, ElementB, ElementC,
+        LayoutA, LayoutB, LayoutC,
+        cutlass::epilogue::Default,
+        cutlass::threadblock::GemmShape<16, 16, 32>,
+        cutlass::warp::GemmShape<4, 4, 4>,
+        cutlass::threadblock::GemmShape<16, 16, 32>,
+        cutlass::warp::GemmShape<4, 4, 4>,
+        ArchTag
+    > gemm;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, input.size * sizeof(float));
+    cudaMalloc(&d_output, (input.size - kernel_size + 1) / stride * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input.data, input.size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Perform CUTLASS GEMM
+    CUTLASS_CHECK(gemm.execute(
+        d_input, input.stride,
+        nullptr, 0, // No bias
+        d_output, output.stride,
+        workspace, workspace_size,
+        problem
+    ));
+
+    // Copy result back to host
+    cudaMemcpy(output.data, d_output, (input.size - kernel_size + 1) / stride * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+
+    free(workspace);
+}
+
+// Function to perform max pooling with CUDA
+template <typename T>
+__global__ void max_pool1d_kernel(const Tensor& input, Tensor& output, int kernel_size, int stride) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i * stride + kernel_size <= input.size) {
+        T max_value = input.data[i * stride];
+        for (int k = 1; k < kernel_size; k++) {
+            if (input.data[i * stride + k] > max_value) {
+                max_value = input.data[i * stride + k];
+            }
+        }
+        output.data[i] = max_value;
     }
 }
 
+// Function to perform Gaussian blur and max pooling
 extern "C" {
-
-void torch_double_linear_hilbert_inplace(int num_args, ...) {
+void gaussian_maxpool_function(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
     // Extract input tensor
-    const float* input_tensor = va_arg(args, const float*);
-    int input_tensor_dim0 = va_arg(args, int);
-    int input_tensor_dim1 = va_arg(args, int);
+    float* input_data = va_arg(args, float*);
+    int input_size = va_arg(args, int);
+    int input_stride = va_arg(args, int);
 
-    // Extract weight1 tensor
-    const float* weight1 = va_arg(args, const float*);
-    int weight1_dim0 = va_arg(args, int);
-    int weight1_dim1 = va_arg(args, int);
+    // Extract kernel size
+    int kernel_size = va_arg(args, int);
 
-    // Extract weight2 tensor
-    const float* weight2 = va_arg(args, const float*);
-    int weight2_dim0 = va_arg(args, int);
-    int weight2_dim1 = va_arg(args, int);
+    // Extract stride
+    int stride = va_arg(args, int);
 
-    // Output tensor is the same as input tensor, so no need to extract it
+    // Extract output tensor
+    float* output_data = va_arg(args, float*);
 
     va_end(args);
 
-    int batch_size = input_tensor_dim0;
-    int input_dim = input_tensor_dim1;
-    int output_dim = weight2_dim0;
+    // Create Tensor objects
+    Tensor input = {input_data, input_size, input_stride};
+    Tensor output = {output_data, (input_size - kernel_size + 1) / stride, 1};
 
-    // Allocate device memory
-    float *d_input, *d_weight1, *d_weight2, *d_output;
-    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
-    cudaMalloc(&d_weight1, output_dim * input_dim * sizeof(float));
-    cudaMalloc(&d_weight2, output_dim * input_dim * sizeof(float));
-    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+    // Perform Gaussian blur
+    gaussian_blur_kernel<<<(input.size + 255) / 256, 256>>>(input, output, kernel_size, 1.0f);
 
-    // Copy input data to device
-    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_weight1, weight1, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_weight2, weight2, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Launch kernel for the first matrix multiplication
-    dim3 threadsPerBlock(16, 16);
-    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
-
-    cutlass_matmul_kernel<float><<<numBlocks, threadsPerBlock>>>(
-        d_input, d_weight1, d_output, batch_size, output_dim, input_dim
-    );
-
-    // Apply Hilbert transform in frequency domain
-    // (You could use cuFFT for faster FFTs if necessary)
-    // ... (Implementation of Hilbert transform in frequency domain)
-
-    // Launch kernel for the second matrix multiplication
-    cutlass_matmul_kernel<float><<<numBlocks, threadsPerBlock>>>(
-        d_output, d_weight2, d_input, batch_size, output_dim, input_dim
-    );
-
-    // Copy result back to host (input tensor is modified inplace)
-    cudaMemcpy(input_tensor, d_input, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Free device memory
-    cudaFree(d_input);
-    cudaFree(d_weight1);
-    cudaFree(d_weight2);
-    cudaFree(d_output);
+    // Perform max pooling
+    max_pool1d_cutlass(input, output, kernel_size, stride);
 }
-
-}  // extern "C"
+} // extern "C"

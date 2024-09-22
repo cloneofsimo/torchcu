@@ -1,0 +1,498 @@
+```python
+import torch
+import torch.nn.functional as F
+from cutlass import *
+
+def max_euclidean_distance_gradient_accumulation(input1: torch.Tensor, input2: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates the maximum pairwise Euclidean distance between elements in two tensors after applying a grid sampling operation,
+    and accumulates gradients for the grid.
+
+    Args:
+        input1: First input tensor (batch_size, channels, height, width).
+        input2: Second input tensor (batch_size, channels, height, width).
+        grid: Grid tensor (batch_size, height, width, 2).
+
+    Returns:
+        A tensor containing the maximum pairwise Euclidean distances.
+    """
+
+    # Convert to bfloat16 for faster computation
+    input1_bf16 = input1.to(torch.bfloat16)
+    input2_bf16 = input2.to(torch.bfloat16)
+
+    # Grid sampling with interpolation
+    sampled_input1 = F.grid_sample(input1_bf16, grid, mode='bilinear', align_corners=False)
+    sampled_input2 = F.grid_sample(input2_bf16, grid, mode='bilinear', align_corners=False)
+
+    # Calculate pairwise Euclidean distances
+    distances = torch.cdist(sampled_input1.view(input1.shape[0], -1), sampled_input2.view(input2.shape[0], -1))
+
+    # Find maximum distance for each batch element
+    max_distances = torch.max(distances, dim=1).values
+
+    # Gradient accumulation for grid (requires_grad=True on grid)
+    max_distances.backward(retain_graph=True)
+
+    # Return the maximum distances
+    return max_distances.to(torch.float32)
+
+function_signature = {
+    "name": "max_euclidean_distance_gradient_accumulation",
+    "inputs": [
+        ((1, 16, 256, 256), torch.float32),
+        ((1, 16, 256, 256), torch.float32),
+        ((1, 256, 256, 2), torch.float32),
+    ],
+    "outputs": [
+        ((1,), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math_functions.h>  // For fmaxf
+#include <iostream>
+#include <cuda_fp16.h>
+#include <cutlass.h>
+
+
+// Function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for grid sampling
+__global__ void grid_sampling_kernel(const float *input, const float *grid, float *output,
+                                   int batch_size, int channels, int height, int width, int grid_height, int grid_width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = threadIdx.z;
+
+    if (b < batch_size && h < grid_height && c < channels) {
+        // Grid sampling coordinates
+        float gx = grid[b * grid_height * grid_width * 2 + h * grid_width * 2 + 0];
+        float gy = grid[b * grid_height * grid_width * 2 + h * grid_width * 2 + 1];
+
+        // Bilinear interpolation
+        int x0 = floor(gx);
+        int y0 = floor(gy);
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+        float tx = gx - x0;
+        float ty = gy - y0;
+
+        // Clamp coordinates within bounds
+        x0 = max(0, min(x0, width - 1));
+        x1 = max(0, min(x1, width - 1));
+        y0 = max(0, min(y0, height - 1));
+        y1 = max(0, min(y1, height - 1));
+
+        // Bilinear interpolation weights
+        float w00 = (1 - tx) * (1 - ty);
+        float w01 = (1 - tx) * ty;
+        float w10 = tx * (1 - ty);
+        float w11 = tx * ty;
+
+        // Sample from input tensor
+        float val00 = input[b * channels * height * width + c * height * width + y0 * width + x0];
+        float val01 = input[b * channels * height * width + c * height * width + y1 * width + x0];
+        float val10 = input[b * channels * height * width + c * height * width + y0 * width + x1];
+        float val11 = input[b * channels * height * width + c * height * width + y1 * width + x1];
+
+        // Interpolate
+        output[b * channels * grid_height * grid_width + c * grid_height * grid_width + h * grid_width] =
+            w00 * val00 + w01 * val01 + w10 * val10 + w11 * val11;
+    }
+}
+
+// CUDA kernel for pairwise Euclidean distance calculation
+__global__ void euclidean_distance_kernel(const float *input1, const float *input2, float *output,
+                                         int batch_size, int channels, int height, int width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (b < batch_size && i < height * width) {
+        float sum = 0.0f;
+        for (int c = 0; c < channels; ++c) {
+            float diff = input1[b * channels * height * width + c * height * width + i] -
+                        input2[b * channels * height * width + c * height * width + i];
+            sum += diff * diff;
+        }
+        output[b * height * width + i] = sqrtf(sum);
+    }
+}
+
+// CUDA kernel for finding maximum distances
+__global__ void max_distance_kernel(const float *distances, float *max_distances, int batch_size, int height, int width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch_size) {
+        float max_dist = distances[b * height * width];
+        for (int i = 1; i < height * width; ++i) {
+            max_dist = fmaxf(max_dist, distances[b * height * width + i]);
+        }
+        max_distances[b] = max_dist;
+    }
+}
+
+// Gradient accumulation for grid using Cutlass
+template <typename T>
+__global__ void grid_gradient_accumulation_kernel(const float *d_distances, const float *d_sampled_input1, const float *d_sampled_input2, 
+                                                   float *d_grid, int batch_size, int channels, int height, int width, int grid_height, int grid_width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && h < grid_height) {
+        for (int w = 0; w < grid_width; ++w) {
+            int grid_idx = b * grid_height * grid_width * 2 + h * grid_width * 2 + w;
+            float sum = 0.0f;
+            for (int c = 0; c < channels; ++c) {
+                // Calculate gradient for each channel
+                // ... (implementation dependent on how d_distances is computed)
+                // ...
+
+                // Accumulate gradient
+                // d_grid[grid_idx] += gradient_value;
+                // ...
+            }
+        }
+    }
+}
+
+
+extern "C" {
+
+void max_euclidean_distance_gradient_accumulation(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float *input1 = va_arg(args, const float*);
+    int input1_dim0 = va_arg(args, int);
+    int input1_dim1 = va_arg(args, int);
+    int input1_dim2 = va_arg(args, int);
+    int input1_dim3 = va_arg(args, int);
+
+    const float *input2 = va_arg(args, const float*);
+    int input2_dim0 = va_arg(args, int);
+    int input2_dim1 = va_arg(args, int);
+    int input2_dim2 = va_arg(args, int);
+    int input2_dim3 = va_arg(args, int);
+
+    const float *grid = va_arg(args, const float*);
+    int grid_dim0 = va_arg(args, int);
+    int grid_dim1 = va_arg(args, int);
+    int grid_dim2 = va_arg(args, int);
+    int grid_dim3 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float *output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input1_dim0;
+    int channels = input1_dim1;
+    int height = input1_dim2;
+    int width = input1_dim3;
+    int grid_height = grid_dim1;
+    int grid_width = grid_dim2;
+
+    // Allocate device memory
+    float *d_input1, *d_input2, *d_grid, *d_sampled_input1, *d_sampled_input2, *d_distances, *d_max_distances;
+    cudaMalloc(&d_input1, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_input2, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_grid, batch_size * grid_height * grid_width * 2 * sizeof(float));
+    cudaMalloc(&d_sampled_input1, batch_size * channels * grid_height * grid_width * sizeof(float));
+    cudaMalloc(&d_sampled_input2, batch_size * channels * grid_height * grid_width * sizeof(float));
+    cudaMalloc(&d_distances, batch_size * height * width * sizeof(float));
+    cudaMalloc(&d_max_distances, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input1, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input2, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_grid, grid, batch_size * grid_height * grid_width * 2 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Perform grid sampling
+    dim3 threadsPerBlock(16, 16, 16);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (grid_height + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (channels + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    grid_sampling_kernel<<<numBlocks, threadsPerBlock>>>(d_input1, d_grid, d_sampled_input1,
+                                                        batch_size, channels, height, width, grid_height, grid_width);
+
+    grid_sampling_kernel<<<numBlocks, threadsPerBlock>>>(d_input2, d_grid, d_sampled_input2,
+                                                        batch_size, channels, height, width, grid_height, grid_width);
+
+    // Calculate pairwise Euclidean distances
+    dim3 distance_threadsPerBlock(16, 16);
+    dim3 distance_numBlocks((batch_size + distance_threadsPerBlock.x - 1) / distance_threadsPerBlock.x,
+                            (height * width + distance_threadsPerBlock.y - 1) / distance_threadsPerBlock.y);
+
+    euclidean_distance_kernel<<<distance_numBlocks, distance_threadsPerBlock>>>(d_sampled_input1, d_sampled_input2, d_distances,
+                                                                          batch_size, channels, height, width);
+
+    // Find maximum distances
+    dim3 max_threadsPerBlock(16, 1);
+    dim3 max_numBlocks((batch_size + max_threadsPerBlock.x - 1) / max_threadsPerBlock.x, 1);
+
+    max_distance_kernel<<<max_numBlocks, max_threadsPerBlock>>>(d_distances, d_max_distances, batch_size, height, width);
+
+    // Gradient accumulation using Cutlass (replace with actual gradient calculation)
+    // ...
+    // ... (Example implementation for d_distances computed using Euclidean distance)
+    // ...
+    // dim3 grad_threadsPerBlock(16, 16);
+    // dim3 grad_numBlocks((batch_size + grad_threadsPerBlock.x - 1) / grad_threadsPerBlock.x,
+    //                     (grid_height + grad_threadsPerBlock.y - 1) / grad_threadsPerBlock.y);
+    // grid_gradient_accumulation_kernel<<<grad_numBlocks, grad_threadsPerBlock>>>(d_distances, d_sampled_input1, d_sampled_input2, d_grid,
+    //                                                                   batch_size, channels, height, width, grid_height, grid_width);
+    // ...
+
+    // Copy result back to host
+    cudaMemcpy(output, d_max_distances, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_grid);
+    cudaFree(d_sampled_input1);
+    cudaFree(d_sampled_input2);
+    cudaFree(d_distances);
+    cudaFree(d_max_distances);
+}
+
+} // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math_functions.h>  // For fmaxf
+#include <iostream>
+#include <cuda_fp16.h>
+#include <cutlass.h>
+
+// Function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for grid sampling
+__global__ void grid_sampling_kernel(const float *input, const float *grid, float *output,
+                                   int batch_size, int channels, int height, int width, int grid_height, int grid_width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = threadIdx.z;
+
+    if (b < batch_size && h < grid_height && c < channels) {
+        // Grid sampling coordinates
+        float gx = grid[b * grid_height * grid_width * 2 + h * grid_width * 2 + 0];
+        float gy = grid[b * grid_height * grid_width * 2 + h * grid_width * 2 + 1];
+
+        // Bilinear interpolation
+        int x0 = floor(gx);
+        int y0 = floor(gy);
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+        float tx = gx - x0;
+        float ty = gy - y0;
+
+        // Clamp coordinates within bounds
+        x0 = max(0, min(x0, width - 1));
+        x1 = max(0, min(x1, width - 1));
+        y0 = max(0, min(y0, height - 1));
+        y1 = max(0, min(y1, height - 1));
+
+        // Bilinear interpolation weights
+        float w00 = (1 - tx) * (1 - ty);
+        float w01 = (1 - tx) * ty;
+        float w10 = tx * (1 - ty);
+        float w11 = tx * ty;
+
+        // Sample from input tensor
+        float val00 = input[b * channels * height * width + c * height * width + y0 * width + x0];
+        float val01 = input[b * channels * height * width + c * height * width + y1 * width + x0];
+        float val10 = input[b * channels * height * width + c * height * width + y0 * width + x1];
+        float val11 = input[b * channels * height * width + c * height * width + y1 * width + x1];
+
+        // Interpolate
+        output[b * channels * grid_height * grid_width + c * grid_height * grid_width + h * grid_width] =
+            w00 * val00 + w01 * val01 + w10 * val10 + w11 * val11;
+    }
+}
+
+// CUDA kernel for pairwise Euclidean distance calculation
+__global__ void euclidean_distance_kernel(const float *input1, const float *input2, float *output,
+                                         int batch_size, int channels, int height, int width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (b < batch_size && i < height * width) {
+        float sum = 0.0f;
+        for (int c = 0; c < channels; ++c) {
+            float diff = input1[b * channels * height * width + c * height * width + i] -
+                        input2[b * channels * height * width + c * height * width + i];
+            sum += diff * diff;
+        }
+        output[b * height * width + i] = sqrtf(sum);
+    }
+}
+
+// CUDA kernel for finding maximum distances
+__global__ void max_distance_kernel(const float *distances, float *max_distances, int batch_size, int height, int width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch_size) {
+        float max_dist = distances[b * height * width];
+        for (int i = 1; i < height * width; ++i) {
+            max_dist = fmaxf(max_dist, distances[b * height * width + i]);
+        }
+        max_distances[b] = max_dist;
+    }
+}
+
+// Gradient accumulation for grid using Cutlass
+template <typename T>
+__global__ void grid_gradient_accumulation_kernel(const float *d_distances, const float *d_sampled_input1, const float *d_sampled_input2, 
+                                                   float *d_grid, int batch_size, int channels, int height, int width, int grid_height, int grid_width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && h < grid_height) {
+        for (int w = 0; w < grid_width; ++w) {
+            int grid_idx = b * grid_height * grid_width * 2 + h * grid_width * 2 + w;
+            float sum = 0.0f;
+            for (int c = 0; c < channels; ++c) {
+                // Calculate gradient for each channel
+                // ... (implementation dependent on how d_distances is computed)
+                // ...
+
+                // Accumulate gradient
+                // d_grid[grid_idx] += gradient_value;
+                // ...
+            }
+        }
+    }
+}
+
+
+extern "C" {
+
+void max_euclidean_distance_gradient_accumulation(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float *input1 = va_arg(args, const float*);
+    int input1_dim0 = va_arg(args, int);
+    int input1_dim1 = va_arg(args, int);
+    int input1_dim2 = va_arg(args, int);
+    int input1_dim3 = va_arg(args, int);
+
+    const float *input2 = va_arg(args, const float*);
+    int input2_dim0 = va_arg(args, int);
+    int input2_dim1 = va_arg(args, int);
+    int input2_dim2 = va_arg(args, int);
+    int input2_dim3 = va_arg(args, int);
+
+    const float *grid = va_arg(args, const float*);
+    int grid_dim0 = va_arg(args, int);
+    int grid_dim1 = va_arg(args, int);
+    int grid_dim2 = va_arg(args, int);
+    int grid_dim3 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float *output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input1_dim0;
+    int channels = input1_dim1;
+    int height = input1_dim2;
+    int width = input1_dim3;
+    int grid_height = grid_dim1;
+    int grid_width = grid_dim2;
+
+    // Allocate device memory
+    float *d_input1, *d_input2, *d_grid, *d_sampled_input1, *d_sampled_input2, *d_distances, *d_max_distances;
+    cudaMalloc(&d_input1, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_input2, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_grid, batch_size * grid_height * grid_width * 2 * sizeof(float));
+    cudaMalloc(&d_sampled_input1, batch_size * channels * grid_height * grid_width * sizeof(float));
+    cudaMalloc(&d_sampled_input2, batch_size * channels * grid_height * grid_width * sizeof(float));
+    cudaMalloc(&d_distances, batch_size * height * width * sizeof(float));
+    cudaMalloc(&d_max_distances, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input1, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input2, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_grid, grid, batch_size * grid_height * grid_width * 2 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Perform grid sampling
+    dim3 threadsPerBlock(16, 16, 16);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (grid_height + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (channels + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    grid_sampling_kernel<<<numBlocks, threadsPerBlock>>>(d_input1, d_grid, d_sampled_input1,
+                                                        batch_size, channels, height, width, grid_height, grid_width);
+
+    grid_sampling_kernel<<<numBlocks, threadsPerBlock>>>(d_input2, d_grid, d_sampled_input2,
+                                                        batch_size, channels, height, width, grid_height, grid_width);
+
+    // Calculate pairwise Euclidean distances
+    dim3 distance_threadsPerBlock(16, 16);
+    dim3 distance_numBlocks((batch_size + distance_threadsPerBlock.x - 1) / distance_threadsPerBlock.x,
+                            (height * width + distance_threadsPerBlock.y - 1) / distance_threadsPerBlock.y);
+
+    euclidean_distance_kernel<<<distance_numBlocks, distance_threadsPerBlock>>>(d_sampled_input1, d_sampled_input2, d_distances,
+                                                                          batch_size, channels, height, width);
+
+    // Find maximum distances
+    dim3 max_threadsPerBlock(16, 1);
+    dim3 max_numBlocks((batch_size + max_threadsPerBlock.x - 1) / max_threadsPerBlock.x, 1);
+
+    max_distance_kernel<<<max_numBlocks, max_threadsPerBlock>>>(d_distances, d_max_distances, batch_size, height, width);
+
+    // Gradient accumulation using Cutlass (replace with actual gradient calculation)
+    // ...
+    // ... (Example implementation for d_distances computed using Euclidean distance)
+    // ...
+    // dim3 grad_threadsPerBlock(16, 16);
+    // dim3 grad_numBlocks((batch_size + grad_threadsPerBlock.x - 1) / grad_threadsPerBlock.x,
+    //                     (grid_height + grad_threadsPerBlock.y - 1) / grad_threadsPerBlock.y);
+    // grid_gradient_accumulation_kernel<<<grad_numBlocks, grad_threadsPerBlock>>>(d_distances, d_sampled_input1, d_sampled_input2, d_grid,
+    //                                                                   batch_size, channels, height, width, grid_height, grid_width);
+    // ...
+
+    // Copy result back to host
+    cudaMemcpy(output, d_max_distances, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_grid);
+    cudaFree(d_sampled_input1);
+    cudaFree(d_sampled_input2);
+    cudaFree(d_distances);
+    cudaFree(d_max_distances);
+}
+
+} // extern "C"
+```

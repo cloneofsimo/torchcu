@@ -1,0 +1,483 @@
+```python
+import torch
+import torch.nn as nn
+
+class MyModule(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(MyModule, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = torch.true_divide(x, torch.mean(x, dim=[2, 3], keepdim=True))  # Normalize
+        x = nn.functional.adaptive_avg_pool2d(x, (1, 1))  # Global average pooling
+        return x
+
+def my_function(input_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Applies a convolution, batch normalization, ReLU, normalization, and adaptive average pooling.
+    """
+    model = MyModule(in_channels=3, out_channels=16)
+    output = model(input_tensor)
+    return output
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((3, 32, 32), torch.float32)
+    ],
+    "outputs": [
+        ((16, 1, 1), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for convolution
+__global__ void conv_kernel(const float* input, const float* weight, const float* bias, float* output,
+                            int batch_size, int in_channels, int out_channels, int height, int width, int kernel_size, int padding) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int out_channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_row = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_col = threadIdx.x;
+
+    if (batch_idx < batch_size && out_channel_idx < out_channels && out_row < height && out_col < width) {
+        float sum = bias[out_channel_idx];
+        for (int in_channel_idx = 0; in_channel_idx < in_channels; ++in_channel_idx) {
+            for (int kernel_row = 0; kernel_row < kernel_size; ++kernel_row) {
+                for (int kernel_col = 0; kernel_col < kernel_size; ++kernel_col) {
+                    int in_row = out_row + kernel_row - padding;
+                    int in_col = out_col + kernel_col - padding;
+
+                    if (in_row >= 0 && in_row < height && in_col >= 0 && in_col < width) {
+                        sum += half_to_float(weight[out_channel_idx * in_channels * kernel_size * kernel_size +
+                                            in_channel_idx * kernel_size * kernel_size +
+                                            kernel_row * kernel_size + kernel_col]) *
+                               half_to_float(input[batch_idx * in_channels * height * width +
+                                               in_channel_idx * height * width +
+                                               in_row * width + in_col]);
+                    }
+                }
+            }
+        }
+        output[batch_idx * out_channels * height * width + out_channel_idx * height * width + out_row * width + out_col] = sum;
+    }
+}
+
+// CUDA kernel for batch normalization
+__global__ void batch_norm_kernel(const float* input, const float* running_mean, const float* running_var, const float* gamma, const float* beta, float* output,
+                                 int batch_size, int channels, int height, int width, float eps) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < channels && row < height && col < width) {
+        int index = batch_idx * channels * height * width + channel_idx * height * width + row * width + col;
+        float x = input[index];
+        output[index] = (x - running_mean[channel_idx]) * gamma[channel_idx] / sqrtf(running_var[channel_idx] + eps) + beta[channel_idx];
+    }
+}
+
+// CUDA kernel for ReLU activation
+__global__ void relu_kernel(const float* input, float* output, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        output[i] = fmaxf(input[i], 0.0f);
+    }
+}
+
+// CUDA kernel for normalization
+__global__ void normalization_kernel(const float* input, float* output, int batch_size, int channels, int height, int width) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < channels && row < height && col < width) {
+        int index = batch_idx * channels * height * width + channel_idx * height * width + row * width + col;
+        output[index] = input[index] / (float) (height * width);  // Normalize by total pixels
+    }
+}
+
+// CUDA kernel for adaptive average pooling (global)
+__global__ void adaptive_avg_pool_kernel(const float* input, float* output, int batch_size, int channels, int height, int width) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && channel_idx < channels) {
+        float sum = 0.0f;
+        for (int row = 0; row < height; ++row) {
+            for (int col = 0; col < width; ++col) {
+                int index = batch_idx * channels * height * width + channel_idx * height * width + row * width + col;
+                sum += input[index];
+            }
+        }
+        output[batch_idx * channels + channel_idx] = sum / (float) (height * width);
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Parameters
+    int batch_size = input_tensor_dim0;
+    int in_channels = input_tensor_dim1;
+    int height = input_tensor_dim2;
+    int width = input_tensor_dim3;
+    int out_channels = 16;
+    int kernel_size = 3;
+    int padding = 1;
+    float eps = 1e-5f;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output, *d_running_mean, *d_running_var, *d_gamma, *d_beta;
+    cudaMalloc(&d_input, batch_size * in_channels * height * width * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * in_channels * kernel_size * kernel_size * sizeof(float));
+    cudaMalloc(&d_bias, out_channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * height * width * sizeof(float));
+    cudaMalloc(&d_running_mean, out_channels * sizeof(float));
+    cudaMalloc(&d_running_var, out_channels * sizeof(float));
+    cudaMalloc(&d_gamma, out_channels * sizeof(float));
+    cudaMalloc(&d_beta, out_channels * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Initialize weights and biases (replace with your actual initialization)
+    // Convolution weights (assuming your weights are initialized elsewhere)
+    float conv_weights[16 * 3 * 3 * 3] = {
+        // ... your convolution weights ...
+    };
+    cudaMemcpy(d_weight, conv_weights, 16 * 3 * 3 * 3 * sizeof(float), cudaMemcpyHostToDevice);
+    // Convolution biases (assuming your biases are initialized elsewhere)
+    float conv_biases[16] = {
+        // ... your convolution biases ...
+    };
+    cudaMemcpy(d_bias, conv_biases, 16 * sizeof(float), cudaMemcpyHostToDevice);
+    // Batch normalization parameters (replace with your actual values)
+    float bn_running_mean[16] = {
+        // ... your batch normalization running mean ...
+    };
+    cudaMemcpy(d_running_mean, bn_running_mean, 16 * sizeof(float), cudaMemcpyHostToDevice);
+    float bn_running_var[16] = {
+        // ... your batch normalization running variance ...
+    };
+    cudaMemcpy(d_running_var, bn_running_var, 16 * sizeof(float), cudaMemcpyHostToDevice);
+    float bn_gamma[16] = {
+        // ... your batch normalization gamma values ...
+    };
+    cudaMemcpy(d_gamma, bn_gamma, 16 * sizeof(float), cudaMemcpyHostToDevice);
+    float bn_beta[16] = {
+        // ... your batch normalization beta values ...
+    };
+    cudaMemcpy(d_beta, bn_beta, 16 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch convolution kernel
+    dim3 threadsPerBlock(32, 1, 1);
+    dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    conv_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output,
+        batch_size, in_channels, out_channels, height, width, kernel_size, padding
+    );
+
+    // Launch batch normalization kernel
+    batch_norm_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, d_running_mean, d_running_var, d_gamma, d_beta, d_output,
+        batch_size, out_channels, height, width, eps
+    );
+
+    // Launch ReLU kernel
+    relu_kernel<<<(out_channels * height * width * batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, threadsPerBlock.x>>>(
+        d_output, d_output, batch_size * out_channels * height * width
+    );
+
+    // Launch normalization kernel
+    normalization_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, d_output, batch_size, out_channels, height, width
+    );
+
+    // Launch adaptive average pooling kernel
+    dim3 numBlocksPool((batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z,
+                       (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y, 1);
+
+    adaptive_avg_pool_kernel<<<numBlocksPool, threadsPerBlock>>>(
+        d_output, d_output, batch_size, out_channels, height, width
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * out_channels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+    cudaFree(d_running_mean);
+    cudaFree(d_running_var);
+    cudaFree(d_gamma);
+    cudaFree(d_beta);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for convolution
+__global__ void conv_kernel(const float* input, const float* weight, const float* bias, float* output,
+                            int batch_size, int in_channels, int out_channels, int height, int width, int kernel_size, int padding) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int out_channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_row = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_col = threadIdx.x;
+
+    if (batch_idx < batch_size && out_channel_idx < out_channels && out_row < height && out_col < width) {
+        float sum = bias[out_channel_idx];
+        for (int in_channel_idx = 0; in_channel_idx < in_channels; ++in_channel_idx) {
+            for (int kernel_row = 0; kernel_row < kernel_size; ++kernel_row) {
+                for (int kernel_col = 0; kernel_col < kernel_size; ++kernel_col) {
+                    int in_row = out_row + kernel_row - padding;
+                    int in_col = out_col + kernel_col - padding;
+
+                    if (in_row >= 0 && in_row < height && in_col >= 0 && in_col < width) {
+                        sum += half_to_float(weight[out_channel_idx * in_channels * kernel_size * kernel_size +
+                                            in_channel_idx * kernel_size * kernel_size +
+                                            kernel_row * kernel_size + kernel_col]) *
+                               half_to_float(input[batch_idx * in_channels * height * width +
+                                               in_channel_idx * height * width +
+                                               in_row * width + in_col]);
+                    }
+                }
+            }
+        }
+        output[batch_idx * out_channels * height * width + out_channel_idx * height * width + out_row * width + out_col] = sum;
+    }
+}
+
+// CUDA kernel for batch normalization
+__global__ void batch_norm_kernel(const float* input, const float* running_mean, const float* running_var, const float* gamma, const float* beta, float* output,
+                                 int batch_size, int channels, int height, int width, float eps) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < channels && row < height && col < width) {
+        int index = batch_idx * channels * height * width + channel_idx * height * width + row * width + col;
+        float x = input[index];
+        output[index] = (x - running_mean[channel_idx]) * gamma[channel_idx] / sqrtf(running_var[channel_idx] + eps) + beta[channel_idx];
+    }
+}
+
+// CUDA kernel for ReLU activation
+__global__ void relu_kernel(const float* input, float* output, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        output[i] = fmaxf(input[i], 0.0f);
+    }
+}
+
+// CUDA kernel for normalization
+__global__ void normalization_kernel(const float* input, float* output, int batch_size, int channels, int height, int width) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < channels && row < height && col < width) {
+        int index = batch_idx * channels * height * width + channel_idx * height * width + row * width + col;
+        output[index] = input[index] / (float) (height * width);  // Normalize by total pixels
+    }
+}
+
+// CUDA kernel for adaptive average pooling (global)
+__global__ void adaptive_avg_pool_kernel(const float* input, float* output, int batch_size, int channels, int height, int width) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && channel_idx < channels) {
+        float sum = 0.0f;
+        for (int row = 0; row < height; ++row) {
+            for (int col = 0; col < width; ++col) {
+                int index = batch_idx * channels * height * width + channel_idx * height * width + row * width + col;
+                sum += input[index];
+            }
+        }
+        output[batch_idx * channels + channel_idx] = sum / (float) (height * width);
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Parameters
+    int batch_size = input_tensor_dim0;
+    int in_channels = input_tensor_dim1;
+    int height = input_tensor_dim2;
+    int width = input_tensor_dim3;
+    int out_channels = 16;
+    int kernel_size = 3;
+    int padding = 1;
+    float eps = 1e-5f;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output, *d_running_mean, *d_running_var, *d_gamma, *d_beta;
+    cudaMalloc(&d_input, batch_size * in_channels * height * width * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * in_channels * kernel_size * kernel_size * sizeof(float));
+    cudaMalloc(&d_bias, out_channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * height * width * sizeof(float));
+    cudaMalloc(&d_running_mean, out_channels * sizeof(float));
+    cudaMalloc(&d_running_var, out_channels * sizeof(float));
+    cudaMalloc(&d_gamma, out_channels * sizeof(float));
+    cudaMalloc(&d_beta, out_channels * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Initialize weights and biases (replace with your actual initialization)
+    // Convolution weights (assuming your weights are initialized elsewhere)
+    float conv_weights[16 * 3 * 3 * 3] = {
+        // ... your convolution weights ...
+    };
+    cudaMemcpy(d_weight, conv_weights, 16 * 3 * 3 * 3 * sizeof(float), cudaMemcpyHostToDevice);
+    // Convolution biases (assuming your biases are initialized elsewhere)
+    float conv_biases[16] = {
+        // ... your convolution biases ...
+    };
+    cudaMemcpy(d_bias, conv_biases, 16 * sizeof(float), cudaMemcpyHostToDevice);
+    // Batch normalization parameters (replace with your actual values)
+    float bn_running_mean[16] = {
+        // ... your batch normalization running mean ...
+    };
+    cudaMemcpy(d_running_mean, bn_running_mean, 16 * sizeof(float), cudaMemcpyHostToDevice);
+    float bn_running_var[16] = {
+        // ... your batch normalization running variance ...
+    };
+    cudaMemcpy(d_running_var, bn_running_var, 16 * sizeof(float), cudaMemcpyHostToDevice);
+    float bn_gamma[16] = {
+        // ... your batch normalization gamma values ...
+    };
+    cudaMemcpy(d_gamma, bn_gamma, 16 * sizeof(float), cudaMemcpyHostToDevice);
+    float bn_beta[16] = {
+        // ... your batch normalization beta values ...
+    };
+    cudaMemcpy(d_beta, bn_beta, 16 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch convolution kernel
+    dim3 threadsPerBlock(32, 1, 1);
+    dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    conv_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output,
+        batch_size, in_channels, out_channels, height, width, kernel_size, padding
+    );
+
+    // Launch batch normalization kernel
+    batch_norm_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, d_running_mean, d_running_var, d_gamma, d_beta, d_output,
+        batch_size, out_channels, height, width, eps
+    );
+
+    // Launch ReLU kernel
+    relu_kernel<<<(out_channels * height * width * batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, threadsPerBlock.x>>>(
+        d_output, d_output, batch_size * out_channels * height * width
+    );
+
+    // Launch normalization kernel
+    normalization_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, d_output, batch_size, out_channels, height, width
+    );
+
+    // Launch adaptive average pooling kernel
+    dim3 numBlocksPool((batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z,
+                       (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y, 1);
+
+    adaptive_avg_pool_kernel<<<numBlocksPool, threadsPerBlock>>>(
+        d_output, d_output, batch_size, out_channels, height, width
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * out_channels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+    cudaFree(d_running_mean);
+    cudaFree(d_running_var);
+    cudaFree(d_gamma);
+    cudaFree(d_beta);
+}
+
+}  // extern "C"
+```

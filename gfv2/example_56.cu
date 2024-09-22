@@ -1,0 +1,148 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Median Filter Kernel
+__global__ void median_filter_kernel(const float* input, float* output, int width, int height, int channels) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (x < width && y < height && c < channels) {
+        // Calculate the neighborhood
+        int min_x = max(0, x - 1);
+        int max_x = min(width - 1, x + 1);
+        int min_y = max(0, y - 1);
+        int max_y = min(height - 1, y + 1);
+
+        // Calculate the size of the neighborhood
+        int neighborhood_size = (max_x - min_x + 1) * (max_y - min_y + 1);
+
+        // Allocate temporary memory for the neighborhood
+        float neighborhood[neighborhood_size];
+
+        // Copy the neighborhood to the temporary memory
+        int index = 0;
+        for (int i = min_y; i <= max_y; ++i) {
+            for (int j = min_x; j <= max_x; ++j) {
+                neighborhood[index++] = input[c * width * height + i * width + j];
+            }
+        }
+
+        // Calculate the median of the neighborhood
+        float median = neighborhood[neighborhood_size / 2];
+
+        // Write the median to the output
+        output[c * width * height + y * width + x] = median;
+    }
+}
+
+// Kernel for element-wise sum and greater than or equal comparison
+__global__ void sum_and_threshold_kernel(const float* filtered_image, const float* filter_kernel, float* output, 
+                                         float threshold, int width, int height, int channels) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (x < width && y < height && c < channels) {
+        output[c * width * height + y * width + x] = 
+            (filtered_image[c * width * height + y * width + x] + filter_kernel[c * width * height + y * width + x]) >= threshold;
+    }
+}
+
+// Softmax kernel with temperature
+__global__ void softmax_kernel(const float* input, float* output, float temperature, int width, int height, int channels) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (x < width && y < height && c < channels) {
+        // Calculate the numerator
+        float numerator = exp(input[c * width * height + y * width + x] * temperature);
+
+        // Calculate the denominator
+        float denominator = 0.0f;
+        for (int i = 0; i < channels; ++i) {
+            denominator += exp(input[i * width * height + y * width + x] * temperature);
+        }
+
+        // Calculate the softmax value
+        output[c * width * height + y * width + x] = numerator / denominator;
+    }
+}
+
+extern "C" {
+    void complex_image_processing(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        // Extract input tensors
+        const float* image_tensor = va_arg(args, const float*);
+        int image_tensor_dim0 = va_arg(args, int);
+        int image_tensor_dim1 = va_arg(args, int);
+        int image_tensor_dim2 = va_arg(args, int);
+
+        const float* filter_kernel = va_arg(args, const float*);
+        int filter_kernel_dim0 = va_arg(args, int);
+        int filter_kernel_dim1 = va_arg(args, int);
+        int filter_kernel_dim2 = va_arg(args, int);
+
+        // Extract temperature
+        float temperature = va_arg(args, double);
+
+        // Extract output tensor (assuming it's preallocated)
+        int8_t* output = va_arg(args, int8_t*);
+
+        va_end(args);
+
+        int channels = image_tensor_dim0;
+        int width = image_tensor_dim1;
+        int height = image_tensor_dim2;
+
+        // Allocate device memory
+        float *d_image, *d_filtered_image, *d_filter_kernel, *d_summed_image;
+        cudaMalloc(&d_image, channels * width * height * sizeof(float));
+        cudaMalloc(&d_filtered_image, channels * width * height * sizeof(float));
+        cudaMalloc(&d_filter_kernel, channels * width * height * sizeof(float));
+        cudaMalloc(&d_summed_image, channels * width * height * sizeof(float));
+
+        // Copy input data to device
+        cudaMemcpy(d_image, image_tensor, channels * width * height * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_filter_kernel, filter_kernel, channels * width * height * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Launch median filter kernel
+        dim3 threadsPerBlock(16, 16, 1);
+        dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                       (height + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                       (channels + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+        median_filter_kernel<<<numBlocks, threadsPerBlock>>>(d_image, d_filtered_image, width, height, channels);
+
+        // Launch sum and threshold kernel
+        sum_and_threshold_kernel<<<numBlocks, threadsPerBlock>>>(d_filtered_image, d_filter_kernel, d_summed_image, 0.5f, width, height, channels);
+
+        // Launch softmax kernel
+        softmax_kernel<<<numBlocks, threadsPerBlock>>>(d_summed_image, d_summed_image, temperature, width, height, channels);
+
+        // Copy result back to host
+        cudaMemcpy(output, d_summed_image, channels * width * height * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_image);
+        cudaFree(d_filtered_image);
+        cudaFree(d_filter_kernel);
+        cudaFree(d_summed_image);
+    }
+} 

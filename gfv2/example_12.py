@@ -1,62 +1,43 @@
 
 import torch
-import torch.nn.functional as F
-from torch.cuda.amp import autocast
+import torch.fft
 
-def torch_int8_batchnorm_function(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, 
-                                    running_mean: torch.Tensor, running_var: torch.Tensor, 
-                                    eps: float, momentum: float, training: bool,
-                                    output_scale: float) -> torch.Tensor:
+def stft_and_power_spectrum(signal: torch.Tensor, 
+                            window: torch.Tensor, 
+                            n_fft: int, 
+                            hop_length: int, 
+                            win_length: int) -> torch.Tensor:
     """
-    Performs int8 batch normalization with optional training and gradient precision scaling.
+    Computes the Short-Time Fourier Transform (STFT) and power spectrum of a signal.
 
     Args:
-        input_tensor: Input tensor, dtype torch.int8.
-        weight: Weight tensor, dtype torch.float32.
-        bias: Bias tensor, dtype torch.float32.
-        running_mean: Running mean tensor, dtype torch.float32.
-        running_var: Running variance tensor, dtype torch.float32.
-        eps: Small value added to variance to avoid division by zero.
-        momentum: Momentum for running mean and variance update.
-        training: Flag indicating if the operation is in training mode.
-        output_scale: Output scale factor to apply after batch normalization.
+        signal: The input signal tensor.
+        window: The window function tensor.
+        n_fft: The length of the FFT.
+        hop_length: The hop length between frames.
+        win_length: The length of the window function.
 
     Returns:
-        Output tensor, dtype torch.float32.
+        The power spectrum of the signal.
     """
+    # Perform STFT
+    stft_matrix = torch.stft(signal, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window=window)
 
-    # Convert input to fp32 for batch norm operations
-    input_fp32 = input_tensor.to(torch.float32)
+    # Calculate power spectrum
+    power_spectrum = stft_matrix.abs() ** 2
 
-    # Batch normalization
-    with autocast():
-        output = F.batch_norm(input_fp32, weight, bias, running_mean, running_var, 
-                              training=training, momentum=momentum, eps=eps)
-
-    # Scale output
-    output = output * output_scale
-
-    # Convert back to int8 (optional)
-    # output_int8 = output.to(torch.int8) 
-    # return output_int8
-
-    return output
+    return power_spectrum
 
 function_signature = {
-    "name": "torch_int8_batchnorm_function",
+    "name": "stft_and_power_spectrum",
     "inputs": [
-        ((16, 16, 16, 16), torch.int8),
-        ((16,), torch.float32),
-        ((16,), torch.float32),
-        ((16,), torch.float32),
-        ((16,), torch.float32),
-        (0.001, torch.float32),
-        (0.1, torch.float32),
-        (True, torch.bool),
-        (1.0, torch.float32)
+        ((1024,), torch.float32),
+        ((256,), torch.float32),
+        (1024,),
+        (256,),
+        (256,)
     ],
     "outputs": [
-        ((16, 16, 16, 16), torch.float32),
+        ((5, 513), torch.float32)
     ]
 }
-

@@ -1,42 +1,22 @@
 
 import torch
-import torch.nn as nn
-from torch.nn.functional import one_hot
 
-class MyModel(nn.Module):
-    def __init__(self, num_classes):
-        super(MyModel, self).__init__()
-        self.linear = nn.Linear(10, num_classes)
-
-    def forward(self, x):
-        x = self.linear(x)
-        return x
-
-def torch_model_l1_isin_function(input_tensor: torch.Tensor, model: MyModel, labels: torch.Tensor) -> torch.Tensor:
+def sum_int8_function(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
-    This function runs a model, computes L1 loss and checks if predicted class is in a list of labels.
+    Performs element-wise multiplication and sum using int8.
     """
-    output = model(input_tensor)
-    predicted_class = torch.argmax(output, dim=1)
-
-    # L1 loss between predicted and target (one-hot encoded)
-    target = one_hot(labels, num_classes=output.shape[1])
-    loss = torch.nn.L1Loss()(output, target)
-
-    # Check if predicted class is in a list of labels
-    isin = torch.isin(predicted_class, labels)
-
-    return loss, isin.float()
+    input_int8 = input_tensor.to(torch.int8)
+    weight_int8 = weight.to(torch.int8)
+    output = (input_int8 * weight_int8).sum()
+    return torch.tensor([output], dtype=torch.int32)
 
 function_signature = {
-    "name": "torch_model_l1_isin_function",
+    "name": "sum_int8_function",
     "inputs": [
-        ((10, 10), torch.float32),
-        (MyModel, None),
-        ((10,), torch.int64)
+        ((4, 4), torch.int8),
+        ((4, 4), torch.int8)
     ],
     "outputs": [
-        ((), torch.float32),
-        ((10,), torch.float32)
+        ((1,), torch.int32),
     ]
 }

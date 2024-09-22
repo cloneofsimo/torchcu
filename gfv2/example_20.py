@@ -1,38 +1,37 @@
 
 import torch
-import torch.nn as nn
-from torch.cuda.amp import autocast
+import torch.nn.functional as F
 
-def torch_center_loss_function(input_tensor: torch.Tensor, centers: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+def conv3d_fft_replication_pad(input_tensor: torch.Tensor, weight: torch.Tensor, 
+                                  padding: int, stride: int = 1, dilation: int = 1) -> torch.Tensor:
     """
-    Calculates the center loss for a batch of features, with bucketing and weighted averaging.
+    Applies a 3D convolution using FFT and replication padding.
     """
-    # Bucketize features
-    bucket_indices = torch.bucketize(input_tensor, torch.linspace(0, 1, 10))  # 10 buckets
-    
-    # Compute center loss for each bucket
-    bucket_losses = []
-    for i in range(10):
-        indices = (bucket_indices == i)
-        features_in_bucket = input_tensor[indices]
-        center_in_bucket = centers[i]
-        loss_in_bucket = torch.sum((features_in_bucket - center_in_bucket) ** 2)
-        bucket_losses.append(loss_in_bucket)
+    # Replication padding
+    input_tensor = F.pad(input_tensor, (padding, padding, padding, padding, padding, padding), mode='replicate')
 
-    # Weighted average of bucket losses
-    weighted_losses = [loss * weight for loss, weight in zip(bucket_losses, weights)]
-    total_loss = torch.sum(torch.stack(weighted_losses))
-    
-    return total_loss
+    # 3D FFT
+    input_tensor = torch.fft.fft3(input_tensor)
+    weight_fft = torch.fft.fft3(weight)
+
+    # Convolution in frequency domain
+    output_fft = torch.fft.ifft3(input_tensor * weight_fft)
+
+    # Crop output to original size
+    output_tensor = output_fft[padding:padding + input_tensor.shape[2], 
+                                padding:padding + input_tensor.shape[3], 
+                                padding:padding + input_tensor.shape[4]]
+
+    # ReLU activation
+    return F.relu(output_tensor)
 
 function_signature = {
-    "name": "torch_center_loss_function",
+    "name": "conv3d_fft_replication_pad",
     "inputs": [
-        ((128, 512), torch.float32),  # Features
-        ((10, 512), torch.float32),  # Centers
-        ((10,), torch.float32),  # Weights
+        ((4, 4, 4, 4, 4), torch.float32),  # input tensor (batch, channels, D, H, W)
+        ((4, 4, 3, 3, 3), torch.float32)   # weight tensor (out_channels, in_channels, kernel_D, kernel_H, kernel_W)
     ],
     "outputs": [
-        ((), torch.float32),  # Total center loss
+        ((4, 4, 4, 4, 4), torch.float32)  # output tensor
     ]
 }

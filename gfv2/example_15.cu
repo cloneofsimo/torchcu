@@ -1,140 +1,122 @@
 
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
 #include <cutlass/cutlass.h>
-#include <cutlass/gemm/gemm.h>
-#include <cutlass/layout/tensor.h>
-#include <cutlass/epilogue/threadblock/linear_combination.h>
 
-// Define element types
-using ElementA = half;
-using ElementB = half;
-using ElementC = half;
-
-// Define matrix layout for CUDA kernels
-using MatrixLayoutA = cutlass::layout::RowMajor;
-using MatrixLayoutB = cutlass::layout::RowMajor;
-using MatrixLayoutC = cutlass::layout::RowMajor;
-
-// Define threadblock size
-constexpr int kThreadblockSize = 128;
-
-// CUDA kernel for multi-head attention
-__global__ void multihead_attention_kernel(const half* query, const half* key, const half* value, 
-                                           half* output, int batch_size, int seq_len, int head_size) {
-    int batch_idx = blockIdx.x;
-    int thread_idx = threadIdx.x;
-
-    // Calculate global memory offsets
-    int query_offset = batch_idx * seq_len * head_size + thread_idx;
-    int key_offset = batch_idx * seq_len * head_size + thread_idx;
-    int value_offset = batch_idx * seq_len * head_size + thread_idx;
-    int output_offset = batch_idx * seq_len * head_size + thread_idx;
-
-    // Load query, key, and value values
-    half q = query[query_offset];
-    half k = key[key_offset];
-    half v = value[value_offset];
-
-    // Calculate attention score
-    half score = __hmul(q, k);
-
-    // Calculate weighted sum of value
-    output[output_offset] = __hmul(score, v);
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
 }
 
-// CUDA kernel for feedforward network
-__global__ void feedforward_kernel(const half* input, const half* weight, half* output, 
-                                  int batch_size, int seq_len, int hidden_size) {
-    int batch_idx = blockIdx.x;
-    int thread_idx = threadIdx.x;
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
 
-    // Calculate global memory offsets
-    int input_offset = batch_idx * seq_len * hidden_size + thread_idx;
-    int output_offset = batch_idx * seq_len + thread_idx;
+// CUDA kernel for Cholesky decomposition
+__global__ void cholesky_kernel(const float* input, float* chol_output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Load input value
-    half in = input[input_offset];
+    if (i >= j && i < n && j < n) {
+        float sum = 0.0f;
+        for (int k = 0; k < j; ++k) {
+            sum += chol_output[i * n + k] * chol_output[j * n + k];
+        }
+        chol_output[i * n + j] = (i == j) ? sqrtf(input[i * n + i] - sum) : (input[i * n + j] - sum) / chol_output[j * n + j];
+    }
+}
 
-    // Multiply by weight
-    output[output_offset] = __hmul(in, weight[thread_idx]);
+// CUDA kernel for pairwise Hamming distance calculation
+__global__ void hamming_distance_kernel(const float* chol_input, const float* weight, float* hamming_dist, int m, int n) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            sum += fabsf(chol_input[row * n + i] - weight[col * n + i]);
+        }
+        hamming_dist[row * n + col] = sum;
+    }
+}
+
+// CUDA kernel for layer scaling decay
+__global__ void layer_scaling_decay_kernel(const float* hamming_dist, float* scaled_hamming, int m, int n, float scale_factor) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        scaled_hamming[row * n + col] = hamming_dist[row * n + col] * (1 - scale_factor);
+    }
 }
 
 extern "C" {
 
-void torch_transformer_decoder_fp16_function(int num_args, ...) {
+void cholesky_hamming_layer_scaling(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
-    // Extract input tensors
-    const float* input = va_arg(args, const float*);
-    int input_dim0 = va_arg(args, int);
-    int input_dim1 = va_arg(args, int);
-    int input_dim2 = va_arg(args, int);
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
 
-    const float* memory = va_arg(args, const float*);
-    int memory_dim0 = va_arg(args, int);
-    int memory_dim1 = va_arg(args, int);
-    int memory_dim2 = va_arg(args, int);
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
 
-    const float* query = va_arg(args, const float*);
-    int query_dim0 = va_arg(args, int);
-    int query_dim1 = va_arg(args, int);
-    int query_dim2 = va_arg(args, int);
+    // Extract scale factor
+    const float* scale_factor_ptr = va_arg(args, const float*);
+    float scale_factor = *scale_factor_ptr;
 
-    const float* key = va_arg(args, const float*);
-    int key_dim0 = va_arg(args, int);
-    int key_dim1 = va_arg(args, int);
-    int key_dim2 = va_arg(args, int);
-
-    const float* value = va_arg(args, const float*);
-    int value_dim0 = va_arg(args, int);
-    int value_dim1 = va_arg(args, int);
-    int value_dim2 = va_arg(args, int);
-
-    // Extract output tensor
+    // Extract output tensor (assuming it's preallocated)
     float* output = va_arg(args, float*);
 
     va_end(args);
 
-    int batch_size = input_dim0;
-    int seq_len = input_dim1;
-    int head_size = input_dim2;
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
 
     // Allocate device memory
-    half* d_input, *d_memory, *d_query, *d_key, *d_value, *d_output;
-    cudaMalloc(&d_input, batch_size * seq_len * head_size * sizeof(half));
-    cudaMalloc(&d_memory, batch_size * memory_dim1 * memory_dim2 * sizeof(half));
-    cudaMalloc(&d_query, batch_size * seq_len * head_size * sizeof(half));
-    cudaMalloc(&d_key, batch_size * memory_dim1 * head_size * sizeof(half));
-    cudaMalloc(&d_value, batch_size * memory_dim1 * head_size * sizeof(half));
-    cudaMalloc(&d_output, batch_size * seq_len * head_size * sizeof(half));
+    float *d_input, *d_weight, *d_chol_input, *d_hamming_dist, *d_scaled_hamming;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_chol_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_hamming_dist, batch_size * batch_size * sizeof(float));
+    cudaMalloc(&d_scaled_hamming, batch_size * batch_size * sizeof(float));
 
     // Copy input data to device
-    cudaMemcpy(d_input, input, batch_size * seq_len * head_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_memory, memory, batch_size * memory_dim1 * memory_dim2 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_query, query, batch_size * seq_len * head_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_key, key, batch_size * memory_dim1 * head_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_value, value, batch_size * memory_dim1 * head_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Launch multi-head attention kernel
-    multihead_attention_kernel<<<batch_size, kThreadblockSize>>>(d_query, d_key, d_value, d_output, 
-                                                            batch_size, seq_len, head_size);
+    // Launch Cholesky kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((input_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (input_dim + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    cholesky_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_chol_input, input_dim);
 
-    // Launch feedforward network kernel
-    feedforward_kernel<<<batch_size, kThreadblockSize>>>(d_output, d_input, d_output, 
-                                                  batch_size, seq_len, head_size);
+    // Launch Hamming distance kernel
+    numBlocks = ((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    hamming_distance_kernel<<<numBlocks, threadsPerBlock>>>(d_chol_input, d_weight, d_hamming_dist, batch_size, input_dim);
+
+    // Launch layer scaling decay kernel
+    layer_scaling_decay_kernel<<<numBlocks, threadsPerBlock>>>(d_hamming_dist, d_scaled_hamming, batch_size, batch_size, scale_factor);
 
     // Copy result back to host
-    cudaMemcpy(output, d_output, batch_size * seq_len * head_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(output, d_scaled_hamming, batch_size * batch_size * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Free device memory
     cudaFree(d_input);
-    cudaFree(d_memory);
-    cudaFree(d_query);
-    cudaFree(d_key);
-    cudaFree(d_value);
-    cudaFree(d_output);
+    cudaFree(d_weight);
+    cudaFree(d_chol_input);
+    cudaFree(d_hamming_dist);
+    cudaFree(d_scaled_hamming);
 }
 
-} // extern "C"
+}  // extern "C"

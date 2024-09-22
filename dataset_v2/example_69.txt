@@ -1,0 +1,121 @@
+```python
+import torch
+
+def label_smoothing_int8(input_tensor: torch.Tensor, labels: torch.Tensor, smoothing: float = 0.1) -> torch.Tensor:
+    """
+    Applies label smoothing to the input tensor and returns the smoothed labels.
+    """
+    confidence = 1.0 - smoothing
+    log_probs = torch.log_softmax(input_tensor, dim=1)
+    nll_loss = -log_probs.gather(dim=1, index=labels.unsqueeze(1))
+    nll_loss = nll_loss.squeeze(1)
+    smooth_loss = -log_probs.mean(dim=1)
+    loss = confidence * nll_loss + smoothing * smooth_loss
+    return loss.to(torch.int8)
+
+function_signature = {
+    "name": "label_smoothing_int8",
+    "inputs": [
+        ((10, 5), torch.float32),
+        ((10,), torch.int64)
+    ],
+    "outputs": [
+        ((10,), torch.int8)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>  // Include for half precision
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for label smoothing
+__global__ void label_smoothing_kernel(const float* input_tensor, const int* labels, int* output,
+                                       int batch_size, int num_classes, float smoothing) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float max_prob = -INFINITY;
+        int max_idx = -1;
+        for (int i = 0; i < num_classes; ++i) {
+            float prob = input_tensor[idx * num_classes + i];
+            if (prob > max_prob) {
+                max_prob = prob;
+                max_idx = i;
+            }
+        }
+
+        float confidence = 1.0f - smoothing;
+        float smooth_loss = -logf(max_prob) * confidence;
+        float nll_loss = -logf(input_tensor[idx * num_classes + labels[idx]]) * confidence;
+        float loss = smooth_loss + smoothing * nll_loss;
+
+        output[idx] = __int_as_char(static_cast<int>(loss));
+    }
+}
+
+extern "C" {
+
+void label_smoothing_int8(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract labels tensor
+    const int* labels = va_arg(args, const int*);
+
+    // Extract output tensor (assuming it's preallocated)
+    int* output = va_arg(args, int*);
+
+    float smoothing = va_arg(args, double);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int num_classes = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input;
+    int *d_labels, *d_output;
+    cudaMalloc(&d_input, batch_size * num_classes * sizeof(float));
+    cudaMalloc(&d_labels, batch_size * sizeof(int));
+    cudaMalloc(&d_output, batch_size * sizeof(int));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * num_classes * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_labels, labels, batch_size * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(128);  // Adjust block size as needed
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    label_smoothing_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_labels, d_output, batch_size, num_classes, smoothing
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_labels);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

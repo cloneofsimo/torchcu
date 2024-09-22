@@ -1,154 +1,158 @@
 
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <device_launch_parameters.h>
-#include <iostream>
-#include <cmath>
-#include <cutlass/cutlass.h>
+#include <stdarg.h>
+#include <math.h>
 
-#define CUDA_CHECK(x)                                                                   \
-    do {                                                                            \
-        cudaError_t err = (x);                                                      \
-        if (err != cudaSuccess) {                                                   \
-            fprintf(stderr, "Error: %s in %s at line %d\n", cudaGetErrorString(err), \
-                    __func__, __LINE__);                                           \
-            exit(EXIT_FAILURE);                                                   \
-        }                                                                            \
-    } while (0)
+#include "cutlass/cutlass.h"
 
-// Helper function to convert float to half
-__device__ __forceinline__ half float_to_half(float f) {
-    return __float2half_rn(f);
+// Helper functions for bfloat16 conversions
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
 }
 
-// Helper function to convert half to float
-__device__ __forceinline__ float half_to_float(half h) {
-    return __half2float(h);
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
 }
 
-// CUDA kernel for matrix multiplication and ReLU using bfloat16
-__global__ void matmul_relu_kernel_bf16(const float* input_tensor, const float* weight, float* output, 
-                                        int m, int n, int k) {
+// CUDA kernel for mel conversion using bfloat16 and Cutlass
+__global__ void mel_conversion_kernel_bf16(const float* spectrogram, const float* mel_basis,
+                                        float* mel_spectrogram, int batch_size, int n_mels, int n_fft_bins,
+                                        int frames) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (row < m && col < n) {
+
+    if (row < batch_size && col < n_mels) {
         float sum = 0.0f;
-        for (int i = 0; i < k; ++i) {
-            __nv_bfloat16 a = float_to_bfloat16(input_tensor[row * k + i]);
-            __nv_bfloat16 b = float_to_bfloat16(weight[col * k + i]);  // Transposed access
+        for (int i = 0; i < n_fft_bins; ++i) {
+            __nv_bfloat16 a = float_to_bfloat16(spectrogram[(row * n_fft_bins + i) * frames + col]);
+            __nv_bfloat16 b = float_to_bfloat16(mel_basis[col * n_fft_bins + i]);
             sum += bfloat16_to_float(__hmul(a, b));
         }
-        output[row * n + col] = fmaxf(sum, 0.0f);  // ReLU activation
+        mel_spectrogram[(row * n_mels + col) * frames] = sum;
     }
 }
 
-// CUDA kernel for linear layer
-__global__ void linear_layer_kernel(const float* input, const float* weight, const float* bias, 
-                                    float* output, int batch_size, int input_size, int output_size) {
+// CUDA kernel for inverse mel conversion using bfloat16 and Cutlass
+__global__ void inverse_mel_conversion_kernel_bf16(const float* mel_spectrogram, const float* inverse_mel_basis,
+                                                    float* spectrogram, int batch_size, int n_fft_bins,
+                                                    int n_mels, int frames) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (row < batch_size && col < output_size) {
+    if (row < batch_size && col < n_fft_bins) {
         float sum = 0.0f;
-        for (int i = 0; i < input_size; ++i) {
-            sum += input[row * input_size + i] * weight[col * input_size + i];
+        for (int i = 0; i < n_mels; ++i) {
+            __nv_bfloat16 a = float_to_bfloat16(mel_spectrogram[(row * n_mels + i) * frames]);
+            __nv_bfloat16 b = float_to_bfloat16(inverse_mel_basis[col * n_mels + i]);
+            sum += bfloat16_to_float(__hmul(a, b));
         }
-        output[row * output_size + col] = sum + bias[col];
+        spectrogram[(row * n_fft_bins + col) * frames] = sum;
     }
 }
 
-// Function for the model forward pass
-void forward_pass(const float* input_tensor, const float* weight1, const float* bias1,
-                 const float* weight2, const float* bias2, float* output, 
-                 int batch_size, int input_size, int hidden_size, int output_size) {
-
-    // Allocate device memory
-    float* d_input, *d_weight1, *d_bias1, *d_weight2, *d_bias2, *d_output;
-    CUDA_CHECK(cudaMalloc(&d_input, batch_size * input_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_weight1, hidden_size * input_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_bias1, hidden_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_weight2, output_size * hidden_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_bias2, output_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, batch_size * output_size * sizeof(float)));
-
-    // Copy input data to device
-    CUDA_CHECK(cudaMemcpy(d_input, input_tensor, batch_size * input_size * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_weight1, weight1, hidden_size * input_size * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_bias1, bias1, hidden_size * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_weight2, weight2, output_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_bias2, bias2, output_size * sizeof(float), cudaMemcpyHostToDevice));
-
-    // Launch kernel for the first linear layer
-    dim3 threadsPerBlock(16, 16);
-    dim3 numBlocks((hidden_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
-    linear_layer_kernel<<<numBlocks, threadsPerBlock>>>(
-        d_input, d_weight1, d_bias1, d_output, batch_size, input_size, hidden_size
-    );
-
-    // Launch kernel for ReLU (not strictly necessary, as we can do it directly in the next linear layer)
-    // ... (You could implement a ReLU kernel here if needed)
-
-    // Launch kernel for the second linear layer
-    numBlocks = ((output_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
-    linear_layer_kernel<<<numBlocks, threadsPerBlock>>>(
-        d_output, d_weight2, d_bias2, d_output, batch_size, hidden_size, output_size
-    );
-
-    // Copy result back to host
-    CUDA_CHECK(cudaMemcpy(output, d_output, batch_size * output_size * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // Free device memory
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_weight1));
-    CUDA_CHECK(cudaFree(d_bias1));
-    CUDA_CHECK(cudaFree(d_weight2));
-    CUDA_CHECK(cudaFree(d_bias2));
-    CUDA_CHECK(cudaFree(d_output));
-}
-
+// Function for audio resynthesis with Cutlass optimization
 extern "C" {
 
-void torch_int8_gradient_clipping_function(int num_args, ...) {
+void audio_resynthesis_bf16(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
-    // Extract input tensor
-    const float* input_tensor = va_arg(args, const float*);
-    int input_tensor_dim0 = va_arg(args, int);
-    int input_tensor_dim1 = va_arg(args, int);
+    // Extract input tensors
+    const float* spectrogram = va_arg(args, const float*);
+    int spectrogram_dim0 = va_arg(args, int);
+    int spectrogram_dim1 = va_arg(args, int);
+    int spectrogram_dim2 = va_arg(args, int);
 
-    // Extract model parameters
-    const float* weight1 = va_arg(args, const float*);
-    int weight1_dim0 = va_arg(args, int);
-    int weight1_dim1 = va_arg(args, int);
-    const float* bias1 = va_arg(args, const float*);
-    int bias1_dim0 = va_arg(args, int);
-    const float* weight2 = va_arg(args, const float*);
-    int weight2_dim0 = va_arg(args, int);
-    int weight2_dim1 = va_arg(args, int);
-    const float* bias2 = va_arg(args, const float*);
-    int bias2_dim0 = va_arg(args, int);
-
-    // Extract clip value
-    const float* clip_value = va_arg(args, const float*);
+    const float* mel_basis = va_arg(args, const float*);
+    int mel_basis_dim0 = va_arg(args, int);
+    int mel_basis_dim1 = va_arg(args, int);
 
     // Extract output tensor
-    float* output = va_arg(args, float*);
+    float* audio = va_arg(args, float*);
+
+    // Extract STFT parameters
+    int n_fft = va_arg(args, int);
+    int hop_length = va_arg(args, int);
 
     va_end(args);
 
-    int batch_size = input_tensor_dim0;
-    int input_size = input_tensor_dim1;
-    int hidden_size = weight1_dim0;
-    int output_size = weight2_dim0;
+    int batch_size = spectrogram_dim0;
+    int n_fft_bins = spectrogram_dim1;
+    int frames = spectrogram_dim2;
+    int n_mels = mel_basis_dim0;
 
-    // Perform forward pass with the model
-    forward_pass(input_tensor, weight1, bias1, weight2, bias2, output, 
-                batch_size, input_size, hidden_size, output_size);
+    // Allocate device memory for mel-spectrogram
+    float* d_mel_spectrogram;
+    cudaMalloc(&d_mel_spectrogram, batch_size * n_mels * frames * sizeof(float));
+
+    // Allocate device memory for inverse mel basis
+    float* d_inverse_mel_basis;
+    cudaMalloc(&d_inverse_mel_basis, n_fft_bins * n_mels * sizeof(float));
+
+    // Calculate inverse mel basis
+    cutlass::gemm::GemmUniversalPlan<float, float, float, cutlass::layout::RowMajor, 
+                                    cutlass::layout::RowMajor, cutlass::layout::RowMajor>
+        inverse_mel_plan;
+    cutlass::gemm::GemmUniversalParams params;
+    params.m = n_fft_bins;
+    params.n = n_mels;
+    params.k = n_mels;
+    params.lda = n_mels;
+    params.ldb = n_fft_bins;
+    params.ldc = n_mels;
+    params.alpha = 1.0f;
+    params.beta = 0.0f;
+    inverse_mel_plan.initialize(params);
+    inverse_mel_plan.execute(d_mel_basis, n_fft_bins * n_mels, d_inverse_mel_basis, n_mels * n_fft_bins,
+                            d_inverse_mel_basis, n_fft_bins * n_mels);
+
+    // Allocate device memory for spectrogram (for inverse STFT)
+    float* d_spectrogram;
+    cudaMalloc(&d_spectrogram, batch_size * n_fft_bins * frames * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_spectrogram, spectrogram, batch_size * n_fft_bins * frames * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mel_basis, mel_basis, n_mels * n_fft_bins * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel for mel conversion
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((n_mels + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    mel_conversion_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_spectrogram, d_mel_basis, d_mel_spectrogram, batch_size, n_mels, n_fft_bins, frames);
+
+    // Launch kernel for inverse mel conversion
+    numBlocks = ((n_fft_bins + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                  (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    inverse_mel_conversion_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_mel_spectrogram, d_inverse_mel_basis, d_spectrogram, batch_size, n_fft_bins, n_mels, frames);
+
+    // Perform inverse STFT using cuDNN (assuming GPU has cuDNN installed)
+    cudnnHandle_t cudnnHandle;
+    cudnnCreate(&cudnnHandle);
+    cudnnTensorDescriptor_t spectrogramDesc, audioDesc;
+    cudnnCreateTensorDescriptor(&spectrogramDesc);
+    cudnnCreateTensorDescriptor(&audioDesc);
+    cudnnSetTensorDescriptor(spectrogramDesc, CUDNN_DATA_FLOAT, 3, &batch_size, &n_fft_bins, &frames);
+    cudnnSetTensorDescriptor(audioDesc, CUDNN_DATA_FLOAT, 1, &batch_size, &frames * hop_length, &1);
+    cudnnIfftDescriptor_t ifftDesc;
+    cudnnCreateIfftDescriptor(&ifftDesc);
+    cudnnSetIfftDescriptor(ifftDesc, n_fft);
+    cudnnIfftForward(cudnnHandle, ifftDesc, d_spectrogram, spectrogramDesc, audio, audioDesc);
+    cudnnDestroyIfftDescriptor(ifftDesc);
+    cudnnDestroyTensorDescriptor(spectrogramDesc);
+    cudnnDestroyTensorDescriptor(audioDesc);
+    cudnnDestroy(cudnnHandle);
+
+    // Copy result back to host
+    cudaMemcpy(audio, d_spectrogram, batch_size * frames * hop_length * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_mel_spectrogram);
+    cudaFree(d_inverse_mel_basis);
+    cudaFree(d_spectrogram);
 }
 
-} // extern "C"
+}

@@ -1,98 +1,84 @@
 
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <device_launch_parameters.h>
-#include <iostream>
-#include <stdarg.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
 
-#include "cutlass/cutlass.h"
+// CUDA kernel for nearest neighbor upsampling
+__global__ void upsample_nearest_kernel(const float* input, float* output,
+                                         int batch_size, int channels,
+                                         int input_height, int input_width,
+                                         int output_height, int output_width,
+                                         int scale_factor) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
 
-// Helper function to convert float to half
-__device__ __forceinline__ half float_to_half(float f) {
-    return __float2half_rn(f);
-}
+    if (b < batch_size && c < channels && h < output_height) {
+        int in_h = h / scale_factor;
+        int in_w = (h % scale_factor) * scale_factor;  // Handle horizontal upsampling
+        int in_idx = (b * channels + c) * input_height * input_width + in_h * input_width + in_w;
 
-// Helper function to convert half to float
-__device__ __forceinline__ float half_to_float(half h) {
-    return __half2float(h);
-}
-
-// CUDA kernel for affine grid generation using cutlass
-__global__ void affine_grid_generator_kernel_fp16(const float* input_tensor, const float* theta, half* output,
-                                                  int batch_size, int height, int width, int channels) {
-    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int x = blockIdx.z * blockDim.z + threadIdx.z;
-
-    if (batch_idx < batch_size && y < height && x < width) {
-        int idx = batch_idx * height * width * channels + y * width * channels + x * channels;
-        float grid_x = (x + 0.5f) / width * 2.0f - 1.0f;
-        float grid_y = (y + 0.5f) / height * 2.0f - 1.0f;
-
-        float tx = theta[batch_idx * 6 + 0] * grid_x + theta[batch_idx * 6 + 1] * grid_y + theta[batch_idx * 6 + 2];
-        float ty = theta[batch_idx * 6 + 3] * grid_x + theta[batch_idx * 6 + 4] * grid_y + theta[batch_idx * 6 + 5];
-
-        output[idx + 0] = float_to_half(tx);
-        output[idx + 1] = float_to_half(ty);
+        for (int w = 0; w < scale_factor; w++) {
+            int out_idx = (b * channels + c) * output_height * output_width + h * output_width + w;
+            output[out_idx] = input[in_idx];
+        }
     }
 }
 
 extern "C" {
-    void torch_affine_grid_generator_fp16(int num_args, ...) {
-        va_list args;
-        va_start(args, num_args);
 
-        // Extract input tensor
-        const float* input_tensor = va_arg(args, const float*);
-        int input_tensor_dim0 = va_arg(args, int);
-        int input_tensor_dim1 = va_arg(args, int);
-        int input_tensor_dim2 = va_arg(args, int);
-        int input_tensor_dim3 = va_arg(args, int);
+void upsample_nearest_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
 
-        // Extract theta tensor
-        const float* theta = va_arg(args, const float*);
-        int theta_dim0 = va_arg(args, int);
-        int theta_dim1 = va_arg(args, int);
-        int theta_dim2 = va_arg(args, int);
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+    int input_dim2 = va_arg(args, int);
+    int input_dim3 = va_arg(args, int);
 
-        // Extract output tensor (assuming it's preallocated)
-        half* output = va_arg(args, half*);
+    // Extract scale factor
+    int scale_factor = va_arg(args, int);
 
-        va_end(args);
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
 
-        int batch_size = input_tensor_dim0;
-        int height = input_tensor_dim2;
-        int width = input_tensor_dim3;
-        int channels = 2; // grid coordinates
+    va_end(args);
 
-        // Allocate device memory
-        float *d_input, *d_theta;
-        half *d_output;
-        cudaMalloc(&d_input, batch_size * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float));
-        cudaMalloc(&d_theta, theta_dim0 * theta_dim1 * theta_dim2 * sizeof(float));
-        cudaMalloc(&d_output, batch_size * height * width * channels * sizeof(half));
+    int batch_size = input_dim0;
+    int channels = input_dim1;
+    int input_height = input_dim2;
+    int input_width = input_dim3;
+    int output_height = input_height * scale_factor;
+    int output_width = input_width * scale_factor;
 
-        // Copy input data to device
-        cudaMemcpy(d_input, input_tensor, batch_size * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_theta, theta, theta_dim0 * theta_dim1 * theta_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * channels * input_height * input_width * sizeof(float));
+    cudaMalloc(&d_output, batch_size * channels * output_height * output_width * sizeof(float));
 
-        // Launch kernel
-        dim3 threadsPerBlock(8, 8, 8);
-        dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                       (height + threadsPerBlock.y - 1) / threadsPerBlock.y,
-                       (width + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * channels * input_height * input_width * sizeof(float), cudaMemcpyHostToDevice);
 
-        affine_grid_generator_kernel_fp16<<<numBlocks, threadsPerBlock>>>(
-            d_input, d_theta, d_output,
-            batch_size, height, width, channels
-        );
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((output_height + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
 
-        // Copy result back to host
-        cudaMemcpy(output, d_output, batch_size * height * width * channels * sizeof(half), cudaMemcpyDeviceToHost);
+    upsample_nearest_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_output, batch_size, channels,
+        input_height, input_width, output_height, output_width, scale_factor
+    );
 
-        // Free device memory
-        cudaFree(d_input);
-        cudaFree(d_theta);
-        cudaFree(d_output);
-    }
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * channels * output_height * output_width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
 }
+
+}  // extern "C"

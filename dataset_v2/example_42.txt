@@ -1,0 +1,121 @@
+```python
+import torch
+import torch.nn.functional as F
+from cutlass import *
+
+def subtract_and_clamp(input_tensor: torch.Tensor, subtrahend: torch.Tensor, min_val: float, max_val: float) -> torch.Tensor:
+    """
+    Subtract two tensors and clamp the result to a specified range.
+    """
+    result = torch.sub(input_tensor, subtrahend)
+    result = torch.clamp(result, min_val, max_val)
+    return result
+
+function_signature = {
+    "name": "subtract_and_clamp",
+    "inputs": [
+        ((16, 16), torch.float32),
+        ((16, 16), torch.float32),
+        (torch.float32),
+        (torch.float32)
+    ],
+    "outputs": [
+        ((16, 16), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/conv/kernel.h>
+#include <cutlass/conv/device/implicit_gemm_convolution.h>
+#include <cutlass/epilogue/threadblock/linear_combine.h>
+#include <cutlass/epilogue/threadblock/identity.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/layout/tensor.h>
+#include <cutlass/matrix_multiply/kernel.h>
+#include <cutlass/matrix_multiply/device/gemm.h>
+#include <cutlass/reduction/device/reduction.h>
+#include <cutlass/reduction/threadblock/reduction.h>
+#include <cutlass/tensor_view.h>
+#include <cutlass/util/host_tensor.h>
+#include <cutlass/util/tensor_view_io.h>
+
+#define BLOCK_SIZE 16
+#define THREADS_PER_BLOCK (BLOCK_SIZE * BLOCK_SIZE)
+
+using cutlass::layout::TensorNHWC;
+using cutlass::layout::TensorNCHW;
+using cutlass::layout::RowMajor;
+using cutlass::layout::ColumnMajor;
+
+using cutlass::epilogue::threadblock::Identity;
+using cutlass::epilogue::threadblock::LinearCombine;
+
+// Function to perform element-wise subtraction and clamping
+__global__ void subtract_and_clamp_kernel(const float* input, const float* subtrahend, float* output, 
+                                            float min_val, float max_val, int num_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_elements) {
+        output[idx] = fmaxf(fminf(input[idx] - subtrahend[idx], max_val), min_val);
+    }
+}
+
+extern "C" {
+
+void subtract_and_clamp(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract subtrahend tensor
+    const float* subtrahend = va_arg(args, const float*);
+    int subtrahend_dim0 = va_arg(args, int);
+    int subtrahend_dim1 = va_arg(args, int);
+
+    // Extract min_val
+    float min_val = va_arg(args, float);
+    
+    // Extract max_val
+    float max_val = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int num_elements = input_tensor_dim0 * input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_subtrahend, *d_output;
+    cudaMalloc(&d_input, num_elements * sizeof(float));
+    cudaMalloc(&d_subtrahend, num_elements * sizeof(float));
+    cudaMalloc(&d_output, num_elements * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_subtrahend, subtrahend, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int num_blocks = (num_elements + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    subtract_and_clamp_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(
+        d_input, d_subtrahend, d_output, min_val, max_val, num_elements
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_subtrahend);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```

@@ -1,0 +1,115 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+#define THREADS_PER_BLOCK 256
+
+__global__ void vision_transformer_block_fp16_kernel(const half* x, const half* attn_weights, const half* mlp_weights, const half* norm_weights, 
+                                                     half* output, int batch_size, int input_dim, int height, int width, float threshold) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * input_dim * height * width) {
+        int b = idx / (input_dim * height * width);
+        int h = (idx % (input_dim * height * width)) / (input_dim * width);
+        int w = (idx % (input_dim * height * width)) % (input_dim * width);
+        int i = idx % input_dim;
+
+        // Multi-Head Attention
+        half sum = 0.0h;
+        for (int j = 0; j < input_dim; ++j) {
+            sum += x[(b * input_dim * height * width) + (j * height * width) + (h * width) + w] * attn_weights[i * input_dim + j];
+        }
+        output[idx] = __fmaf_rn(sum, 1.0h, 0.0h);
+        output[idx] = fmaxf(output[idx], 0.0h);
+
+        // MLP
+        sum = 0.0h;
+        for (int j = 0; j < input_dim; ++j) {
+            sum += output[idx] * mlp_weights[i * input_dim + j];
+        }
+        output[idx] = __fmaf_rn(sum, 1.0h, 0.0h);
+        output[idx] = fmaxf(output[idx], 0.0h);
+
+        // Layer Normalization (Simplified)
+        float mean = 0.0f;
+        float var = 0.0f;
+        for (int j = 0; j < input_dim; ++j) {
+            mean += __float2half_rn(output[(b * input_dim * height * width) + (j * height * width) + (h * width) + w]);
+            var += __float2half_rn(output[(b * input_dim * height * width) + (j * height * width) + (h * width) + w]) * __float2half_rn(output[(b * input_dim * height * width) + (j * height * width) + (h * width) + w]);
+        }
+        mean /= input_dim;
+        var /= input_dim;
+        var -= mean * mean;
+        output[idx] = __float2half_rn(((__float2half_rn(output[idx]) - mean) / sqrtf(var + 1e-5f)) * norm_weights[i]);
+
+        // Thresholding
+        output[idx] = (output[idx] > threshold) ? output[idx] : 0.0h;
+    }
+}
+
+
+extern "C" {
+    void vision_transformer_block_fp16(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        // Extract input tensors
+        const float* x = va_arg(args, const float*);
+        int x_dim0 = va_arg(args, int);
+        int x_dim1 = va_arg(args, int);
+        int x_dim2 = va_arg(args, int);
+        int x_dim3 = va_arg(args, int);
+
+        const float* attn_weights = va_arg(args, const float*);
+        int attn_weights_dim0 = va_arg(args, int);
+        int attn_weights_dim1 = va_arg(args, int);
+
+        const float* mlp_weights = va_arg(args, const float*);
+        int mlp_weights_dim0 = va_arg(args, int);
+        int mlp_weights_dim1 = va_arg(args, int);
+
+        const float* norm_weights = va_arg(args, const float*);
+        int norm_weights_dim0 = va_arg(args, int);
+
+        // Extract threshold
+        float threshold = va_arg(args, double);
+
+        // Extract output tensor (assuming it's preallocated)
+        float* output = va_arg(args, float*);
+
+        va_end(args);
+
+        // Allocate device memory
+        half *d_x, *d_attn_weights, *d_mlp_weights, *d_norm_weights, *d_output;
+        cudaMalloc(&d_x, x_dim0 * x_dim1 * x_dim2 * x_dim3 * sizeof(half));
+        cudaMalloc(&d_attn_weights, attn_weights_dim0 * attn_weights_dim1 * sizeof(half));
+        cudaMalloc(&d_mlp_weights, mlp_weights_dim0 * mlp_weights_dim1 * sizeof(half));
+        cudaMalloc(&d_norm_weights, norm_weights_dim0 * sizeof(half));
+        cudaMalloc(&d_output, x_dim0 * x_dim1 * x_dim2 * x_dim3 * sizeof(half));
+
+        // Copy input data to device
+        cudaMemcpy(d_x, x, x_dim0 * x_dim1 * x_dim2 * x_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_attn_weights, attn_weights, attn_weights_dim0 * attn_weights_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_mlp_weights, mlp_weights, mlp_weights_dim0 * mlp_weights_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_norm_weights, norm_weights, norm_weights_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Launch kernel
+        int num_blocks = (x_dim0 * x_dim1 * x_dim2 * x_dim3 + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        vision_transformer_block_fp16_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(
+            d_x, d_attn_weights, d_mlp_weights, d_norm_weights, d_output,
+            x_dim0, x_dim1, x_dim2, x_dim3, threshold
+        );
+
+        // Copy result back to host
+        cudaMemcpy(output, d_output, x_dim0 * x_dim1 * x_dim2 * x_dim3 * sizeof(half), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_x);
+        cudaFree(d_attn_weights);
+        cudaFree(d_mlp_weights);
+        cudaFree(d_norm_weights);
+        cudaFree(d_output);
+    }
+}

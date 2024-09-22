@@ -1,13 +1,73 @@
 
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cufft.h>
+#include <math_functions.h>
 #include <device_launch_parameters.h>
 #include <stdarg.h>
 
+#define BLOCK_SIZE 16
+#define FFT_RANK 3
+#define CUDA_CHECK(status)                                   \
+    {                                                     \
+        if (status != cudaSuccess) {                         \
+            fprintf(stderr, "CUDA Error: %s:%d\n", __FILE__, __LINE__); \
+            fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(status)); \
+            exit(1);                                           \
+        }                                                     \
+    }
+
+// Helper function to create a cufft plan
+cufftHandle create_cufft_plan(int* dims, cufftType type) {
+    cufftHandle plan;
+    CUDA_CHECK(cufftPlanMany(&plan, FFT_RANK, dims, NULL, 1, dims, NULL, 1, type,
+                            CUFFT_INPLACE, CUFFT_FORWARD));
+    return plan;
+}
+
+// Helper function to destroy a cufft plan
+void destroy_cufft_plan(cufftHandle plan) {
+    CUDA_CHECK(cufftDestroy(plan));
+}
+
+__global__ void normalize_tensor_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int depth, float mean, float std) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    int idz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (idx < batch_size && idy < channels && idz < height * width * depth) {
+        output[idx * channels * height * width * depth + idy * height * width * depth + idz] = (input[idx * channels * height * width * depth + idy * height * width * depth + idz] - mean) / std;
+    }
+}
+
+__global__ void crop_tensor_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int depth, int crop_h, int crop_w, int crop_d) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    int idz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (idx < batch_size && idy < channels && idz < height * width * depth) {
+        int x = idz % width;
+        int y = (idz / width) % height;
+        int z = idz / (width * height);
+
+        if (x >= crop_w && x < width - crop_w && y >= crop_h && y < height - crop_h && z >= crop_d && z < depth - crop_d) {
+            output[idx * channels * height * width * depth + idy * height * width * depth + idz - (crop_h * width + crop_w + crop_d * width * height)] = input[idx * channels * height * width * depth + idy * height * width * depth + idz];
+        }
+    }
+}
+
+__global__ void view_tensor_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int depth) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (idx < batch_size && idy < channels * height * width * depth) {
+        output[idx * channels * height * width * depth + idy] = input[idx * channels * height * width * depth + idy];
+    }
+}
+
 extern "C" {
 
-void torch_group_norm_function(int num_args, ...) {
+void conv_fft_3d_normal_function(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
@@ -17,63 +77,95 @@ void torch_group_norm_function(int num_args, ...) {
     int input_tensor_dim1 = va_arg(args, int);
     int input_tensor_dim2 = va_arg(args, int);
     int input_tensor_dim3 = va_arg(args, int);
+    int input_tensor_dim4 = va_arg(args, int);
 
-    // Extract num_groups
-    int num_groups = va_arg(args, int);
+    // Extract kernel tensor
+    const float* kernel = va_arg(args, const float*);
+    int kernel_dim0 = va_arg(args, int);
+    int kernel_dim1 = va_arg(args, int);
+    int kernel_dim2 = va_arg(args, int);
+
+    // Extract mean and std
+    float mean = va_arg(args, float);
+    float std = va_arg(args, float);
 
     // Extract output tensor (assuming it's preallocated)
     float* output = va_arg(args, float*);
 
     va_end(args);
 
-    // Calculate dimensions
-    int batch_size = input_tensor_dim0;
-    int num_channels = input_tensor_dim1;
-    int height = input_tensor_dim2;
-    int width = input_tensor_dim3;
-
-    // Calculate group size and number of groups
-    int group_size = num_channels / num_groups;
-
     // Allocate device memory
-    float *d_input, *d_output;
-    cudaMalloc(&d_input, batch_size * num_channels * height * width * sizeof(float));
-    cudaMalloc(&d_output, batch_size * num_channels * height * width * sizeof(float));
+    float *d_input, *d_kernel, *d_output;
+    CUDA_CHECK(cudaMalloc(&d_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * input_tensor_dim4 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_kernel, kernel_dim0 * kernel_dim1 * kernel_dim2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * input_tensor_dim4 * sizeof(float)));
 
     // Copy input data to device
-    cudaMemcpy(d_input, input_tensor, batch_size * num_channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * input_tensor_dim4 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kernel, kernel, kernel_dim0 * kernel_dim1 * kernel_dim2 * sizeof(float), cudaMemcpyHostToDevice));
 
-    // Use cuDNN for group normalization (you'll need to link cuDNN)
-    cudnnHandle_t cudnnHandle;
-    cudnnCreate(&cudnnHandle);
+    // Normalize input tensor on device
+    int threadsPerBlock = BLOCK_SIZE;
+    int blocksPerGrid = (input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * input_tensor_dim4 + threadsPerBlock - 1) / threadsPerBlock;
+    normalize_tensor_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_input, d_output, input_tensor_dim0, input_tensor_dim1, input_tensor_dim2, input_tensor_dim3, input_tensor_dim4, mean, std);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudnnTensorDescriptor_t inputDesc, outputDesc;
-    cudnnCreateTensorDescriptor(&inputDesc);
-    cudnnCreateTensorDescriptor(&outputDesc);
+    // Pad input tensor on device
+    int pad_h = kernel_dim1 / 2;
+    int pad_w = kernel_dim2 / 2;
+    int pad_d = kernel_dim0 / 2;
+    int padded_height = input_tensor_dim2 + 2 * pad_h;
+    int padded_width = input_tensor_dim3 + 2 * pad_w;
+    int padded_depth = input_tensor_dim4 + 2 * pad_d;
 
-    // Set tensor descriptors
-    cudnnSetTensor4dDescriptor(inputDesc, CUDNN_DATA_FLOAT, batch_size, num_channels, height, width);
-    cudnnSetTensor4dDescriptor(outputDesc, CUDNN_DATA_FLOAT, batch_size, num_channels, height, width);
+    float *d_input_padded;
+    CUDA_CHECK(cudaMalloc(&d_input_padded, input_tensor_dim0 * input_tensor_dim1 * padded_height * padded_width * padded_depth * sizeof(float)));
+    crop_tensor_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_output, d_input_padded, input_tensor_dim0, input_tensor_dim1, padded_height, padded_width, padded_depth, pad_h, pad_w, pad_d);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Create a cuDNN group normalization descriptor
-    cudnnGroupNormDescriptor_t normDesc;
-    cudnnCreateGroupNormDescriptor(&normDesc);
-    cudnnSetGroupNormDescriptor(normDesc, CUDNN_GROUP_NORM_DESCRIPTOR_DEFAULT, num_groups);
+    // Perform FFT convolution
+    int dims[FFT_RANK] = {input_tensor_dim2, input_tensor_dim3, input_tensor_dim4};
+    cufftHandle plan = create_cufft_plan(dims, CUFFT_R2C);
 
-    // Perform group normalization
-    cudnnGroupNormalizationForward(cudnnHandle, normDesc, inputDesc, d_input, outputDesc, d_output);
+    // Plan for input
+    CUDA_CHECK(cufftExecR2C(plan, d_input_padded, d_input_padded));
+
+    // Plan for kernel
+    int kernel_dims[FFT_RANK] = {kernel_dim1, kernel_dim2, kernel_dim0};
+    cufftHandle kernel_plan = create_cufft_plan(kernel_dims, CUFFT_R2C);
+    CUDA_CHECK(cufftExecR2C(kernel_plan, d_kernel, d_kernel));
+
+    // Pointwise multiplication in frequency domain
+    for (int i = 0; i < input_tensor_dim0; ++i) {
+        for (int j = 0; j < input_tensor_dim1; ++j) {
+            for (int k = 0; k < padded_height * padded_width * padded_depth / 2 + 1; ++k) {
+                d_input_padded[i * input_tensor_dim1 * padded_height * padded_width * padded_depth / 2 + j * padded_height * padded_width * padded_depth / 2 + k] *= d_kernel[j * kernel_dim1 * kernel_dim2 * kernel_dim0 / 2 + k];
+            }
+        }
+    }
+
+    // Inverse FFT
+    CUDA_CHECK(cufftExecC2R(plan, d_input_padded, d_input_padded));
+
+    destroy_cufft_plan(plan);
+    destroy_cufft_plan(kernel_plan);
+
+    // Crop output tensor
+    crop_tensor_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_input_padded, d_output, input_tensor_dim0, input_tensor_dim1, padded_height, padded_width, padded_depth, pad_h, pad_w, pad_d);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // View output tensor
+    view_tensor_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_output, d_output, input_tensor_dim0, input_tensor_dim1, input_tensor_dim2, input_tensor_dim3, input_tensor_dim4);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Copy result back to host
-    cudaMemcpy(output, d_output, batch_size * num_channels * height * width * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Clean up cuDNN resources
-    cudnnDestroyGroupNormDescriptor(normDesc);
-    cudnnDestroyTensorDescriptor(outputDesc);
-    cudnnDestroyTensorDescriptor(inputDesc);
-    cudnnDestroy(cudnnHandle);
+    CUDA_CHECK(cudaMemcpy(output, d_output, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * input_tensor_dim4 * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Free device memory
-    cudaFree(d_input);
-    cudaFree(d_output);
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_kernel));
+    CUDA_CHECK(cudaFree(d_output));
+    CUDA_CHECK(cudaFree(d_input_padded));
 }
-}
+
+}  // extern "C"

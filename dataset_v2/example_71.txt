@@ -1,0 +1,145 @@
+```python
+import torch
+
+def cross_fade_int8_function(input_tensor1: torch.Tensor, input_tensor2: torch.Tensor, alpha: float) -> torch.Tensor:
+    """
+    Cross-fades between two input tensors using a specified alpha value.
+
+    This function first decomposes the input tensors into their individual components using
+    tensor_decomposition. Then, it cross-fades between these components using a weighted average
+    with the provided alpha value. Finally, it recombines the cross-faded components into a single
+    tensor and returns the result.
+
+    Args:
+        input_tensor1 (torch.Tensor): The first input tensor.
+        input_tensor2 (torch.Tensor): The second input tensor.
+        alpha (float): The cross-fade weight, ranging from 0.0 to 1.0.
+
+    Returns:
+        torch.Tensor: The cross-faded tensor.
+    """
+
+    # Tensor decomposition for both input tensors
+    component1_1, component1_2 = torch.tensor_split(input_tensor1, 2, dim=1)
+    component2_1, component2_2 = torch.tensor_split(input_tensor2, 2, dim=1)
+
+    # Cross-fade between components using a weighted average
+    cross_faded_component_1 = (1 - alpha) * component1_1 + alpha * component2_1
+    cross_faded_component_2 = (1 - alpha) * component1_2 + alpha * component2_2
+
+    # Recombine the cross-faded components
+    cross_faded_tensor = torch.cat([cross_faded_component_1, cross_faded_component_2], dim=1)
+
+    # Apply a threshold using a non-equality operation and then apply addcdiv operation
+    cross_faded_tensor = torch.where(cross_faded_tensor != 0.0, cross_faded_tensor, 0.0)
+    cross_faded_tensor.addcdiv_(cross_faded_tensor, cross_faded_tensor, value=1.0)
+
+    # Convert to int8 for efficient processing
+    cross_faded_tensor = cross_faded_tensor.to(torch.int8)
+
+    return cross_faded_tensor
+
+function_signature = {
+    "name": "cross_fade_int8_function",
+    "inputs": [
+        ((2, 2), torch.float32),
+        ((2, 2), torch.float32),
+        ((), torch.float32)
+    ],
+    "outputs": [
+        ((2, 2), torch.int8)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// CUDA kernel for cross-fade operation
+__global__ void cross_fade_kernel(const float* input1, const float* input2, float* output, float alpha, int m, int n) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float val1 = input1[row * n + col];
+        float val2 = input2[row * n + col];
+        output[row * n + col] = (1 - alpha) * val1 + alpha * val2; 
+    }
+}
+
+// CUDA kernel for thresholding and addcdiv operation
+__global__ void threshold_addcdiv_kernel(int8_t* output, int m, int n) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        int8_t val = output[row * n + col];
+        if (val != 0) {
+            output[row * n + col] = val + 1;
+        }
+    }
+}
+
+extern "C" {
+
+void cross_fade_int8_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input1 = va_arg(args, const float*);
+    int input1_dim0 = va_arg(args, int);
+    int input1_dim1 = va_arg(args, int);
+    const float* input2 = va_arg(args, const float*);
+    int input2_dim0 = va_arg(args, int);
+    int input2_dim1 = va_arg(args, int);
+    const float* alpha_ptr = va_arg(args, const float*); // alpha is a single float
+    float alpha = *alpha_ptr; // dereference the pointer to get the value
+
+    // Extract output tensor (assuming it's preallocated)
+    int8_t* output = va_arg(args, int8_t*);
+
+    va_end(args);
+
+    int batch_size = input1_dim0;
+    int input_dim = input1_dim1;
+
+    // Allocate device memory
+    float *d_input1, *d_input2;
+    int8_t *d_output;
+    cudaMalloc(&d_input1, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_input2, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * input_dim * sizeof(int8_t));
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input1, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input2, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch cross-fade kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((input_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    cross_fade_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input1, d_input2, d_output, alpha, batch_size, input_dim
+    );
+
+    // Launch thresholding and addcdiv kernel
+    threshold_addcdiv_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, batch_size, input_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_dim * sizeof(int8_t), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

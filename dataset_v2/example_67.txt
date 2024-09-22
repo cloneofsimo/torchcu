@@ -1,0 +1,143 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def sobel_adaptive_max_pool(input_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Computes Sobel gradients and applies adaptive max pooling.
+    """
+    # Calculate Sobel gradients
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+    sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32)
+    grad_x = F.conv2d(input_tensor, sobel_x.unsqueeze(0).unsqueeze(0), padding=1)
+    grad_y = F.conv2d(input_tensor, sobel_y.unsqueeze(0).unsqueeze(0), padding=1)
+
+    # Combine gradient magnitudes
+    gradient_magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    # Apply adaptive max pooling
+    output = F.adaptive_max_pool2d(gradient_magnitude, (1, 1))
+    
+    return output
+
+function_signature = {
+    "name": "sobel_adaptive_max_pool",
+    "inputs": [
+        ((1, 1, 32, 32), torch.float32)
+    ],
+    "outputs": [
+        ((1, 1, 1, 1), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Sobel kernel
+__global__ void sobel_kernel(const float* input, float* grad_x, float* grad_y, int batch, int channels, int height, int width) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int index = batch * channels * height * width + channels * y * width + x;
+
+    if (x >= 1 && x < width - 1 && y >= 1 && y < height - 1) {
+        // Sobel x
+        grad_x[index] = -input[index - channels * width - 1] 
+                      - 2.0f * input[index - channels * width]
+                      - input[index - channels * width + 1]
+                      + input[index + channels * width - 1]
+                      + 2.0f * input[index + channels * width]
+                      + input[index + channels * width + 1];
+
+        // Sobel y
+        grad_y[index] = input[index - width - 1]
+                      + 2.0f * input[index - width]
+                      + input[index - width + 1]
+                      - input[index + width - 1]
+                      - 2.0f * input[index + width]
+                      - input[index + width + 1];
+    }
+}
+
+// Max pooling kernel
+__global__ void max_pooling_kernel(const float* input, float* output, int batch, int channels, int height, int width) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int index = batch * channels * height * width + channels * y * width + x;
+
+    if (x >= 0 && x < width && y >= 0 && y < height) {
+        float max_val = input[index];
+        for (int i = y; i < y + height; ++i) {
+            for (int j = x; j < x + width; ++j) {
+                int pool_index = batch * channels * height * width + channels * i * width + j;
+                max_val = fmaxf(max_val, input[pool_index]);
+            }
+        }
+        output[index] = max_val;
+    }
+}
+
+extern "C" {
+    void sobel_adaptive_max_pool(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        const float* input = va_arg(args, const float*);
+        int batch = va_arg(args, int);
+        int channels = va_arg(args, int);
+        int height = va_arg(args, int);
+        int width = va_arg(args, int);
+        float* output = va_arg(args, float*);
+
+        va_end(args);
+
+        // Allocate device memory
+        float* d_input, *d_grad_x, *d_grad_y, *d_output;
+        cudaMalloc(&d_input, batch * channels * height * width * sizeof(float));
+        cudaMalloc(&d_grad_x, batch * channels * height * width * sizeof(float));
+        cudaMalloc(&d_grad_y, batch * channels * height * width * sizeof(float));
+        cudaMalloc(&d_output, batch * channels * height * width * sizeof(float));
+
+        // Copy input to device
+        cudaMemcpy(d_input, input, batch * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Launch Sobel kernels
+        dim3 threadsPerBlock(16, 16);
+        dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x, (height + threadsPerBlock.y - 1) / threadsPerBlock.y);
+        sobel_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_grad_x, d_grad_y, batch, channels, height, width);
+
+        // Calculate gradient magnitude on device
+        cudaDeviceSynchronize(); // Synchronize for the next kernel launch
+        const int numThreads = threadsPerBlock.x * threadsPerBlock.y;
+        const int numBlocks = (batch * channels * height * width + numThreads - 1) / numThreads;
+        gradient_magnitude<<<numBlocks, threadsPerBlock>>>(d_grad_x, d_grad_y, d_input, batch, channels, height, width);
+
+        // Launch adaptive max pooling kernel
+        numBlocks = (width + threadsPerBlock.x - 1) / threadsPerBlock.x;
+        max_pooling_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, batch, channels, height, width);
+
+        // Copy output back to host
+        cudaMemcpy(output, d_output, batch * channels * height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_grad_x);
+        cudaFree(d_grad_y);
+        cudaFree(d_output);
+    }
+
+    __global__ void gradient_magnitude(const float* grad_x, const float* grad_y, float* output, 
+                                        int batch, int channels, int height, int width) {
+        int x = blockIdx.x * blockDim.x + threadIdx.x;
+        int y = blockIdx.y * blockDim.y + threadIdx.y;
+        int index = batch * channels * height * width + channels * y * width + x;
+
+        if (x >= 0 && x < width && y >= 0 && y < height) {
+            output[index] = sqrtf(grad_x[index] * grad_x[index] + grad_y[index] * grad_y[index]);
+        }
+    }
+}
+```

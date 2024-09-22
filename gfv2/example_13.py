@@ -1,21 +1,46 @@
 
 import torch
+import torch.nn as nn
+from torch.nn.functional import adaptive_avg_pool3d
 
-def torch_baddbmm_function(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+def center_loss_with_adaptive_pooling(features: torch.Tensor, labels: torch.Tensor, num_classes: int, 
+                                       alpha: float = 0.5, size: int = 1) -> torch.Tensor:
     """
-    Performs a batched matrix multiplication (bmm) followed by a batched addition (badd) with bias.
+    Calculates the center loss with adaptive average pooling for a given batch of features and labels.
+
+    Args:
+        features: Batch of features, shape (batch_size, feature_dim)
+        labels: Batch of labels, shape (batch_size,)
+        num_classes: Number of classes
+        alpha: Weighting factor for center loss
+        size: Size for adaptive average pooling
+
+    Returns:
+        Center loss value
     """
-    output = torch.baddbmm(input_tensor, weight, bias)
-    return output
+    # Adaptive average pooling
+    features = adaptive_avg_pool3d(features.reshape(-1, 1, features.shape[1], 1, 1), output_size=(size, size, size))
+    features = features.squeeze()
+
+    # Calculate class centers
+    centers = nn.Parameter(torch.randn(num_classes, features.shape[1]))
+    centers = centers.to(features.device)
+    centers_batch = centers[labels]
+
+    # Calculate center loss
+    loss = torch.mean(torch.sum(torch.pow(features - centers_batch, 2), dim=1))
+    loss = alpha * loss
+
+    return loss
 
 function_signature = {
-    "name": "torch_baddbmm_function",
+    "name": "center_loss_with_adaptive_pooling",
     "inputs": [
-        ((4, 4), torch.float32),
-        ((4, 4, 4), torch.float32),
-        ((4, 4), torch.float32)
+        ((16, 128), torch.float32),
+        ((16,), torch.int64),
+        (10, torch.int64)
     ],
     "outputs": [
-        ((4, 4, 4), torch.float32),
+        ((1,), torch.float32)
     ]
 }

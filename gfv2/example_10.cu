@@ -1,93 +1,108 @@
 
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cudnn.h>
-#include <iostream>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math_functions.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for CoordAttention with bfloat16
+__global__ void coord_attention_kernel_bf16(const float* input_tensor, const float* weight, float* output, 
+                                        int B, int C, int H, int W, int kernel_size, 
+                                        int padding) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (b < B && h < H && w < W) {
+        // Coordinate embedding
+        int x = w;
+        int y = h;
+        float x_embed = (float)x / (W - 1);
+        float y_embed = (float)y / (H - 1);
+
+        // Convolution using bfloat16
+        __nv_bfloat16 sum = 0;
+        for (int k = 0; k < kernel_size; ++k) {
+            for (int l = 0; l < kernel_size; ++l) {
+                int i = h + k - padding;
+                int j = w + l - padding;
+                if (i >= 0 && i < H && j >= 0 && j < W) {
+                    for (int c = 0; c < C; ++c) {
+                        __nv_bfloat16 input_val = float_to_bfloat16(input_tensor[b * C * H * W + c * H * W + i * W + j]);
+                        __nv_bfloat16 weight_val = float_to_bfloat16(weight[(k * kernel_size + l) * C + c]);
+                        sum += __hmul(input_val, weight_val);
+                    }
+                }
+            }
+        }
+        float conv_output = bfloat16_to_float(sum);
+
+        // Cosine similarity
+        __nv_bfloat16 input_val = float_to_bfloat16(input_tensor[b * C * H * W + c * H * W + h * W + w]);
+        float cosine_sim = __fdividef(conv_output, sqrtf(input_val * conv_output));
+
+        // Attention and output
+        output[b * C * H * W + c * H * W + h * W + w] = cosine_sim * input_tensor[b * C * H * W + c * H * W + h * W + w];
+    }
+}
 
 extern "C" {
 
-void torch_sobel_filter_int8_function(int num_args, ...) {
+void coord_attention_bf16_function(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
-    // Extract input tensor
     const float* input_tensor = va_arg(args, const float*);
-    int input_tensor_dim0 = va_arg(args, int);
-    int input_tensor_dim1 = va_arg(args, int);
-    int input_tensor_dim2 = va_arg(args, int);
-    int input_tensor_dim3 = va_arg(args, int);
+    int B = va_arg(args, int);
+    int C = va_arg(args, int);
+    int H = va_arg(args, int);
+    int W = va_arg(args, int);
 
-    // Extract output tensor
-    int8_t* output = va_arg(args, int8_t*);
+    const float* weight = va_arg(args, const float*);
+    int kernel_size = va_arg(args, int);
+    int padding = va_arg(args, int);
+
+    float* output = va_arg(args, float*);
 
     va_end(args);
 
-    // CUDA setup
-    cudnnHandle_t cudnnHandle;
-    cudnnCreate(&cudnnHandle);
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, B * C * H * W * sizeof(float));
+    cudaMalloc(&d_weight, kernel_size * kernel_size * C * sizeof(float));
+    cudaMalloc(&d_output, B * C * H * W * sizeof(float));
 
-    // Input and output tensor descriptors
-    cudnnTensorDescriptor_t inputDesc, outputDesc;
-    cudnnCreateTensorDescriptor(&inputDesc);
-    cudnnCreateTensorDescriptor(&outputDesc);
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, B * C * H * W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, kernel_size * kernel_size * C * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Set input tensor descriptor
-    cudnnSetTensor4dDescriptor(inputDesc, CUDNN_DATA_FLOAT, 1, input_tensor_dim1, input_tensor_dim2, input_tensor_dim3);
-    // Set output tensor descriptor (int8)
-    cudnnSetTensor4dDescriptor(outputDesc, CUDNN_DATA_INT8, 1, input_tensor_dim1, input_tensor_dim2, input_tensor_dim3);
+    // Launch kernel
+    dim3 threadsPerBlock(8, 8, 8);
+    dim3 numBlocks((B + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (H + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (W + threadsPerBlock.z - 1) / threadsPerBlock.z);
 
-    // Sobel kernel descriptor
-    cudnnFilterDescriptor_t sobelFilterDesc;
-    cudnnCreateFilterDescriptor(&sobelFilterDesc);
-    const float sobelX[] = {1, 0, -1, 2, 0, -2, 1, 0, -1};
-    const float sobelY[] = {1, 2, 1, 0, 0, 0, -1, -2, -1};
-    cudnnSetFilterNdDescriptor(sobelFilterDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 1, 3, 3); // 1x1x3x3
-    cudnnSetFilterNdDescriptor(sobelFilterDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, 1, 3, 3); // 1x1x3x3
-    cudaMemcpy(cudnnFilterDesc, sobelX, sizeof(sobelX), cudaMemcpyHostToDevice);
-    cudaMemcpy(cudnnFilterDesc, sobelY, sizeof(sobelY), cudaMemcpyHostToDevice);
+    coord_attention_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, B, C, H, W, kernel_size, padding
+    );
 
-    // Convolution descriptor
-    cudnnConvolutionDescriptor_t convDesc;
-    cudnnCreateConvolutionDescriptor(&convDesc);
-    cudnnSetConvolutionNdDescriptor(convDesc, 0, 1, 1, 1, 1, 1, CUDNN_CROSS_CHANNEL_PRODUCT, CUDNN_DATA_FLOAT, CUDNN_DATA_FLOAT);
+    // Copy result back to host
+    cudaMemcpy(output, d_output, B * C * H * W * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // Allocate device memory for input, output, and gradient
-    float* d_input;
-    int8_t* d_output;
-    cudaMalloc(&d_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float));
-    cudaMalloc(&d_output, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(int8_t));
-
-    // Copy input to device
-    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Set up convolution parameters
-    cudnnConvolutionFwdAlgo_t convolutionAlgorithm = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM; // Optimize for GEMM
-    int workspaceSize;
-    cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle, inputDesc, sobelFilterDesc, convDesc, outputDesc, convolutionAlgorithm, &workspaceSize);
-    char* workspace = new char[workspaceSize];
-
-    // Perform convolution (forward pass)
-    cudnnConvolutionForward(cudnnHandle,
-        1.0f, // alpha
-        inputDesc, d_input,
-        sobelFilterDesc, nullptr, // No bias
-        convDesc,
-        convolutionAlgorithm, workspace, workspaceSize,
-        0.0f, // beta
-        outputDesc, d_output);
-
-    // Copy output back to host
-    cudaMemcpy(output, d_output, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(int8_t), cudaMemcpyDeviceToHost);
-
-    // Cleanup CUDA resources
-    cudnnDestroyTensorDescriptor(inputDesc);
-    cudnnDestroyTensorDescriptor(outputDesc);
-    cudnnDestroyFilterDescriptor(sobelFilterDesc);
-    cudnnDestroyConvolutionDescriptor(convDesc);
-    cudnnDestroy(cudnnHandle);
+    // Free device memory
     cudaFree(d_input);
+    cudaFree(d_weight);
     cudaFree(d_output);
-    delete[] workspace;
 }
 
 }  // extern "C"

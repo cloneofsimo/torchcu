@@ -1,112 +1,111 @@
 
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <device_launch_parameters.h>
+#include <math.h>
 #include <stdarg.h>
-#include <math.h>  
 
-// Helper function to convert int8 to float
-__device__ __forceinline__ float int8_to_float(int8_t val) {
-    return (float)val;
+#include "cutlass.h"
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
 }
 
-// CUDA kernel for batch normalization with int8 input and float output
-__global__ void int8_batchnorm_kernel(const int8_t* input, const float* weight, const float* bias,
-                                    const float* running_mean, const float* running_var,
-                                    float eps, float momentum, bool training, float output_scale, 
-                                    float* output, int N, int C, int H, int W) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int batch_idx = idx / (C * H * W);
-    int ch_idx = (idx % (C * H * W)) / (H * W);
-    int h_idx = (idx % (H * W)) / W;
-    int w_idx = idx % W;
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
 
-    if (batch_idx < N && ch_idx < C && h_idx < H && w_idx < W) {
-        float input_val = int8_to_float(input[batch_idx * C * H * W + ch_idx * H * W + h_idx * W + w_idx]);
+// CUDA kernel for STFT and power spectrum calculation
+__global__ void stft_power_spectrum_kernel(const float* signal, const float* window, float* power_spectrum, 
+                                        int signal_length, int n_fft, int hop_length, int win_length) {
+    int frame_idx = blockIdx.x;
+    int freq_idx = threadIdx.x;
 
-        // Mean and variance calculation
-        float mean = running_mean[ch_idx];
-        float var = running_var[ch_idx];
-        float inv_var = 1.0f / sqrtf(var + eps);
+    int frame_start = frame_idx * hop_length;
+    int frame_end = frame_start + win_length;
 
-        // Batch normalization computation
-        float output_val = (input_val - mean) * inv_var * weight[ch_idx] + bias[ch_idx];
+    if (frame_end <= signal_length && freq_idx < n_fft / 2 + 1) {
+        float sum_real = 0.0f;
+        float sum_imag = 0.0f;
 
-        // Output scaling
-        output_val *= output_scale;
+        for (int i = 0; i < win_length; ++i) {
+            int sample_idx = frame_start + i;
+            float window_val = window[i];
+            float signal_val = signal[sample_idx];
 
-        // Store result
-        output[batch_idx * C * H * W + ch_idx * H * W + h_idx * W + w_idx] = output_val;
+            float real = signal_val * window_val * cosf(2 * M_PI * i * freq_idx / n_fft);
+            float imag = signal_val * window_val * sinf(2 * M_PI * i * freq_idx / n_fft);
 
-        // Update running mean and variance (only in training mode)
-        if (training) {
-            // ... (Implementation depends on specific running mean/variance update strategy)
+            sum_real += real;
+            sum_imag += imag;
         }
+
+        float magnitude = sqrtf(sum_real * sum_real + sum_imag * sum_imag);
+        power_spectrum[frame_idx * (n_fft / 2 + 1) + freq_idx] = magnitude * magnitude;
     }
 }
 
+// CUTLASS GEMM kernel configuration
+typedef cutlass::gemm::GemmCoord GemmCoord;
+typedef cutlass::layout::RowMajor RowMajor;
+typedef cutlass::layout::ColumnMajor ColumnMajor;
+typedef cutlass::epilogue::Identity Identity;
+typedef cutlass::arch::Sm75 Sm75;
+typedef cutlass::epilogue::thread::Default ThreadEpilogue;
+typedef cutlass::gemm::GemmOp<cutlass::gemm::GemmShape<1, 1, 1>, GemmCoord, cutlass::layout::ColumnMajor,
+                              cutlass::layout::RowMajor, cutlass::layout::RowMajor, half, half, half,
+                              cutlass::epilogue::Identity, ThreadEpilogue, Sm75> GemmKernel;
+
 extern "C" {
 
-void torch_int8_batchnorm_function(int num_args, ...) {
+void stft_and_power_spectrum(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
-    // Extract input tensor
-    const int8_t* input = va_arg(args, const int8_t*);
-    int input_dim0 = va_arg(args, int);
-    int input_dim1 = va_arg(args, int);
-    int input_dim2 = va_arg(args, int);
-    int input_dim3 = va_arg(args, int);
+    // Extract input arguments
+    const float* signal = va_arg(args, const float*);
+    int signal_length = va_arg(args, int);
 
-    // Extract weight tensor
-    const float* weight = va_arg(args, const float*);
-    int weight_dim0 = va_arg(args, int);
+    const float* window = va_arg(args, const float*);
+    int window_length = va_arg(args, int);
 
-    // Extract bias tensor
-    const float* bias = va_arg(args, const float*);
-    int bias_dim0 = va_arg(args, int);
+    int n_fft = va_arg(args, int);
+    int hop_length = va_arg(args, int);
+    int win_length = va_arg(args, int);
 
-    // Extract running mean tensor
-    const float* running_mean = va_arg(args, const float*);
-    int running_mean_dim0 = va_arg(args, int);
-
-    // Extract running variance tensor
-    const float* running_var = va_arg(args, const float*);
-    int running_var_dim0 = va_arg(args, int);
-
-    // Extract eps
-    float eps = (float)va_arg(args, double);
-
-    // Extract momentum
-    float momentum = (float)va_arg(args, double);
-
-    // Extract training flag
-    bool training = (bool)va_arg(args, int);
-
-    // Extract output scale
-    float output_scale = (float)va_arg(args, double);
-
-    // Extract output tensor
-    float* output = va_arg(args, float*);
+    // Extract output tensor (assuming it's preallocated)
+    float* power_spectrum = va_arg(args, float*);
 
     va_end(args);
 
-    // Launch kernel
-    int N = input_dim0;
-    int C = input_dim1;
-    int H = input_dim2;
-    int W = input_dim3;
+    // Calculate number of frames
+    int num_frames = (signal_length - win_length) / hop_length + 1;
 
-    dim3 threadsPerBlock(256);
-    dim3 numBlocks((N * C * H * W + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    // Allocate device memory
+    float *d_signal, *d_window, *d_power_spectrum;
+    cudaMalloc(&d_signal, signal_length * sizeof(float));
+    cudaMalloc(&d_window, window_length * sizeof(float));
+    cudaMalloc(&d_power_spectrum, num_frames * (n_fft / 2 + 1) * sizeof(float));
 
-    int8_batchnorm_kernel<<<numBlocks, threadsPerBlock>>>(
-        input, weight, bias, running_mean, running_var, eps, momentum, training, output_scale,
-        output, N, C, H, W
-    );
+    // Copy input data to device
+    cudaMemcpy(d_signal, signal, signal_length * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_window, window, window_length * sizeof(float), cudaMemcpyHostToDevice);
 
-    cudaDeviceSynchronize();
+    // Launch STFT and power spectrum kernel
+    dim3 threadsPerBlock(n_fft / 2 + 1);
+    dim3 numBlocks(num_frames);
+    stft_power_spectrum_kernel<<<numBlocks, threadsPerBlock>>>(d_signal, d_window, d_power_spectrum, 
+                                                            signal_length, n_fft, hop_length, win_length);
+
+    // Copy result back to host
+    cudaMemcpy(power_spectrum, d_power_spectrum, num_frames * (n_fft / 2 + 1) * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_signal);
+    cudaFree(d_window);
+    cudaFree(d_power_spectrum);
 }
 
 }  // extern "C"
