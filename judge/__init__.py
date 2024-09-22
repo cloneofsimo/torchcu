@@ -8,6 +8,7 @@ from typing import Callable
 
 from rich.table import Table
 import traceback
+import multiprocessing
 
 table = Table(title="Transpilation Results")
 table.add_column("File", style="cyan", no_wrap=True)
@@ -186,15 +187,21 @@ def judge_transpilation(input_file: Path, num_tests: int = 10) -> None:
 
     return passed_tests / num_tests
 
-def judge_it(input_file: Path, num_tests: int = 10) -> None:
-    """Judge the correctness of the transpiled CUDA code."""
-    
-    try:
-        score = judge_transpilation(input_file, num_tests)
-    except Exception as e:
-        print("Error in judge_it", e)
-        traceback.print_exc()
-        score = 0.0
+def judge_it(input_file: Path, num_tests: int = 10) -> float:
+    """Judge the correctness of the transpiled CUDA code in a separate process."""
 
-    return score
+    def target(queue):
+        try:
+            score = judge_transpilation(input_file, num_tests)
+            queue.put(score)
+        except Exception as e:
+            print("Error in judge_it_process", e)
+            traceback.print_exc()
+            queue.put(0.0)
 
+    queue = multiprocessing.Queue()
+    process = multiprocessing.Process(target=target, args=(queue,))
+    process.start()
+    process.join()
+
+    return queue.get() if not queue.empty() else 0.0
