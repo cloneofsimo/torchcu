@@ -2,3 +2,4 @@ rich
 together
 python-dotenv
 openai
+warp-lang
