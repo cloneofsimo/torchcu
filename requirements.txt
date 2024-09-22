@@ -1,1 +1,3 @@
 rich
+together
+python-dotenv
