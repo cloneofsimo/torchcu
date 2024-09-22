@@ -1,14 +1,14 @@
-from pathlib import Path
+import ctypes
+import multiprocessing
 import runpy
 import subprocess
-import numpy as np
-import torch
-import ctypes
+import traceback
+from pathlib import Path
 from typing import Callable
 
+import numpy as np
+import torch
 from rich.table import Table
-import traceback
-import multiprocessing
 
 table = Table(title="Transpilation Results")
 table.add_column("File", style="cyan", no_wrap=True)
@@ -69,7 +69,14 @@ def prepare_inputs(signature: list) -> list:
     """Prepare input tensors based on the function signature."""
     positional_arguments = []
     for arg in signature:
-        positional_arguments.append(torch.randn(arg[0], dtype=arg[1]))
+        shape, dtype = arg
+        rand_arg = None
+        if dtype == torch.long or dtype == torch.int:
+            rand_arg = torch.randint(0, 100, shape, dtype=dtype)
+        else:
+            rand_arg = torch.randn(shape, dtype=dtype)
+
+        positional_arguments.append(rand_arg)
 
     return positional_arguments
 
