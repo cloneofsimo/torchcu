@@ -1,0 +1,304 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def complex_function(input_tensor: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations:
+    1. Layer normalization
+    2. 3D Max Pooling
+    3. Elementwise sum with a learned weight
+    4. Instance normalization
+    5. ReLU activation
+    """
+    
+    # Layer Normalization
+    normalized_input = F.layer_norm(input_tensor, input_tensor.shape[1:])
+    
+    # 3D Max Pooling
+    pooled_input = F.max_pool3d(normalized_input, kernel_size=3, stride=2, padding=1)
+    
+    # Elementwise sum with learned weight
+    weighted_sum = pooled_input + weight1
+    
+    # Instance Normalization
+    instance_normalized = F.instance_norm(weighted_sum)
+    
+    # ReLU activation
+    output = F.relu(instance_normalized)
+    
+    # Multiply with another learned weight
+    output = torch.matmul(output, weight2.t())
+    
+    return output
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((2, 3, 4, 5, 6), torch.float32),
+        ((3, 3), torch.float32),
+        ((4, 4), torch.float32)
+    ],
+    "outputs": [
+        ((2, 4), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for Layer Normalization
+__global__ void layer_norm_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int depth) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && channel_idx < channels) {
+        float sum = 0.0f;
+        float square_sum = 0.0f;
+        for (int h = 0; h < height; ++h) {
+            for (int w = 0; w < width; ++w) {
+                for (int d = 0; d < depth; ++d) {
+                    int index = (batch_idx * channels + channel_idx) * height * width * depth + h * width * depth + w * depth + d;
+                    sum += input[index];
+                    square_sum += input[index] * input[index];
+                }
+            }
+        }
+
+        float mean = sum / (height * width * depth);
+        float variance = square_sum / (height * width * depth) - mean * mean;
+        float std_dev = sqrtf(variance + 1e-5f);
+
+        for (int h = 0; h < height; ++h) {
+            for (int w = 0; w < width; ++w) {
+                for (int d = 0; d < depth; ++d) {
+                    int index = (batch_idx * channels + channel_idx) * height * width * depth + h * width * depth + w * depth + d;
+                    output[index] = (input[index] - mean) / std_dev;
+                }
+            }
+        }
+    }
+}
+
+// CUDA kernel for 3D Max Pooling
+__global__ void max_pool3d_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int depth, int kernel_size, int stride, int padding) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int h_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int w_idx = threadIdx.w;
+    int d_idx = threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < channels && h_idx < height && w_idx < width && d_idx < depth) {
+        int h_start = max(0, h_idx - padding);
+        int h_end = min(height, h_idx + kernel_size - padding);
+        int w_start = max(0, w_idx - padding);
+        int w_end = min(width, w_idx + kernel_size - padding);
+        int d_start = max(0, d_idx - padding);
+        int d_end = min(depth, d_idx + kernel_size - padding);
+
+        float max_val = -FLT_MAX;
+        for (int h = h_start; h < h_end; ++h) {
+            for (int w = w_start; w < w_end; ++w) {
+                for (int d = d_start; d < d_end; ++d) {
+                    int index = (batch_idx * channels + channel_idx) * height * width * depth + h * width * depth + w * depth + d;
+                    max_val = max(max_val, input[index]);
+                }
+            }
+        }
+
+        int output_index = (batch_idx * channels + channel_idx) * (height / stride) * (width / stride) * (depth / stride) +
+            (h_idx / stride) * (width / stride) * (depth / stride) + (w_idx / stride) * (depth / stride) + (d_idx / stride);
+        output[output_index] = max_val;
+    }
+}
+
+// CUDA kernel for elementwise sum
+__global__ void elementwise_sum_kernel(const float* input, const float* weight, float* output, int batch_size, int channels, int height, int width, int depth) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int h_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int w_idx = threadIdx.w;
+    int d_idx = threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < channels && h_idx < height && w_idx < width && d_idx < depth) {
+        int index = (batch_idx * channels + channel_idx) * height * width * depth + h_idx * width * depth + w_idx * depth + d_idx;
+        output[index] = input[index] + weight[channel_idx];
+    }
+}
+
+// CUDA kernel for Instance Normalization
+__global__ void instance_norm_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int depth) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int h_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int w_idx = threadIdx.w;
+    int d_idx = threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < channels && h_idx < height && w_idx < width && d_idx < depth) {
+        float sum = 0.0f;
+        float square_sum = 0.0f;
+        for (int h = 0; h < height; ++h) {
+            for (int w = 0; w < width; ++w) {
+                for (int d = 0; d < depth; ++d) {
+                    int index = (batch_idx * channels + channel_idx) * height * width * depth + h * width * depth + w * depth + d;
+                    sum += input[index];
+                    square_sum += input[index] * input[index];
+                }
+            }
+        }
+
+        float mean = sum / (height * width * depth);
+        float variance = square_sum / (height * width * depth) - mean * mean;
+        float std_dev = sqrtf(variance + 1e-5f);
+
+        int index = (batch_idx * channels + channel_idx) * height * width * depth + h_idx * width * depth + w_idx * depth + d_idx;
+        output[index] = (input[index] - mean) / std_dev;
+    }
+}
+
+// CUDA kernel for ReLU activation
+__global__ void relu_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int depth) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int h_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int w_idx = threadIdx.w;
+    int d_idx = threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < channels && h_idx < height && w_idx < width && d_idx < depth) {
+        int index = (batch_idx * channels + channel_idx) * height * width * depth + h_idx * width * depth + w_idx * depth + d_idx;
+        output[index] = max(0.0f, input[index]);
+    }
+}
+
+// CUDA kernel for matrix multiplication
+__global__ void matmul_kernel(const float* input, const float* weight, float* output, int batch_size, int input_channels, int output_channels) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int output_channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && output_channel_idx < output_channels) {
+        float sum = 0.0f;
+        for (int input_channel_idx = 0; input_channel_idx < input_channels; ++input_channel_idx) {
+            int input_index = (batch_idx * input_channels + input_channel_idx);
+            int weight_index = (output_channel_idx * input_channels + input_channel_idx);
+            sum += input[input_index] * weight[weight_index];
+        }
+        output[batch_idx * output_channels + output_channel_idx] = sum;
+    }
+}
+
+extern "C" {
+    
+    void complex_function(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        // Extract input tensor
+        const float* input_tensor = va_arg(args, const float*);
+        int input_tensor_dim0 = va_arg(args, int);
+        int input_tensor_dim1 = va_arg(args, int);
+        int input_tensor_dim2 = va_arg(args, int);
+        int input_tensor_dim3 = va_arg(args, int);
+        int input_tensor_dim4 = va_arg(args, int);
+
+        // Extract weight1 tensor
+        const float* weight1 = va_arg(args, const float*);
+        int weight1_dim0 = va_arg(args, int);
+        int weight1_dim1 = va_arg(args, int);
+
+        // Extract weight2 tensor
+        const float* weight2 = va_arg(args, const float*);
+        int weight2_dim0 = va_arg(args, int);
+        int weight2_dim1 = va_arg(args, int);
+
+        // Extract output tensor (assuming it's preallocated)
+        float* output = va_arg(args, float*);
+
+        va_end(args);
+
+        int batch_size = input_tensor_dim0;
+        int channels = input_tensor_dim1;
+        int height = input_tensor_dim2;
+        int width = input_tensor_dim3;
+        int depth = input_tensor_dim4;
+
+        // Allocate device memory
+        float *d_input, *d_weight1, *d_weight2, *d_layer_norm, *d_pooled, *d_weighted_sum, *d_instance_norm, *d_relu, *d_output;
+        cudaMalloc(&d_input, batch_size * channels * height * width * depth * sizeof(float));
+        cudaMalloc(&d_weight1, weight1_dim0 * weight1_dim1 * sizeof(float));
+        cudaMalloc(&d_weight2, weight2_dim0 * weight2_dim1 * sizeof(float));
+        cudaMalloc(&d_layer_norm, batch_size * channels * height * width * depth * sizeof(float));
+        cudaMalloc(&d_pooled, batch_size * channels * (height / 2) * (width / 2) * (depth / 2) * sizeof(float));
+        cudaMalloc(&d_weighted_sum, batch_size * channels * (height / 2) * (width / 2) * (depth / 2) * sizeof(float));
+        cudaMalloc(&d_instance_norm, batch_size * channels * (height / 2) * (width / 2) * (depth / 2) * sizeof(float));
+        cudaMalloc(&d_relu, batch_size * channels * (height / 2) * (width / 2) * (depth / 2) * sizeof(float));
+        cudaMalloc(&d_output, batch_size * weight2_dim0 * sizeof(float));
+
+        // Copy input data to device
+        cudaMemcpy(d_input, input_tensor, batch_size * channels * height * width * depth * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_weight1, weight1, weight1_dim0 * weight1_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_weight2, weight2, weight2_dim0 * weight2_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Layer Normalization
+        dim3 threadsPerBlockLayerNorm(16, 16);
+        dim3 numBlocksLayerNorm((batch_size + threadsPerBlockLayerNorm.x - 1) / threadsPerBlockLayerNorm.x,
+                                (channels + threadsPerBlockLayerNorm.y - 1) / threadsPerBlockLayerNorm.y);
+        layer_norm_kernel<<<numBlocksLayerNorm, threadsPerBlockLayerNorm>>>(d_input, d_layer_norm, batch_size, channels, height, width, depth);
+
+        // 3D Max Pooling
+        dim3 threadsPerBlockMaxPool(8, 8, 4);
+        dim3 numBlocksMaxPool((batch_size + threadsPerBlockMaxPool.x - 1) / threadsPerBlockMaxPool.x,
+                             (channels + threadsPerBlockMaxPool.y - 1) / threadsPerBlockMaxPool.y,
+                             ((height + 1) / 2 + threadsPerBlockMaxPool.z - 1) / threadsPerBlockMaxPool.z);
+        max_pool3d_kernel<<<numBlocksMaxPool, threadsPerBlockMaxPool>>>(d_layer_norm, d_pooled, batch_size, channels, height, width, depth, 3, 2, 1);
+
+        // Elementwise sum with learned weight
+        dim3 threadsPerBlockElementwiseSum(8, 8, 4);
+        dim3 numBlocksElementwiseSum((batch_size + threadsPerBlockElementwiseSum.x - 1) / threadsPerBlockElementwiseSum.x,
+                                  (channels + threadsPerBlockElementwiseSum.y - 1) / threadsPerBlockElementwiseSum.y,
+                                  ((height / 2 + 1) / 2 + threadsPerBlockElementwiseSum.z - 1) / threadsPerBlockElementwiseSum.z);
+        elementwise_sum_kernel<<<numBlocksElementwiseSum, threadsPerBlockElementwiseSum>>>(d_pooled, d_weight1, d_weighted_sum, batch_size, channels, height / 2, width / 2, depth / 2);
+
+        // Instance Normalization
+        dim3 threadsPerBlockInstanceNorm(8, 8, 4);
+        dim3 numBlocksInstanceNorm((batch_size + threadsPerBlockInstanceNorm.x - 1) / threadsPerBlockInstanceNorm.x,
+                                  (channels + threadsPerBlockInstanceNorm.y - 1) / threadsPerBlockInstanceNorm.y,
+                                  ((height / 2 + 1) / 2 + threadsPerBlockInstanceNorm.z - 1) / threadsPerBlockInstanceNorm.z);
+        instance_norm_kernel<<<numBlocksInstanceNorm, threadsPerBlockInstanceNorm>>>(d_weighted_sum, d_instance_norm, batch_size, channels, height / 2, width / 2, depth / 2);
+
+        // ReLU activation
+        dim3 threadsPerBlockReLU(8, 8, 4);
+        dim3 numBlocksReLU((batch_size + threadsPerBlockReLU.x - 1) / threadsPerBlockReLU.x,
+                           (channels + threadsPerBlockReLU.y - 1) / threadsPerBlockReLU.y,
+                           ((height / 2 + 1) / 2 + threadsPerBlockReLU.z - 1) / threadsPerBlockReLU.z);
+        relu_kernel<<<numBlocksReLU, threadsPerBlockReLU>>>(d_instance_norm, d_relu, batch_size, channels, height / 2, width / 2, depth / 2);
+
+        // Matrix multiplication
+        dim3 threadsPerBlockMatmul(16, 16);
+        dim3 numBlocksMatmul((batch_size + threadsPerBlockMatmul.x - 1) / threadsPerBlockMatmul.x,
+                           (weight2_dim0 + threadsPerBlockMatmul.y - 1) / threadsPerBlockMatmul.y);
+        matmul_kernel<<<numBlocksMatmul, threadsPerBlockMatmul>>>(d_relu, d_weight2, d_output, batch_size, channels * (height / 2) * (width / 2) * (depth / 2), weight2_dim0);
+
+        // Copy result back to host
+        cudaMemcpy(output, d_output, batch_size * weight2_dim0 * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_weight1);
+        cudaFree(d_weight2);
+        cudaFree(d_layer_norm);
+        cudaFree(d_pooled);
+        cudaFree(d_weighted_sum);
+        cudaFree(d_instance_norm);
+        cudaFree(d_relu);
+        cudaFree(d_output);
+    }
+
+} // extern "C"
+```

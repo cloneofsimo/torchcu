@@ -1,0 +1,308 @@
+## func.py
+
+```python
+import torch
+import torch.nn as nn
+from torch.nn.parameter import Parameter
+import torch.nn.functional as F
+from typing import List, Tuple
+from torch.utils.tensorboard import SummaryWriter
+
+class MyModel(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int,
+                 learning_rate: float = 0.01, weight_decay: float = 0.001,
+                 use_fp16: bool = False):
+        super(MyModel, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.use_fp16 = use_fp16
+
+        # Define layers
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, output_size)
+
+        # Define optimizer
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+
+        # Enable mixed precision training if specified
+        if self.use_fp16:
+            self.scaler = torch.cuda.amp.GradScaler()
+
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.linear1(input_tensor))
+        x = self.linear2(x)
+        return x
+
+    def train_step(self, input_tensor: torch.Tensor, target_tensor: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        self.optimizer.zero_grad()
+
+        if self.use_fp16:
+            with torch.cuda.amp.autocast():
+                output = self.forward(input_tensor)
+                loss = F.mse_loss(output, target_tensor)
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            output = self.forward(input_tensor)
+            loss = F.mse_loss(output, target_tensor)
+            loss.backward()
+            self.optimizer.step()
+
+        return output, loss.item()
+
+def my_function(input_tensor: torch.Tensor, hyperparameters: List[float], target_tensor: torch.Tensor = None) -> List[torch.Tensor]:
+    """
+    This function demonstrates a complex torch function with various concepts:
+        - Hyperparameter optimization: The function accepts hyperparameters for model initialization.
+        - BMM_out: Performs batch matrix multiplication with an output tensor.
+        - Block_diag: Creates a block diagonal matrix.
+        - Any: Checks if any element in a tensor is True.
+        - Backward: Calculates gradients for training.
+        - FP32 and FP16: Supports both floating-point precisions for training.
+        - Forward: Executes the forward pass of the model.
+
+    Args:
+        input_tensor: Input tensor.
+        hyperparameters: List of hyperparameters for model initialization.
+        target_tensor: Target tensor for training (optional).
+
+    Returns:
+        A list of tensors:
+            - Output tensor from the model's forward pass.
+            - Loss tensor (only if target_tensor is provided).
+    """
+
+    # Initialize model with given hyperparameters
+    learning_rate = hyperparameters[0]
+    weight_decay = hyperparameters[1]
+    use_fp16 = hyperparameters[2]
+    model = MyModel(input_size=input_tensor.shape[1], hidden_size=64, output_size=32,
+                    learning_rate=learning_rate, weight_decay=weight_decay, use_fp16=use_fp16)
+
+    # Prepare tensors for block_diag operation
+    identity_matrix = torch.eye(input_tensor.shape[1]).unsqueeze(0)
+    block_diagonal = torch.block_diag(*[identity_matrix for _ in range(input_tensor.shape[0])])
+
+    # Perform batch matrix multiplication
+    output = torch.bmm(input_tensor.unsqueeze(1), block_diagonal.unsqueeze(0))
+
+    # Forward pass and potentially backward pass
+    if target_tensor is not None:
+        # Train the model using provided hyperparameters
+        output, loss = model.train_step(output, target_tensor)
+        # Check if any element in the loss tensor is greater than 1.0
+        is_loss_high = (loss > 1.0).any()
+        # Return output and loss tensors
+        return [output, torch.tensor([loss])]
+    else:
+        # Return output tensor only
+        return [output]
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((10, 4), torch.float32),
+        ([0.01, 0.001, False], torch.float32),
+        ((10, 32), torch.float32)
+    ],
+    "outputs": [
+        ((10, 32), torch.float32),
+        ((1,), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+#define BLOCK_SIZE 16
+
+// Helper function for ReLU activation
+__device__ inline float relu(float x) {
+    return (x > 0.0f) ? x : 0.0f;
+}
+
+// CUDA kernel for matrix multiplication and ReLU
+__global__ void matmul_relu_kernel(const float* input_tensor, const float* weight1, const float* weight2, float* output, 
+                                    int batch_size, int input_dim, int hidden_dim, int output_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < output_dim) {
+        float sum1 = 0.0f;
+        for (int i = 0; i < input_dim; ++i) {
+            sum1 += input_tensor[row * input_dim + i] * weight1[col * input_dim + i];
+        }
+        float sum2 = 0.0f;
+        for (int i = 0; i < hidden_dim; ++i) {
+            sum2 += relu(sum1) * weight2[col * hidden_dim + i];
+        }
+        output[row * output_dim + col] = sum2;
+    }
+}
+
+// CUDA kernel for bmm_out (batch matrix multiplication)
+__global__ void bmm_out_kernel(const float* input_tensor, const float* block_diagonal, float* output, 
+                                int batch_size, int input_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < input_dim) {
+        for (int i = 0; i < input_dim; ++i) {
+            output[row * input_dim + col] += input_tensor[row * input_dim + i] * block_diagonal[col * input_dim + i];
+        }
+    }
+}
+
+// CUDA kernel for MSE loss calculation
+__global__ void mse_loss_kernel(const float* output, const float* target, float* loss, 
+                                int batch_size, int output_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < output_dim) {
+        float diff = output[row * output_dim + col] - target[row * output_dim + col];
+        atomicAdd(loss, diff * diff);
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract hyperparameters
+    float learning_rate = va_arg(args, double);
+    float weight_decay = va_arg(args, double);
+    bool use_fp16 = va_arg(args, int);
+
+    // Extract target tensor (optional)
+    const float* target_tensor = va_arg(args, const float*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+
+    // Extract output tensors (assuming they are preallocated)
+    float* output = va_arg(args, float*);
+    float* loss = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int hidden_dim = 64;
+    int output_dim = 32;
+
+    // Allocate device memory
+    float *d_input, *d_weight1, *d_weight2, *d_output, *d_target, *d_block_diagonal;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight1, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_weight2, output_dim * hidden_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+    cudaMalloc(&d_block_diagonal, batch_size * input_dim * input_dim * sizeof(float));
+
+    if (target_tensor != nullptr) {
+        cudaMalloc(&d_target, batch_size * output_dim * sizeof(float));
+    }
+
+    // Initialize weights on device
+    float *h_weight1 = new float[output_dim * input_dim];
+    float *h_weight2 = new float[output_dim * hidden_dim];
+    for (int i = 0; i < output_dim * input_dim; ++i) {
+        h_weight1[i] = (float)rand() / RAND_MAX;
+    }
+    for (int i = 0; i < output_dim * hidden_dim; ++i) {
+        h_weight2[i] = (float)rand() / RAND_MAX;
+    }
+    cudaMemcpy(d_weight1, h_weight1, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight2, h_weight2, output_dim * hidden_dim * sizeof(float), cudaMemcpyHostToDevice);
+    delete[] h_weight1;
+    delete[] h_weight2;
+
+    // Create block diagonal matrix on device
+    for (int i = 0; i < batch_size; ++i) {
+        for (int j = 0; j < input_dim; ++j) {
+            d_block_diagonal[i * input_dim * input_dim + j * input_dim + j] = 1.0f;
+        }
+    }
+
+    // Copy input and target data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    if (target_tensor != nullptr) {
+        cudaMemcpy(d_target, target_tensor, batch_size * output_dim * sizeof(float), cudaMemcpyHostToDevice);
+    }
+
+    // Perform bmm_out on device
+    dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 numBlocks((input_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    bmm_out_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_block_diagonal, d_output, batch_size, input_dim);
+
+    // Perform forward pass on device
+    numBlocks = ((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                 (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    matmul_relu_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_weight1, d_weight2, d_output, 
+                                                batch_size, input_dim, hidden_dim, output_dim);
+
+    // Calculate loss on device if target tensor is provided
+    if (target_tensor != nullptr) {
+        numBlocks = ((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                     (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+        mse_loss_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_target, loss, batch_size, output_dim);
+    }
+
+    // Copy output and loss data back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+    if (target_tensor != nullptr) {
+        cudaMemcpy(loss, loss, sizeof(float), cudaMemcpyDeviceToHost);
+    }
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight1);
+    cudaFree(d_weight2);
+    cudaFree(d_output);
+    cudaFree(d_block_diagonal);
+    if (target_tensor != nullptr) {
+        cudaFree(d_target);
+    }
+}
+
+} // extern "C"
+
+```
+
+This example demonstrates a complex PyTorch function with the following concepts:
+
+- **Hyperparameter optimization:** The `my_function` accepts hyperparameters for model initialization (`learning_rate`, `weight_decay`, `use_fp16`).
+- **BMM_out:**  The `bmm_out_kernel` performs a batch matrix multiplication (bmm) with an output tensor, effectively expanding the input tensor along a new dimension.
+- **Block_diag:**  The CUDA code constructs a block diagonal matrix to be used in the `bmm_out` operation.
+- **Any:**  The `any` operation is used in the PyTorch code to check if any element in the loss tensor is greater than 1.0.
+- **Backward:** The `train_step` method in the PyTorch code performs the backward pass for gradient calculation during training.
+- **FP32 and FP16:**  The `MyModel` class supports both floating-point precisions (FP32 and FP16) for training, allowing for flexibility and potential performance gains.
+- **Forward:** The `forward` method in the `MyModel` class implements the forward pass of the neural network model. 
+
+The CUDA code implements optimized kernels for the operations involved, including `matmul_relu_kernel` for the matrix multiplication and ReLU activation, `bmm_out_kernel` for the batch matrix multiplication, and `mse_loss_kernel` for the mean squared error (MSE) loss calculation. 
+
+The overall structure involves:
+
+- **Initialization:** Allocating memory for tensors and initializing weights on the device.
+- **BMM_out:** Performing the batch matrix multiplication on the device.
+- **Forward Pass:** Executing the forward pass of the neural network on the device.
+- **Loss Calculation:** Calculating the loss if target tensor is provided.
+- **Data Transfer:** Copying output and loss data back to the host.
+- **Cleanup:** Freeing allocated device memory. 

@@ -1,0 +1,68 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// CUDA kernel for adaptive average pooling in 1D using int8
+__global__ void adaptive_avg_pool1d_int8_kernel(const int8_t* input, float* output, int batch_size, int channels, int sequence_length) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i < batch_size && j < channels) {
+        float sum = 0.0f;
+        for (int k = 0; k < sequence_length; k++) {
+            sum += (float) input[i * channels * sequence_length + j * sequence_length + k];
+        }
+        output[i * channels + j] = sum / (float) sequence_length;
+    }
+}
+
+extern "C" {
+
+void adaptive_avg_pool1d_int8_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int channels = input_tensor_dim1;
+    int sequence_length = input_tensor_dim2;
+
+    // Allocate device memory
+    int8_t *d_input;
+    float *d_output;
+    cudaMalloc(&d_input, batch_size * channels * sequence_length * sizeof(int8_t));
+    cudaMalloc(&d_output, batch_size * channels * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * channels * sequence_length * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (channels + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    adaptive_avg_pool1d_int8_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_output, batch_size, channels, sequence_length
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * channels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

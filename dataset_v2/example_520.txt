@@ -1,0 +1,109 @@
+## func.py
+
+```python
+import torch
+
+def pairwise_distance_fp32(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates the pairwise distance between two tensors.
+    
+    Args:
+        input1: Tensor of shape (N1, D).
+        input2: Tensor of shape (N2, D).
+        
+    Returns:
+        Tensor of shape (N1, N2) containing pairwise distances.
+    """
+    
+    return torch.cdist(input1, input2, p=2)
+
+function_signature = {
+    "name": "pairwise_distance_fp32",
+    "inputs": [
+        ((1, 4), torch.float32),
+        ((1, 4), torch.float32)
+    ],
+    "outputs": [
+        ((1, 1), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+__global__ void pairwise_distance_kernel(const float* input1, const float* input2, float* output, 
+                                        int n1, int n2, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (i < n1 && j < n2) {
+        float sum = 0.0f;
+        for (int k = 0; k < d; ++k) {
+            float diff = input1[i * d + k] - input2[j * d + k];
+            sum += diff * diff;
+        }
+        output[i * n2 + j] = sqrtf(sum);
+    }
+}
+
+extern "C" {
+
+void pairwise_distance_fp32(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input1 = va_arg(args, const float*);
+    int n1 = va_arg(args, int);
+    int d1 = va_arg(args, int);
+
+    const float* input2 = va_arg(args, const float*);
+    int n2 = va_arg(args, int);
+    int d2 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Sanity check for dimensions
+    if (d1 != d2) {
+        printf("Error: Input dimensions must match!\n");
+        return;
+    }
+
+    // Allocate device memory
+    float *d_input1, *d_input2, *d_output;
+    cudaMalloc(&d_input1, n1 * d1 * sizeof(float));
+    cudaMalloc(&d_input2, n2 * d2 * sizeof(float));
+    cudaMalloc(&d_output, n1 * n2 * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input1, n1 * d1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input2, n2 * d2 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((n1 + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (n2 + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    pairwise_distance_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input1, d_input2, d_output, n1, n2, d1
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, n1 * n2 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

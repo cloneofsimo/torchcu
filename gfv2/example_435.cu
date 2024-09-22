@@ -1,0 +1,219 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Shared memory for storing unfolded patches
+__shared__ float sm_unfolded_patches[16 * 9];
+
+// Kernel for unfolding the input tensor
+__global__ void unfold_kernel(const float* input, float* unfolded, int batch_size, int in_channels,
+                                   int height, int width, int kernel_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = row * width + col;
+    int patch_idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    // Unfold only if within the bounds of the input tensor
+    if (row < height && col < width) {
+        // Calculate patch position within the unfolded tensor
+        int unfolded_idx = (idx + (patch_idx - 4)) * in_channels;
+
+        // Store unfolded patch in shared memory
+        sm_unfolded_patches[patch_idx] = input[unfolded_idx];
+    }
+}
+
+// Kernel for calculating pairwise distances between unfolded patches
+__global__ void pairwise_distance_kernel(const float* unfolded, float* distances, 
+                                          int num_patches, int in_channels) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Calculate pairwise distance only for i < j
+    if (i < j && i < num_patches && j < num_patches) {
+        float sum_sq_diff = 0.0f;
+        for (int k = 0; k < in_channels; k++) {
+            float diff = unfolded[i * in_channels + k] - unfolded[j * in_channels + k];
+            sum_sq_diff += diff * diff;
+        }
+        distances[i * num_patches + j] = sqrtf(sum_sq_diff);
+    }
+}
+
+// Kernel for applying threshold to distances
+__global__ void threshold_kernel(const float* distances, float* thresholded_distances, 
+                                   int num_patches, float threshold) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Apply threshold only for i < j
+    if (i < j && i < num_patches && j < num_patches) {
+        thresholded_distances[i * num_patches + j] = (distances[i * num_patches + j] > threshold) ? 1.0f : 0.0f;
+    }
+}
+
+// Kernel for performing convolution with conv2d_fft
+__global__ void conv2d_fft_kernel(const __nv_bfloat16* input, const __nv_bfloat16* weight,
+                                    __nv_bfloat16* output, int batch_size, int in_channels,
+                                    int out_channels, int height, int width, int kernel_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = row * width + col;
+    int patch_idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    // Convolution only if within the bounds of the input tensor
+    if (row < height && col < width) {
+        __nv_bfloat16 sum = float_to_bfloat16(0.0f);
+
+        // Calculate patch position within the unfolded tensor
+        int unfolded_idx = (idx + (patch_idx - 4)) * in_channels;
+
+        // Perform convolution with the weight tensor
+        for (int k = 0; k < in_channels * kernel_size * kernel_size; k++) {
+            sum = __hmul(sum, __hmul(weight[k], float_to_bfloat16(input[unfolded_idx + k])));
+        }
+        output[idx * out_channels + threadIdx.x] = sum;
+    }
+}
+
+// Kernel for combining conv output with thresholded distances
+__global__ void combine_kernel(const float* conv_output, const float* thresholded_distances,
+                                 float* combined_output, int batch_size, int out_channels,
+                                 int height, int width, int num_patches) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = row * width + col;
+
+    if (row < height && col < width) {
+        for (int k = 0; k < out_channels; k++) {
+            combined_output[idx * out_channels + k] = 
+                conv_output[idx * out_channels + k] * thresholded_distances[idx * num_patches + idx];
+        }
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int in_channels = input_tensor_dim1;
+    int height = input_tensor_dim2;
+    int width = input_tensor_dim3;
+    int kernel_size = 3;
+    int out_channels = 8;
+    int num_patches = height * width; 
+    int padding = 1; 
+
+    // Allocate device memory
+    float* d_input;
+    float* d_unfolded;
+    float* d_distances;
+    float* d_thresholded_distances;
+    __nv_bfloat16* d_bf16_input;
+    __nv_bfloat16* d_bf16_weight;
+    __nv_bfloat16* d_bf16_output;
+    float* d_conv_output;
+    float* d_combined_output;
+
+    cudaMalloc(&d_input, batch_size * in_channels * height * width * sizeof(float));
+    cudaMalloc(&d_unfolded, batch_size * in_channels * (height + 2 * padding) * (width + 2 * padding) * 
+                     (kernel_size * kernel_size) * sizeof(float));
+    cudaMalloc(&d_distances, num_patches * num_patches * sizeof(float));
+    cudaMalloc(&d_thresholded_distances, num_patches * num_patches * sizeof(float));
+    cudaMalloc(&d_bf16_input, batch_size * in_channels * height * width * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_bf16_weight, out_channels * in_channels * kernel_size * kernel_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_bf16_output, batch_size * out_channels * height * width * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_conv_output, batch_size * out_channels * height * width * sizeof(float));
+    cudaMalloc(&d_combined_output, batch_size * out_channels * height * width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Unfold the input tensor
+    dim3 threadsPerBlock_unfold(8, 8);
+    dim3 numBlocks_unfold((width + threadsPerBlock_unfold.x - 1) / threadsPerBlock_unfold.x, 
+                         (height + threadsPerBlock_unfold.y - 1) / threadsPerBlock_unfold.y);
+    unfold_kernel<<<numBlocks_unfold, threadsPerBlock_unfold>>>(d_input, d_unfolded, batch_size, in_channels, 
+                                                           height, width, kernel_size);
+
+    // Calculate pairwise distances
+    dim3 threadsPerBlock_distance(16, 16);
+    dim3 numBlocks_distance((num_patches + threadsPerBlock_distance.x - 1) / threadsPerBlock_distance.x, 
+                            (num_patches + threadsPerBlock_distance.y - 1) / threadsPerBlock_distance.y);
+    pairwise_distance_kernel<<<numBlocks_distance, threadsPerBlock_distance>>>(d_unfolded, d_distances, 
+                                                                num_patches, in_channels * kernel_size * kernel_size);
+
+    // Apply threshold to distances
+    threshold_kernel<<<numBlocks_distance, threadsPerBlock_distance>>>(d_distances, d_thresholded_distances,
+                                                                num_patches, 0.5f); // Threshold value
+
+    // Convert input and weight to bf16
+    cudaMemcpy(d_bf16_input, d_input, batch_size * in_channels * height * width * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+
+    // Assume weight is already in bf16 format
+    // ... (Load your weight tensor in bf16 format)
+
+    // Perform conv2d_fft
+    dim3 threadsPerBlock_conv(8, 8);
+    dim3 numBlocks_conv((width + threadsPerBlock_conv.x - 1) / threadsPerBlock_conv.x, 
+                         (height + threadsPerBlock_conv.y - 1) / threadsPerBlock_conv.y);
+    conv2d_fft_kernel<<<numBlocks_conv, threadsPerBlock_conv>>>(d_bf16_input, d_bf16_weight,
+                                                        d_bf16_output, batch_size, in_channels, 
+                                                        out_channels, height, width, kernel_size);
+
+    // Convert conv output to fp32
+    cudaMemcpy(d_conv_output, d_bf16_output, batch_size * out_channels * height * width * sizeof(__nv_bfloat16), 
+                cudaMemcpyDeviceToHost);
+
+    // Combine conv output with thresholded distances
+    dim3 threadsPerBlock_combine(8, 8);
+    dim3 numBlocks_combine((width + threadsPerBlock_combine.x - 1) / threadsPerBlock_combine.x, 
+                            (height + threadsPerBlock_combine.y - 1) / threadsPerBlock_combine.y);
+    combine_kernel<<<numBlocks_combine, threadsPerBlock_combine>>>(d_conv_output, d_thresholded_distances, 
+                                                                d_combined_output, batch_size, out_channels,
+                                                                height, width, num_patches);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_combined_output, batch_size * out_channels * height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_unfolded);
+    cudaFree(d_distances);
+    cudaFree(d_thresholded_distances);
+    cudaFree(d_bf16_input);
+    cudaFree(d_bf16_weight);
+    cudaFree(d_bf16_output);
+    cudaFree(d_conv_output);
+    cudaFree(d_combined_output);
+}
+
+}  // extern "C"

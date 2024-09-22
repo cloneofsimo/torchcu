@@ -1,0 +1,78 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for logsigmoid, gather, and fp16 conversion
+__global__ void logsigmoid_gather_kernel_fp16(const float* input_tensor, const char* indices, half* output,
+                                              int batch_size, int input_size, int output_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size) {
+        int index = indices[idx];
+        // Ensure index is within bounds
+        if (index >= 0 && index < input_size) {
+            float val = input_tensor[idx * input_size + index];
+            output[idx] = __logsigmoidf(val);
+        } else {
+            output[idx] = __int2half_rn(0); // Set to 0 for out-of-bounds indices
+        }
+    }
+}
+
+extern "C" {
+
+void logsigmoid_gather_fp16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract indices tensor
+    const char* indices = va_arg(args, const char*);
+    int indices_dim0 = va_arg(args, int);
+    int indices_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    half* output = va_arg(args, half*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_size = input_tensor_dim1;
+    int output_size = indices_dim1;
+
+    // Allocate device memory
+    float *d_input;
+    char *d_indices;
+    half *d_output;
+    cudaMalloc(&d_input, batch_size * input_size * sizeof(float));
+    cudaMalloc(&d_indices, batch_size * output_size * sizeof(char));
+    cudaMalloc(&d_output, batch_size * output_size * sizeof(half));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_indices, indices, batch_size * output_size * sizeof(char), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    logsigmoid_gather_kernel_fp16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_indices, d_output, batch_size, input_size, output_size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_size * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_indices);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

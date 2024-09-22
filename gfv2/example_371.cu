@@ -1,0 +1,75 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+__global__ void avg_pool1d_kernel(const float* input, float* output, int batch_size, int input_size, int output_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < output_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            int idx = row * input_size + col * 2 + i;
+            if (idx >= 0 && idx < input_size * batch_size) {
+                sum += input[idx];
+            }
+        }
+        output[row * output_size + col] = sum / 3.0f; 
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int input_size = input_dim1;
+    int output_size = (input_size - 2) / 2 + 1; // Calculate output size
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * input_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * input_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    avg_pool1d_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_output, batch_size, input_size, output_size
+    );
+
+    // Copy result back to host in fp16 format
+    // Allocate temporary buffer for fp16 data on the host
+    half* h_output = new half[batch_size * output_size];
+    cudaMemcpy(h_output, d_output, batch_size * output_size * sizeof(half), cudaMemcpyDeviceToHost);
+    
+    // Copy fp16 data to the output array (assuming it's preallocated)
+    for (int i = 0; i < batch_size * output_size; ++i) {
+        output[i] = static_cast<float>(h_output[i]);
+    }
+    delete[] h_output;
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+} // extern "C"

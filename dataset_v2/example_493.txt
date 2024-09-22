@@ -1,0 +1,123 @@
+## func.py
+
+```python
+import torch
+
+def cutout_function(input_tensor: torch.Tensor, cutout_size: int) -> torch.Tensor:
+    """
+    Applies a cutout operation to the input tensor.
+    
+    Args:
+        input_tensor: Input tensor of shape (B, C, H, W).
+        cutout_size: Size of the square cutout region.
+    
+    Returns:
+        The input tensor with cutout applied.
+    """
+    batch_size, channels, height, width = input_tensor.size()
+
+    # Randomly select cutout location
+    x_center = torch.randint(0, width, (batch_size,))
+    y_center = torch.randint(0, height, (batch_size,))
+
+    # Calculate cutout boundaries
+    x_min = torch.clamp(x_center - cutout_size // 2, 0, width - 1)
+    x_max = torch.clamp(x_center + cutout_size // 2, 0, width - 1)
+    y_min = torch.clamp(y_center - cutout_size // 2, 0, height - 1)
+    y_max = torch.clamp(y_center + cutout_size // 2, 0, height - 1)
+
+    # Apply cutout for each image in the batch
+    for i in range(batch_size):
+        input_tensor[i, :, y_min[i]:y_max[i], x_min[i]:x_max[i]] = 0
+
+    return input_tensor
+
+function_signature = {
+    "name": "cutout_function",
+    "inputs": [
+        ((1, 3, 32, 32), torch.float32),
+        (1, torch.int32)
+    ],
+    "outputs": [
+        ((1, 3, 32, 32), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+extern "C" {
+
+__global__ void cutout_kernel(const float* input_tensor, float* output_tensor, int batch_size, int channels, int height, int width, int cutout_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size) {
+        // Calculate cutout boundaries
+        int x_center = rand() % width;
+        int y_center = rand() % height;
+        int x_min = max(0, x_center - cutout_size / 2);
+        int x_max = min(width - 1, x_center + cutout_size / 2);
+        int y_min = max(0, y_center - cutout_size / 2);
+        int y_max = min(height - 1, y_center + cutout_size / 2);
+
+        // Apply cutout
+        for (int c = 0; c < channels; ++c) {
+            for (int y = y_min; y < y_max; ++y) {
+                for (int x = x_min; x < x_max; ++x) {
+                    output_tensor[(idx * channels * height * width) + (c * height * width) + (y * width) + x] = 0.0f;
+                }
+            }
+        }
+    }
+}
+
+void cutout_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract cutout size
+    int cutout_size = va_arg(args, int);
+
+    // Extract output tensor
+    float* output_tensor = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_input_tensor;
+    float* d_output_tensor;
+    cudaMalloc(&d_input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float));
+    cudaMalloc(&d_output_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input_tensor, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((input_tensor_dim0 + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    cutout_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input_tensor, d_output_tensor, input_tensor_dim0, input_tensor_dim1, input_tensor_dim2, input_tensor_dim3, cutout_size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output_tensor, d_output_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input_tensor);
+    cudaFree(d_output_tensor);
+}
+
+} // extern "C"
+```

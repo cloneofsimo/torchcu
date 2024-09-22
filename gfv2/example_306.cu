@@ -1,0 +1,159 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+#include <math.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for attention-weighted input calculation
+__global__ void apply_attention_kernel(const float* input, const float* attention_weights, float* output, 
+                                        int batch_size, int seq_len, int vocab_size) {
+    int batch_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int seq_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && seq_idx < seq_len) {
+        for (int vocab_idx = 0; vocab_idx < vocab_size; ++vocab_idx) {
+            __nv_bfloat16 val = float_to_bfloat16(input[batch_idx * seq_len * vocab_size + seq_idx * vocab_size + vocab_idx]);
+            __nv_bfloat16 weight = float_to_bfloat16(attention_weights[batch_idx * seq_len + seq_idx]);
+            output[batch_idx * seq_len * vocab_size + seq_idx * vocab_size + vocab_idx] = bfloat16_to_float(__hmul(val, weight));
+        }
+    }
+}
+
+// CUDA kernel for calculating CTC loss with attention
+__global__ void ctc_attention_loss_kernel(const float* input, const long long* target, float* loss, 
+                                         int batch_size, int seq_len, int vocab_size, 
+                                         int target_len, int blank_id) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size) {
+        float total_loss = 0.0f;
+        for (int t = 0; t < seq_len; ++t) {
+            for (int s = 0; s < target_len; ++s) {
+                int target_label = target[batch_idx * target_len + s];
+                int input_label = t * vocab_size + target_label;
+                float prob = input[batch_idx * seq_len * vocab_size + input_label];
+
+                float loss_term = 0.0f;
+                if (target_label == blank_id) {
+                    loss_term = -logf(1.0f - prob);
+                } else {
+                    loss_term = -logf(prob);
+                }
+
+                total_loss += loss_term;
+            }
+        }
+
+        loss[batch_idx] = total_loss;
+    }
+}
+
+// CUDA kernel for calculating gradients of the input tensor
+__global__ void calculate_input_gradients_kernel(const float* input, const long long* target, float* gradients,
+                                                int batch_size, int seq_len, int vocab_size,
+                                                int target_len, int blank_id) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int input_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && input_idx < seq_len * vocab_size) {
+        float grad = 0.0f;
+        for (int s = 0; s < target_len; ++s) {
+            int target_label = target[batch_idx * target_len + s];
+            if (input_idx == target_label) {
+                if (target_label == blank_id) {
+                    grad -= 1.0f / (1.0f - input[batch_idx * seq_len * vocab_size + input_idx]);
+                } else {
+                    grad -= 1.0f / input[batch_idx * seq_len * vocab_size + input_idx];
+                }
+            }
+        }
+        gradients[batch_idx * seq_len * vocab_size + input_idx] = grad;
+    }
+}
+
+extern "C" {
+
+void ctc_attention_loss_fp16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    const long long* target_tensor = va_arg(args, const long long*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+
+    const float* attention_weights = va_arg(args, const float*);
+    int attention_weights_dim0 = va_arg(args, int);
+    int attention_weights_dim1 = va_arg(args, int);
+
+    float* loss = va_arg(args, float*);
+    float* input_tensor_grad = va_arg(args, float*);
+
+    int blank_id = va_arg(args, int);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int seq_len = input_tensor_dim1;
+    int vocab_size = input_tensor_dim2;
+    int target_len = target_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_attention_weights, *d_loss, *d_input_grad;
+    cudaMalloc(&d_input, batch_size * seq_len * vocab_size * sizeof(float));
+    cudaMalloc(&d_attention_weights, batch_size * seq_len * sizeof(float));
+    cudaMalloc(&d_loss, batch_size * sizeof(float));
+    cudaMalloc(&d_input_grad, batch_size * seq_len * vocab_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * seq_len * vocab_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_attention_weights, attention_weights, batch_size * seq_len * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Apply attention weights
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((seq_len + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    apply_attention_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_attention_weights, d_input, batch_size, seq_len, vocab_size
+    );
+
+    // Calculate CTC loss
+    numBlocks = (batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x;
+    ctc_attention_loss_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, target_tensor, d_loss, batch_size, seq_len, vocab_size, target_len, blank_id
+    );
+
+    // Calculate gradients of the input tensor
+    numBlocks = (seq_len * vocab_size + threadsPerBlock.y - 1) / threadsPerBlock.y;
+    calculate_input_gradients_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, target_tensor, d_input_grad, batch_size, seq_len, vocab_size, target_len, blank_id
+    );
+
+    // Copy results back to host
+    cudaMemcpy(loss, d_loss, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(input_tensor_grad, d_input_grad, batch_size * seq_len * vocab_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_attention_weights);
+    cudaFree(d_loss);
+    cudaFree(d_input_grad);
+}
+
+}  // extern "C"

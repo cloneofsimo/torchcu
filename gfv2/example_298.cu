@@ -1,0 +1,100 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for pixel shuffle
+__global__ void pixel_shuffle_kernel(const float* input, float* output, int batch_size, int in_channels, 
+                                     int in_height, int in_width, int upscale_factor) {
+    int b = blockIdx.x;
+    int c = threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = blockIdx.z * blockDim.z + threadIdx.z;
+
+    int out_channels = in_channels / (upscale_factor * upscale_factor);
+    int out_height = in_height * upscale_factor;
+    int out_width = in_width * upscale_factor;
+
+    if (b < batch_size && c < out_channels && h < out_height && w < out_width) {
+        int in_h = h / upscale_factor;
+        int in_w = w / upscale_factor;
+        int in_c = c * (upscale_factor * upscale_factor) + (h % upscale_factor) * upscale_factor + (w % upscale_factor);
+
+        output[b * out_channels * out_height * out_width + c * out_height * out_width + h * out_width + w] = 
+            input[b * in_channels * in_height * in_width + in_c * in_height * in_width + in_h * in_width + in_w];
+    }
+}
+
+// CUDA kernel for einsum transpose
+__global__ void einsum_transpose_kernel(const float* input, float* output, int batch_size, int height, int width, int channels) {
+    int b = blockIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = threadIdx.x;
+
+    if (b < batch_size && h < height && w < width && c < channels) {
+        output[b * channels * height * width + c * height * width + h * width + w] = 
+            input[b * height * width * channels + h * width * channels + w * channels + c];
+    }
+}
+
+extern "C" {
+
+void pixel_shuffle_einsum_transpose(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract upscale factor
+    int upscale_factor = va_arg(args, int);
+
+    // Extract output tensors (assuming they are pre-allocated)
+    float* shuffled_tensor = va_arg(args, float*);
+    float* transposed_tensor = va_arg(args, float*);
+
+    va_end(args);
+
+    // Calculate output dimensions
+    int batch_size = input_tensor_dim0;
+    int in_channels = input_tensor_dim1;
+    int in_height = input_tensor_dim2;
+    int in_width = input_tensor_dim3;
+    int out_channels = in_channels / (upscale_factor * upscale_factor);
+    int out_height = in_height * upscale_factor;
+    int out_width = in_width * upscale_factor;
+
+    // Allocate device memory
+    float* d_input, *d_shuffled, *d_transposed;
+    cudaMalloc(&d_input, batch_size * in_channels * in_height * in_width * sizeof(float));
+    cudaMalloc(&d_shuffled, batch_size * out_channels * out_height * out_width * sizeof(float));
+    cudaMalloc(&d_transposed, batch_size * out_channels * out_height * out_width * sizeof(float));
+
+    // Copy input tensor to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * in_height * in_width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch pixel shuffle kernel
+    dim3 threadsPerBlock(32, 1, 1);
+    dim3 numBlocks(batch_size, (out_height + threadsPerBlock.y - 1) / threadsPerBlock.y, (out_width + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    pixel_shuffle_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_shuffled, batch_size, in_channels, in_height, in_width, upscale_factor);
+
+    // Launch einsum transpose kernel
+    numBlocks = dim3((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, (out_height + threadsPerBlock.y - 1) / threadsPerBlock.y, (out_width + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    einsum_transpose_kernel<<<numBlocks, threadsPerBlock>>>(d_shuffled, d_transposed, batch_size, out_height, out_width, out_channels);
+
+    // Copy shuffled and transposed tensors back to host
+    cudaMemcpy(shuffled_tensor, d_shuffled, batch_size * out_channels * out_height * out_width * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(transposed_tensor, d_transposed, batch_size * out_channels * out_height * out_width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_shuffled);
+    cudaFree(d_transposed);
+}
+
+} // extern "C"

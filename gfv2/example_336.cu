@@ -1,0 +1,132 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for 3D max pooling
+__global__ void max_pool3d_kernel(const int8_t* input, int8_t* output,
+                                  int batch, int channels, int depth, int height, int width,
+                                  int kernel_size, int stride) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (b < batch && c < channels && d < depth) {
+        int pool_start_d = max(0, d - kernel_size / 2);
+        int pool_end_d = min(depth, d + kernel_size / 2 + 1);
+        int pool_start_h = max(0, (d / stride) - kernel_size / 2);
+        int pool_end_h = min(height, (d / stride) + kernel_size / 2 + 1);
+        int pool_start_w = max(0, (d / stride) - kernel_size / 2);
+        int pool_end_w = min(width, (d / stride) + kernel_size / 2 + 1);
+
+        int8_t max_val = input[b * channels * depth * height * width + c * depth * height * width +
+                               pool_start_d * height * width + pool_start_h * width + pool_start_w];
+
+        for (int pd = pool_start_d; pd < pool_end_d; ++pd) {
+            for (int ph = pool_start_h; ph < pool_end_h; ++ph) {
+                for (int pw = pool_start_w; pw < pool_end_w; ++pw) {
+                    int8_t current_val = input[b * channels * depth * height * width + c * depth * height * width +
+                                              pd * height * width + ph * width + pw];
+                    max_val = max(max_val, current_val);
+                }
+            }
+        }
+
+        output[b * channels * depth * height * width + c * depth * height * width + d * height * width +
+               (d / stride) * width + (d / stride)] = max_val;
+    }
+}
+
+// CUDA kernel for outer product and element-wise sum
+__global__ void outer_product_sum_kernel(const int8_t* pooled, const int8_t* weights, half* output,
+                                         int batch, int depth, int height, int width, int channels) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.z * blockDim.z + threadIdx.z;
+    int w = threadIdx.x;
+
+    if (b < batch && d < depth && h < height && w < width) {
+        float sum = 0.0f;
+        for (int c = 0; c < channels; ++c) {
+            sum += (float)pooled[b * channels * depth * height * width + c * depth * height * width + d * height * width +
+                                 h * width + w] * (float)weights[c];
+        }
+
+        output[b * depth * height * width + d * height * width + h * width + w] = float_to_half(sum +
+                                                                                    (float)pooled[b * channels * depth * height * width + 1 * depth * height * width + d * height * width + h * width + w]);
+    }
+}
+
+extern "C" {
+void pool_outer_sum(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+    int input_tensor_dim4 = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch = input_tensor_dim0;
+    int channels = input_tensor_dim1;
+    int depth = input_tensor_dim2;
+    int height = input_tensor_dim3;
+    int width = input_tensor_dim4;
+
+    // Allocate device memory
+    int8_t *d_input, *d_weights, *d_pooled;
+    half *d_output;
+    cudaMalloc(&d_input, batch * channels * depth * height * width * sizeof(int8_t));
+    cudaMalloc(&d_weights, channels * sizeof(int8_t));
+    cudaMalloc(&d_pooled, batch * channels * depth * height * width * sizeof(int8_t));
+    cudaMalloc(&d_output, batch * depth * height * width * sizeof(half));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch * channels * depth * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch 3D max pooling kernel
+    dim3 blockDim(32, 32, 1);
+    dim3 gridDim((batch + blockDim.x - 1) / blockDim.x, (channels + blockDim.y - 1) / blockDim.y, (depth + blockDim.z - 1) / blockDim.z);
+    max_pool3d_kernel<<<gridDim, blockDim>>>(d_input, d_pooled, batch, channels, depth, height, width, 3, 2);
+
+    // Launch outer product and element-wise sum kernel
+    blockDim = dim3(32, 32, 32);
+    gridDim = dim3((width + blockDim.x - 1) / blockDim.x, (depth + blockDim.y - 1) / blockDim.y, (height + blockDim.z - 1) / blockDim.z);
+    outer_product_sum_kernel<<<gridDim, blockDim>>>(d_pooled, d_weights, d_output, batch, depth, height, width, channels);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch * depth * height * width * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_pooled);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+

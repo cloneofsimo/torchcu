@@ -1,0 +1,100 @@
+## func.py
+
+```python
+import torch
+
+def pairwise_manhattan_distance_fp32(input_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates pairwise Manhattan distances between all pairs of vectors in the input tensor.
+
+    Args:
+        input_tensor: A 2D tensor of shape (num_vectors, vector_dim).
+
+    Returns:
+        A 2D tensor of shape (num_vectors, num_vectors) containing the pairwise Manhattan distances.
+    """
+
+    # Expand the input tensor to create a matrix where each row is a vector repeated num_vectors times.
+    expanded_input = input_tensor.unsqueeze(1).expand(-1, input_tensor.shape[0], -1)
+
+    # Create a similar matrix where each column is a vector repeated num_vectors times.
+    expanded_input_t = input_tensor.unsqueeze(0).expand(input_tensor.shape[0], -1, -1)
+
+    # Calculate the absolute difference between the expanded matrices.
+    abs_diff = torch.abs(expanded_input - expanded_input_t)
+
+    # Sum the absolute differences along the last dimension (vector dimension) to get Manhattan distances.
+    distances = torch.sum(abs_diff, dim=2)
+
+    return distances
+
+function_signature = {
+    "name": "pairwise_manhattan_distance_fp32",
+    "inputs": [
+        ((10, 4), torch.float32),
+    ],
+    "outputs": [
+        ((10, 10), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+__global__ void pairwise_manhattan_distance_kernel(const float* input_tensor, float* output, 
+                                        int num_vectors, int vector_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < num_vectors && col < num_vectors) {
+        float distance = 0.0f;
+        for (int i = 0; i < vector_dim; ++i) {
+            distance += abs(input_tensor[row * vector_dim + i] - input_tensor[col * vector_dim + i]);
+        }
+        output[row * num_vectors + col] = distance;
+    }
+}
+
+extern "C" {
+
+void pairwise_manhattan_distance_fp32(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int num_vectors = va_arg(args, int);
+    int vector_dim = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_input;
+    cudaMalloc(&d_input, num_vectors * vector_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, num_vectors * vector_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32); // Adjust block size based on GPU architecture
+    dim3 numBlocks((num_vectors + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (num_vectors + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    pairwise_manhattan_distance_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, output, num_vectors, vector_dim
+    );
+
+    // Free device memory
+    cudaFree(d_input);
+}
+
+}  // extern "C"
+```

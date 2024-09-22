@@ -1,0 +1,158 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for softmin along the last dimension
+__global__ void softmin_kernel(const float* input, float* output, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float max_val = input[row * k + col];
+        for (int i = col + 1; i < k; ++i) {
+            max_val = fmaxf(max_val, input[row * k + i]);
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += expf(input[row * k + i] - max_val);
+        }
+
+        output[row * k + col] = expf(input[row * k + col] - max_val) / sum;
+    }
+}
+
+// CUDA kernel for einsum contraction
+__global__ void einsum_kernel(const float* softmin_output, const float* weights, float* output,
+                              int m, int n, int p, int q) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        for (int k = 0; k < q; ++k) {
+            output[row * n * p + col * p + k] = 0.0f;
+            for (int l = 0; l < q; ++l) {
+                output[row * n * p + col * p + k] += softmin_output[row * q + l] * weights[l * q + k];
+            }
+        }
+    }
+}
+
+// CUDA kernel for margin ranking loss
+__global__ void margin_ranking_loss_kernel(const float* output, int m, int n, float margin, float p, float* loss) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m) {
+        float sum = 0.0f;
+        for (int j = 1; j < n; ++j) {
+            float diff = output[row * n + 0] - output[row * n + j] + margin;
+            if (diff > 0.0f) {
+                sum += powf(diff, p);
+            }
+        }
+        loss[row] = sum / (n - 1);
+    }
+}
+
+// CUDA kernel for fused dropout
+__global__ void fused_dropout_kernel(float* output, int m, int n, int p, float dropout_p, bool train) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        if (train) {
+            float random_val = __float_as_int(curand_uniform());
+            if (random_val < dropout_p) {
+                output[row * n + col] = 0.0f;
+            } else {
+                output[row * n + col] *= (1.0f / (1.0f - dropout_p));
+            }
+        }
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+    int weights_dim1 = va_arg(args, int);
+
+    // Extract margin, p, train, dropout_p
+    float margin = va_arg(args, float);
+    float p = va_arg(args, float);
+    bool train = va_arg(args, bool);
+    float dropout_p = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+    float* margin_loss = va_arg(args, float*);
+
+    va_end(args);
+
+    int m = input_tensor_dim0;
+    int n = input_tensor_dim1;
+    int k = input_tensor_dim2;
+    int q = weights_dim0;
+
+    // Allocate device memory
+    float* d_input_tensor, *d_weights, *d_softmin_output, *d_contracted_output;
+    cudaMalloc(&d_input_tensor, m * n * k * sizeof(float));
+    cudaMalloc(&d_weights, q * q * sizeof(float));
+    cudaMalloc(&d_softmin_output, m * k * sizeof(float));
+    cudaMalloc(&d_contracted_output, m * n * q * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input_tensor, input_tensor, m * n * k * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, q * q * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch softmin kernel
+    dim3 threadsPerBlock(32, 16);
+    dim3 numBlocks((k + threadsPerBlock.x - 1) / threadsPerBlock.x, (m + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    softmin_kernel<<<numBlocks, threadsPerBlock>>>(d_input_tensor, d_softmin_output, m, n, k);
+
+    // Launch einsum contraction kernel
+    numBlocks = ((n * p + threadsPerBlock.x - 1) / threadsPerBlock.x, (m + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    einsum_kernel<<<numBlocks, threadsPerBlock>>>(d_softmin_output, d_weights, d_contracted_output, m, n, p, q);
+
+    // Launch margin ranking loss kernel
+    numBlocks = ((m + threadsPerBlock.x - 1) / threadsPerBlock.x, 1);
+    margin_ranking_loss_kernel<<<numBlocks, threadsPerBlock>>>(d_contracted_output, m, n, margin, p, margin_loss);
+
+    // Launch fused dropout kernel
+    numBlocks = ((n + threadsPerBlock.x - 1) / threadsPerBlock.x, (m + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    fused_dropout_kernel<<<numBlocks, threadsPerBlock>>>(d_contracted_output, m, n, q, dropout_p, train);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_contracted_output, m * n * q * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input_tensor);
+    cudaFree(d_weights);
+    cudaFree(d_softmin_output);
+    cudaFree(d_contracted_output);
+}
+
+}  // extern "C"

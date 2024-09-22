@@ -1,0 +1,154 @@
+## func.py
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def multi_label_margin_loss_with_interpolation(input_tensor: torch.Tensor, target_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Computes multi-label margin loss with interpolation.
+
+    Args:
+        input_tensor: The input tensor of shape (batch_size, num_classes).
+        target_tensor: The target tensor of shape (batch_size, num_classes).
+        weight: The weight tensor of shape (num_classes,).
+
+    Returns:
+        The multi-label margin loss.
+    """
+    # Interpolate input tensor to match the target tensor's size
+    input_tensor = F.interpolate(input_tensor.unsqueeze(1), size=target_tensor.shape[1:], mode='bilinear', align_corners=False).squeeze(1)
+    
+    # Calculate the margin loss
+    loss = nn.MultiLabelMarginLoss(reduction='mean')(input_tensor, target_tensor, weight)
+    return loss
+
+function_signature = {
+    "name": "multi_label_margin_loss_with_interpolation",
+    "inputs": [
+        ((1, 16, 16), torch.float32), 
+        ((1, 32, 32), torch.float32),
+        ((16,), torch.float32)
+    ],
+    "outputs": [
+        ((1,), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper function to calculate the bilinear interpolation
+__device__ float bilinear_interpolate(const float* data, int width, int height, float x, float y) {
+    int x0 = floor(x);
+    int y0 = floor(y);
+    int x1 = min(x0 + 1, width - 1);
+    int y1 = min(y0 + 1, height - 1);
+
+    float dx = x - x0;
+    float dy = y - y0;
+
+    float val = (1 - dx) * (1 - dy) * data[y0 * width + x0] + 
+               (1 - dx) * dy * data[y1 * width + x0] +
+               dx * (1 - dy) * data[y0 * width + x1] + 
+               dx * dy * data[y1 * width + x1];
+    return val;
+}
+
+// CUDA kernel for multi-label margin loss with interpolation
+__global__ void multi_label_margin_loss_kernel(const float* input_tensor, const float* target_tensor, const float* weight,
+                                              float* loss, int batch_size, int input_width, int input_height,
+                                              int target_width, int target_height, int num_classes) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size) {
+        float sum_loss = 0.0f;
+
+        for (int c = 0; c < num_classes; c++) {
+            for (int y = 0; y < target_height; y++) {
+                for (int x = 0; x < target_width; x++) {
+                    float interpolated_val = bilinear_interpolate(input_tensor + batch_idx * input_width * input_height, 
+                                                                     input_width, input_height,
+                                                                     (float)x / (target_width - 1), 
+                                                                     (float)y / (target_height - 1));
+                    float target_val = target_tensor[batch_idx * target_width * target_height + y * target_width + x];
+                    float weighted_loss = weight[c] * max(0.0f, 1.0f - (interpolated_val - target_val));
+                    sum_loss += weighted_loss;
+                }
+            }
+        }
+        loss[batch_idx] = sum_loss / (num_classes * target_width * target_height);
+    }
+}
+
+extern "C" {
+
+void multi_label_margin_loss_with_interpolation(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    const float* target_tensor = va_arg(args, const float*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+    int target_tensor_dim2 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_width = input_tensor_dim2;
+    int input_height = input_tensor_dim1;
+    int target_width = target_tensor_dim2;
+    int target_height = target_tensor_dim1;
+    int num_classes = weight_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_target, *d_weight, *d_output;
+    cudaMalloc(&d_input, batch_size * input_width * input_height * sizeof(float));
+    cudaMalloc(&d_target, batch_size * target_width * target_height * sizeof(float));
+    cudaMalloc(&d_weight, num_classes * sizeof(float));
+    cudaMalloc(&d_output, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_width * input_height * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target_tensor, batch_size * target_width * target_height * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, num_classes * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    multi_label_margin_loss_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_target, d_weight, d_output, batch_size, input_width, input_height, target_width, target_height, num_classes
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_target);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```

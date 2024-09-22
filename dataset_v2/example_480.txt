@@ -1,0 +1,199 @@
+## func.py
+
+```python
+import torch
+
+def my_complex_function(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on the input tensor:
+    1. Matrix multiplication with weight.
+    2. Adaptive max pooling with output size 2x2.
+    3. Applies tanh activation.
+    """
+    output = torch.bmm(input_tensor.to(torch.bfloat16), weight.t().to(torch.bfloat16))
+    output = torch.adaptive_max_pool2d(output.to(torch.float32), (2, 2))
+    output = torch.tanh(output)
+    return output.to(torch.bfloat16)
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((2, 3, 4, 4), torch.float32),
+        ((3, 4, 4), torch.float32),
+    ],
+    "outputs": [
+        ((2, 3, 2, 2), torch.bfloat16)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for matrix multiplication
+__global__ void bmm_kernel_bf16(const float* input_tensor, const float* weight, 
+                                  __nv_bfloat16* output, int batch_size, 
+                                  int input_channels, int output_channels, 
+                                  int input_height, int input_width) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch_size && c < output_channels && h < input_height) {
+        float sum = 0.0f;
+        for (int i = 0; i < input_channels; ++i) {
+            __nv_bfloat16 a = float_to_bfloat16(input_tensor[b * input_channels * input_height * input_width + i * input_height * input_width + h * input_width]);
+            __nv_bfloat16 w = float_to_bfloat16(weight[c * input_channels * input_height * input_width + i * input_height * input_width]); 
+            sum += bfloat16_to_float(__hmul(a, w));
+        }
+        output[b * output_channels * input_height * input_width + c * input_height * input_width + h * input_width] = float_to_bfloat16(sum);
+    }
+}
+
+// CUDA kernel for adaptive max pooling
+__global__ void adaptive_max_pool2d_kernel(const __nv_bfloat16* input, __nv_bfloat16* output, 
+                                            int batch_size, int channels, 
+                                            int input_height, int input_width, 
+                                            int output_height, int output_width) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int oh = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch_size && c < channels && oh < output_height) {
+        int input_start_h = oh * input_height / output_height;
+        int input_end_h = (oh + 1) * input_height / output_height;
+        int input_start_w = 0;
+        int input_end_w = input_width;
+
+        __nv_bfloat16 max_val = float_to_bfloat16(-INFINITY);
+
+        for (int h = input_start_h; h < input_end_h; ++h) {
+            for (int w = input_start_w; w < input_end_w; ++w) {
+                __nv_bfloat16 val = input[b * channels * input_height * input_width + c * input_height * input_width + h * input_width + w];
+                max_val = __hmax(max_val, val);
+            }
+        }
+
+        output[b * channels * output_height * output_width + c * output_height * output_width + oh] = max_val;
+    }
+}
+
+// CUDA kernel for tanh activation
+__global__ void tanh_kernel_bf16(const __nv_bfloat16* input, __nv_bfloat16* output, 
+                                      int batch_size, int channels, 
+                                      int height, int width) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch_size && c < channels && h < height) {
+        __nv_bfloat16 val = input[b * channels * height * width + c * height * width + h * width];
+        output[b * channels * height * width + c * height * width + h * width] = float_to_bfloat16(tanhf(bfloat16_to_float(val)));
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_channels = input_tensor_dim1;
+    int output_channels = weight_dim0;
+    int input_height = input_tensor_dim2;
+    int input_width = input_tensor_dim3;
+    int output_height = 2;
+    int output_width = 2;
+
+    // Allocate device memory
+    float *d_input, *d_weight;
+    __nv_bfloat16 *d_output, *d_output_pool, *d_output_tanh;
+    cudaMalloc(&d_input, batch_size * input_channels * input_height * input_width * sizeof(float));
+    cudaMalloc(&d_weight, output_channels * input_channels * input_height * input_width * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_channels * input_height * input_width * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_output_pool, batch_size * output_channels * output_height * output_width * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_output_tanh, batch_size * output_channels * output_height * output_width * sizeof(__nv_bfloat16));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_channels * input_height * input_width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_channels * input_channels * input_height * input_width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch bmm kernel
+    dim3 threadsPerBlock(16, 16, 16);
+    dim3 numBlocks((input_height + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (output_channels + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    bmm_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, batch_size, input_channels, output_channels,
+        input_height, input_width
+    );
+
+    // Launch adaptive max pooling kernel
+    threadsPerBlock = dim3(16, 16, 16);
+    numBlocks = dim3((output_height + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (output_channels + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    adaptive_max_pool2d_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, d_output_pool, batch_size, output_channels, input_height, input_width, 
+        output_height, output_width
+    );
+
+    // Launch tanh kernel
+    threadsPerBlock = dim3(16, 16, 16);
+    numBlocks = dim3((output_height + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (output_channels + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    tanh_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_output_pool, d_output_tanh, batch_size, output_channels, output_height, output_width
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output_tanh, batch_size * output_channels * output_height * output_width * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+    cudaFree(d_output_pool);
+    cudaFree(d_output_tanh);
+}
+
+}  // extern "C"
+```

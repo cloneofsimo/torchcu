@@ -1,0 +1,249 @@
+```python
+import torch
+
+def complex_function(input_tensor1: torch.Tensor, input_tensor2: torch.Tensor, 
+                    input_tensor3: torch.Tensor, alpha: float) -> torch.Tensor:
+    """
+    Performs a series of operations on input tensors:
+    1. Outer product using einsum
+    2. Linear interpolation (lerp)
+    3. GELU activation
+    4. Element-wise difference
+    5. Returns the result in bfloat16
+    """
+    # Outer product
+    outer_product = torch.einsum('i,j->ij', input_tensor1, input_tensor2)
+
+    # Linear interpolation
+    interpolated = torch.lerp(outer_product, input_tensor3, alpha)
+
+    # GELU activation
+    gelu_output = torch.nn.functional.gelu(interpolated)
+
+    # Element-wise difference
+    diff = gelu_output - input_tensor1.unsqueeze(1)
+
+    # Return result in bfloat16
+    return diff.to(torch.bfloat16)
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((1,), torch.float32),
+        ((1,), torch.float32),
+        ((1, 1), torch.float32),
+        (torch.float32,)
+    ],
+    "outputs": [
+        ((1, 1), torch.bfloat16),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversions
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for outer product, lerp, GELU, and element-wise difference
+__global__ void complex_kernel(const float* input1, const float* input2, const float* input3, 
+                               float alpha, __nv_bfloat16* output, int size1, int size2) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size1 * size2) {
+        float outer_product = input1[i / size2] * input2[i % size2];
+        float interpolated = outer_product * (1.0f - alpha) + input3[i] * alpha;
+        float gelu_value = interpolated * 0.5f * (1.0f + erf(interpolated / sqrtf(2.0f)));
+        float diff = gelu_value - input1[i / size2];
+        output[i] = float_to_bfloat16(diff); 
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input1 = va_arg(args, const float*);
+    int size1 = va_arg(args, int);
+
+    const float* input2 = va_arg(args, const float*);
+    int size2 = va_arg(args, int);
+
+    const float* input3 = va_arg(args, const float*);
+    int size3 = va_arg(args, int);
+
+    float alpha = va_arg(args, double);
+
+    // Extract output tensor (assuming preallocated)
+    __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_input1, *d_input2, *d_input3;
+    cudaMalloc(&d_input1, size1 * sizeof(float));
+    cudaMalloc(&d_input2, size2 * sizeof(float));
+    cudaMalloc(&d_input3, size3 * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input1, size1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input2, size2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input3, input3, size3 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((size1 * size2 + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    complex_kernel<<<numBlocks, threadsPerBlock>>>(d_input1, d_input2, d_input3, alpha, output, size1, size2);
+
+    // Copy result back to host (no need to convert to float here, as output is bfloat16)
+    // cudaMemcpy(output, d_output, size1 * size2 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost); 
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_input3);
+}
+
+} // extern "C" 
+```
+
+**func.py**
+
+```python
+import torch
+
+def complex_function(input_tensor1: torch.Tensor, input_tensor2: torch.Tensor, 
+                    input_tensor3: torch.Tensor, alpha: float) -> torch.Tensor:
+    """
+    Performs a series of operations on input tensors:
+    1. Outer product using einsum
+    2. Linear interpolation (lerp)
+    3. GELU activation
+    4. Element-wise difference
+    5. Returns the result in bfloat16
+    """
+    # Outer product
+    outer_product = torch.einsum('i,j->ij', input_tensor1, input_tensor2)
+
+    # Linear interpolation
+    interpolated = torch.lerp(outer_product, input_tensor3, alpha)
+
+    # GELU activation
+    gelu_output = torch.nn.functional.gelu(interpolated)
+
+    # Element-wise difference
+    diff = gelu_output - input_tensor1.unsqueeze(1)
+
+    # Return result in bfloat16
+    return diff.to(torch.bfloat16)
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((1,), torch.float32),
+        ((1,), torch.float32),
+        ((1, 1), torch.float32),
+        (torch.float32,)
+    ],
+    "outputs": [
+        ((1, 1), torch.bfloat16),
+    ]
+}
+```
+
+**func.cu**
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversions
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for outer product, lerp, GELU, and element-wise difference
+__global__ void complex_kernel(const float* input1, const float* input2, const float* input3, 
+                               float alpha, __nv_bfloat16* output, int size1, int size2) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size1 * size2) {
+        float outer_product = input1[i / size2] * input2[i % size2];
+        float interpolated = outer_product * (1.0f - alpha) + input3[i] * alpha;
+        float gelu_value = interpolated * 0.5f * (1.0f + erf(interpolated / sqrtf(2.0f)));
+        float diff = gelu_value - input1[i / size2];
+        output[i] = float_to_bfloat16(diff); 
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input1 = va_arg(args, const float*);
+    int size1 = va_arg(args, int);
+
+    const float* input2 = va_arg(args, const float*);
+    int size2 = va_arg(args, int);
+
+    const float* input3 = va_arg(args, const float*);
+    int size3 = va_arg(args, int);
+
+    float alpha = va_arg(args, double);
+
+    // Extract output tensor (assuming preallocated)
+    __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_input1, *d_input2, *d_input3;
+    cudaMalloc(&d_input1, size1 * sizeof(float));
+    cudaMalloc(&d_input2, size2 * sizeof(float));
+    cudaMalloc(&d_input3, size3 * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input1, size1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input2, size2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input3, input3, size3 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((size1 * size2 + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    complex_kernel<<<numBlocks, threadsPerBlock>>>(d_input1, d_input2, d_input3, alpha, output, size1, size2);
+
+    // Copy result back to host (no need to convert to float here, as output is bfloat16)
+    // cudaMemcpy(output, d_output, size1 * size2 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost); 
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_input3);
+}
+
+} // extern "C" 
+```

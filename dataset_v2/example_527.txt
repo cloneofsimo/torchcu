@@ -1,0 +1,296 @@
+```python
+import torch
+
+def my_complex_function(input_tensor: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """
+    This function performs a series of operations on an input tensor:
+        1. Unfolds the input tensor into a matrix of overlapping patches.
+        2. Calculates pairwise distances between the patches and the weights.
+        3. Applies a logsumexp function along the patch dimension.
+        4. Calculates the variance of the resulting scores.
+        5. Returns the variance.
+    """
+    # Unfold the input tensor into overlapping patches
+    patch_size = 3
+    patches = input_tensor.unfold(1, patch_size, 1).unfold(2, patch_size, 1)
+
+    # Calculate pairwise distances between patches and weights
+    distances = torch.cdist(patches.view(-1, patch_size * patch_size), weights)
+
+    # Apply logsumexp along the patch dimension
+    scores = torch.logsumexp(-distances, dim=0)
+
+    # Calculate the variance of the scores
+    variance = torch.var(scores)
+
+    return variance
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((3, 4, 4), torch.float32),  # Input tensor (batch_size, height, width)
+        ((3, 3 * 3), torch.float32)   # Weights (num_weights, patch_size * patch_size)
+    ],
+    "outputs": [
+        ((), torch.float32),  # Variance (scalar)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h> 
+
+// CUDA kernel for calculating pairwise distances
+__global__ void pairwise_distance_kernel(const float* input_tensor, const float* weights, float* distances,
+                                         int batch_size, int height, int width, int patch_size, int num_weights) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size * height * width && col < num_weights) {
+        int patch_idx = row / (height * width);
+        int patch_row = (row % (height * width)) / width;
+        int patch_col = row % width;
+
+        float sum = 0.0f;
+        for (int i = 0; i < patch_size * patch_size; ++i) {
+            int input_idx = patch_idx * (height - patch_size + 1) * (width - patch_size + 1) +
+                           patch_row * (width - patch_size + 1) + patch_col + i;
+            float diff = input_tensor[input_idx] - weights[col * patch_size * patch_size + i];
+            sum += diff * diff;
+        }
+        distances[row * num_weights + col] = sum;
+    }
+}
+
+// CUDA kernel for logsumexp operation
+__global__ void logsumexp_kernel(const float* distances, float* scores, int num_weights, int patch_count) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (col < num_weights) {
+        float max_value = distances[col];
+        for (int i = 1; i < patch_count; ++i) {
+            max_value = fmaxf(max_value, distances[i * num_weights + col]);
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < patch_count; ++i) {
+            sum += expf(distances[i * num_weights + col] - max_value);
+        }
+
+        scores[col] = logf(sum) + max_value;
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    // Extract weights
+    const float* weights = va_arg(args, const float*);
+    int num_weights = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* variance = va_arg(args, float*);
+
+    va_end(args);
+
+    // Calculate patch count
+    int patch_size = 3;
+    int patch_count = batch_size * (height - patch_size + 1) * (width - patch_size + 1);
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_distances, *d_scores;
+    cudaMalloc(&d_input, batch_size * height * width * sizeof(float));
+    cudaMalloc(&d_weights, num_weights * patch_size * patch_size * sizeof(float));
+    cudaMalloc(&d_distances, patch_count * num_weights * sizeof(float));
+    cudaMalloc(&d_scores, num_weights * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, num_weights * patch_size * patch_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Calculate pairwise distances
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((num_weights + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (patch_count + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    pairwise_distance_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weights, d_distances,
+                                                             batch_size, height, width, patch_size, num_weights);
+
+    // Calculate logsumexp
+    numBlocks = (num_weights + threadsPerBlock.x - 1) / threadsPerBlock.x;
+    logsumexp_kernel<<<numBlocks, threadsPerBlock>>>(d_distances, d_scores, num_weights, patch_count);
+
+    // Calculate variance
+    float d_variance;
+    cudaMalloc(&d_variance, sizeof(float));
+    cudaMemcpy(d_variance, d_scores, num_weights * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaDeviceSynchronize(); // ensure kernel completes before variance computation
+    cudaFuncSetCacheConfig(variance_kernel, cudaFuncCachePreferL1); // optimize cache usage
+    variance_kernel<<<1, 1>>>(d_variance, num_weights);
+
+    // Copy result back to host
+    cudaMemcpy(variance, &d_variance, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_distances);
+    cudaFree(d_scores);
+    cudaFree(d_variance);
+}
+
+}  // extern "C"
+
+// Kernel for variance calculation
+__global__ void variance_kernel(float* variance, int num_weights) {
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < num_weights; ++i) {
+            sum += variance[i];
+            sum_sq += variance[i] * variance[i];
+        }
+        *variance = (sum_sq / num_weights) - (sum / num_weights) * (sum / num_weights);
+    }
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h> 
+
+// CUDA kernel for calculating pairwise distances
+__global__ void pairwise_distance_kernel(const float* input_tensor, const float* weights, float* distances,
+                                         int batch_size, int height, int width, int patch_size, int num_weights) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size * height * width && col < num_weights) {
+        int patch_idx = row / (height * width);
+        int patch_row = (row % (height * width)) / width;
+        int patch_col = row % width;
+
+        float sum = 0.0f;
+        for (int i = 0; i < patch_size * patch_size; ++i) {
+            int input_idx = patch_idx * (height - patch_size + 1) * (width - patch_size + 1) +
+                           patch_row * (width - patch_size + 1) + patch_col + i;
+            float diff = input_tensor[input_idx] - weights[col * patch_size * patch_size + i];
+            sum += diff * diff;
+        }
+        distances[row * num_weights + col] = sum;
+    }
+}
+
+// CUDA kernel for logsumexp operation
+__global__ void logsumexp_kernel(const float* distances, float* scores, int num_weights, int patch_count) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (col < num_weights) {
+        float max_value = distances[col];
+        for (int i = 1; i < patch_count; ++i) {
+            max_value = fmaxf(max_value, distances[i * num_weights + col]);
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < patch_count; ++i) {
+            sum += expf(distances[i * num_weights + col] - max_value);
+        }
+
+        scores[col] = logf(sum) + max_value;
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    // Extract weights
+    const float* weights = va_arg(args, const float*);
+    int num_weights = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* variance = va_arg(args, float*);
+
+    va_end(args);
+
+    // Calculate patch count
+    int patch_size = 3;
+    int patch_count = batch_size * (height - patch_size + 1) * (width - patch_size + 1);
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_distances, *d_scores;
+    cudaMalloc(&d_input, batch_size * height * width * sizeof(float));
+    cudaMalloc(&d_weights, num_weights * patch_size * patch_size * sizeof(float));
+    cudaMalloc(&d_distances, patch_count * num_weights * sizeof(float));
+    cudaMalloc(&d_scores, num_weights * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, num_weights * patch_size * patch_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Calculate pairwise distances
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((num_weights + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (patch_count + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    pairwise_distance_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weights, d_distances,
+                                                             batch_size, height, width, patch_size, num_weights);
+
+    // Calculate logsumexp
+    numBlocks = (num_weights + threadsPerBlock.x - 1) / threadsPerBlock.x;
+    logsumexp_kernel<<<numBlocks, threadsPerBlock>>>(d_distances, d_scores, num_weights, patch_count);
+
+    // Calculate variance
+    float d_variance;
+    cudaMalloc(&d_variance, sizeof(float));
+    cudaMemcpy(d_variance, d_scores, num_weights * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaDeviceSynchronize(); // ensure kernel completes before variance computation
+    cudaFuncSetCacheConfig(variance_kernel, cudaFuncCachePreferL1); // optimize cache usage
+    variance_kernel<<<1, 1>>>(d_variance, num_weights);
+
+    // Copy result back to host
+    cudaMemcpy(variance, &d_variance, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_distances);
+    cudaFree(d_scores);
+    cudaFree(d_variance);
+}
+
+}  // extern "C"
+
+// Kernel for variance calculation
+__global__ void variance_kernel(float* variance, int num_weights) {
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < num_weights; ++i) {
+            sum += variance[i];
+            sum_sq += variance[i] * variance[i];
+        }
+        *variance = (sum_sq / num_weights) - (sum / num_weights) * (sum / num_weights);
+    }
+}
+```

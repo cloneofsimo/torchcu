@@ -1,0 +1,113 @@
+```python
+import torch
+
+def complex_function(input_tensor: torch.Tensor, threshold: float) -> torch.Tensor:
+    """
+    Performs a series of operations on the input tensor:
+    1. Applies a soft shrink function.
+    2. Calculates the mean of the shrunk tensor.
+    3. Creates an empty tensor with the same shape as the input.
+    4. Fills the empty tensor with the calculated mean value.
+    5. Returns the filled tensor.
+    """
+    shrunk_tensor = torch.nn.functional.softshrink(input_tensor, lambd=threshold)
+    mean_value = shrunk_tensor.mean()
+    output_tensor = torch.empty_like(input_tensor)
+    output_tensor.fill_(mean_value)
+    return output_tensor
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((1,), torch.float32),
+        (torch.float32,),
+    ],
+    "outputs": [
+        ((1,), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for soft shrink operation
+__global__ void softshrink_kernel(const float* input, float* output, int size, float threshold) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        float value = input[i];
+        if (value > threshold) {
+            output[i] = value - threshold;
+        } else if (value < -threshold) {
+            output[i] = value + threshold;
+        } else {
+            output[i] = 0.0f;
+        }
+    }
+}
+
+// CUDA kernel for calculating the mean of a tensor
+__global__ void mean_kernel(const float* input, float* mean, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        atomicAdd(mean, input[i]);
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+
+    // Extract threshold
+    float threshold = va_arg(args, double);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_output, *d_mean;
+    cudaMalloc(&d_input, input_tensor_dim0 * sizeof(float));
+    cudaMalloc(&d_output, input_tensor_dim0 * sizeof(float));
+    cudaMalloc(&d_mean, sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Apply softshrink operation
+    int threadsPerBlock = 256;
+    int numBlocks = (input_tensor_dim0 + threadsPerBlock - 1) / threadsPerBlock;
+    softshrink_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, input_tensor_dim0, threshold);
+
+    // Calculate the mean
+    cudaMemset(d_mean, 0, sizeof(float));  // Initialize mean to 0
+    mean_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_mean, input_tensor_dim0);
+
+    // Copy mean back to host
+    float host_mean;
+    cudaMemcpy(&host_mean, d_mean, sizeof(float), cudaMemcpyDeviceToHost);
+    host_mean /= input_tensor_dim0;  // Calculate the actual mean
+
+    // Fill output tensor with the mean
+    cudaMemset(d_output, host_mean, input_tensor_dim0 * sizeof(float));
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, input_tensor_dim0 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_mean);
+}
+
+}  // extern "C"
+```

@@ -1,0 +1,179 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// CUDA kernel for NLL loss
+__global__ void nll_loss_kernel(const float* input, const int* target, float* loss, int batch_size, int num_classes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        int label = target[idx];
+        loss[0] += -logf(expf(input[idx * num_classes + label]) / (expf(input[idx * num_classes]) + expf(input[idx * num_classes + 1]) + expf(input[idx * num_classes + 2]) + expf(input[idx * num_classes + 3]) + expf(input[idx * num_classes + 4]) + expf(input[idx * num_classes + 5]) + expf(input[idx * num_classes + 6]) + expf(input[idx * num_classes + 7]) + expf(input[idx * num_classes + 8]) + expf(input[idx * num_classes + 9])));
+    }
+}
+
+// CUDA kernel for standard deviation across channels
+__global__ void std_loss_kernel(const float* input, float* loss, int batch_size, int channels, int height, int width, int depth) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float sum = 0.0f;
+        for (int c = 0; c < channels; ++c) {
+            for (int h = 0; h < height; ++h) {
+                for (int w = 0; w < width; ++w) {
+                    for (int d = 0; d < depth; ++d) {
+                        sum += input[idx * channels * height * width * depth + c * height * width * depth + h * width * depth + w * depth + d];
+                    }
+                }
+            }
+        }
+        sum /= (channels * height * width * depth);
+        float sq_sum = 0.0f;
+        for (int c = 0; c < channels; ++c) {
+            for (int h = 0; h < height; ++h) {
+                for (int w = 0; w < width; ++w) {
+                    for (int d = 0; d < depth; ++d) {
+                        sq_sum += powf(input[idx * channels * height * width * depth + c * height * width * depth + h * width * depth + w * depth + d] - sum, 2);
+                    }
+                }
+            }
+        }
+        loss[idx] = sqrtf(sq_sum / (channels * height * width * depth));
+    }
+}
+
+// CUDA kernel for Kronecker product
+__global__ void kronecker_loss_kernel(const float* input, const float* weights, float* loss, int batch_size, int channels, int height, int width, int depth, int weight_channels, int weight_height, int weight_width, int weight_depth) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float sum = 0.0f;
+        for (int c = 0; c < channels; ++c) {
+            for (int h = 0; h < height; ++h) {
+                for (int w = 0; w < width; ++w) {
+                    for (int d = 0; d < depth; ++d) {
+                        for (int wc = 0; wc < weight_channels; ++wc) {
+                            for (int wh = 0; wh < weight_height; ++wh) {
+                                for (int ww = 0; ww < weight_width; ++ww) {
+                                    for (int wd = 0; wd < weight_depth; ++wd) {
+                                        sum += input[idx * channels * height * width * depth + c * height * width * depth + h * width * depth + w * depth + d] * weights[wc * weight_height * weight_width * weight_depth + wh * weight_width * weight_depth + ww * weight_depth + wd];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        loss[idx] = sum / (channels * height * width * depth * weight_channels * weight_height * weight_width * weight_depth);
+    }
+}
+
+// CUDA kernel for 3D max pooling
+__global__ void max_pool3d_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int depth, int kernel_size, int stride) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.z * blockDim.z + threadIdx.z;
+    int w = threadIdx.x;
+    int d = threadIdx.y;
+
+    if (idx < batch_size && c < channels && h < (height - kernel_size + 1) / stride && w < (width - kernel_size + 1) / stride && d < (depth - kernel_size + 1) / stride) {
+        float max_val = -INFINITY;
+        for (int kh = 0; kh < kernel_size; ++kh) {
+            for (int kw = 0; kw < kernel_size; ++kw) {
+                for (int kd = 0; kd < kernel_size; ++kd) {
+                    int input_h = h * stride + kh;
+                    int input_w = w * stride + kw;
+                    int input_d = d * stride + kd;
+                    float val = input[idx * channels * height * width * depth + c * height * width * depth + input_h * width * depth + input_w * depth + input_d];
+                    max_val = fmaxf(max_val, val);
+                }
+            }
+        }
+        output[idx * channels * ((height - kernel_size + 1) / stride) * ((width - kernel_size + 1) / stride) * ((depth - kernel_size + 1) / stride) + c * ((height - kernel_size + 1) / stride) * ((width - kernel_size + 1) / stride) * ((depth - kernel_size + 1) / stride) + h * ((width - kernel_size + 1) / stride) * ((depth - kernel_size + 1) / stride) + w * ((depth - kernel_size + 1) / stride) + d] = max_val;
+    }
+}
+
+
+extern "C" {
+
+void complex_loss_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+    int input_tensor_dim4 = va_arg(args, int);
+
+    // Extract target tensor
+    const int* target_tensor = va_arg(args, const int*);
+    int target_tensor_dim0 = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+    int weights_dim1 = va_arg(args, int);
+    int weights_dim2 = va_arg(args, int);
+    int weights_dim3 = va_arg(args, int);
+
+    // Extract output tensors (assuming they are preallocated)
+    float* nll_loss = va_arg(args, float*);
+    float* std_loss = va_arg(args, float*);
+    float* kron_loss = va_arg(args, float*);
+    float* pooled_tensor = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int channels = input_tensor_dim1;
+    int height = input_tensor_dim2;
+    int width = input_tensor_dim3;
+    int depth = input_tensor_dim4;
+    int num_classes = 10;
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_nll_loss, *d_std_loss, *d_kron_loss, *d_pooled_tensor;
+    cudaMalloc(&d_input, batch_size * channels * height * width * depth * sizeof(float));
+    cudaMalloc(&d_weights, weights_dim0 * weights_dim1 * weights_dim2 * weights_dim3 * sizeof(float));
+    cudaMalloc(&d_nll_loss, 1 * sizeof(float));
+    cudaMalloc(&d_std_loss, batch_size * sizeof(float));
+    cudaMalloc(&d_kron_loss, batch_size * sizeof(float));
+    cudaMalloc(&d_pooled_tensor, batch_size * (height - 2) / 2 * (width - 2) / 2 * (depth - 2) / 2 * channels * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * channels * height * width * depth * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, weights_dim0 * weights_dim1 * weights_dim2 * weights_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch NLL loss kernel
+    nll_loss_kernel<<<(batch_size + 255) / 256, 256>>>(d_input, target_tensor, d_nll_loss, batch_size, num_classes);
+
+    // Launch standard deviation loss kernel
+    std_loss_kernel<<<(batch_size + 255) / 256, 256>>>(d_input, d_std_loss, batch_size, channels, height, width, depth);
+
+    // Launch Kronecker product loss kernel
+    kronecker_loss_kernel<<<(batch_size + 255) / 256, 256>>>(d_input, d_weights, d_kron_loss, batch_size, channels, height, width, depth, weights_dim0, weights_dim1, weights_dim2, weights_dim3);
+
+    // Launch max pooling 3D kernel
+    dim3 threadsPerBlock(8, 8);
+    dim3 numBlocks((width - 2 + 1) / 2, (depth - 2 + 1) / 2, channels);
+    max_pool3d_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_pooled_tensor, batch_size, channels, height, width, depth, 3, 2);
+
+    // Copy results back to host
+    cudaMemcpy(nll_loss, d_nll_loss, 1 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(std_loss, d_std_loss, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(kron_loss, d_kron_loss, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(pooled_tensor, d_pooled_tensor, batch_size * (height - 2) / 2 * (width - 2) / 2 * (depth - 2) / 2 * channels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_nll_loss);
+    cudaFree(d_std_loss);
+    cudaFree(d_kron_loss);
+    cudaFree(d_pooled_tensor);
+}
+
+}  // extern "C"

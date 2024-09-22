@@ -1,0 +1,81 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+// CUDA kernel for masked selection
+__global__ void masked_select_kernel(const float* input_tensor, const bool* mask, float* output,
+                                     int num_elements, int num_selected) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < num_selected) {
+        int j = 0;
+        while (j < num_elements && !mask[j]) {
+            j++;
+        }
+        if (j < num_elements) {
+            output[idx] = input_tensor[j];
+        }
+        j++; // Move to the next element
+    }
+}
+
+extern "C" {
+
+void masked_select_fp32(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract mask tensor
+    const bool* mask = va_arg(args, const bool*);
+    int mask_dim0 = va_arg(args, int);
+    int mask_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int num_elements = input_tensor_dim0 * input_tensor_dim1;
+
+    // Count the number of selected elements
+    int num_selected = 0;
+    for (int i = 0; i < num_elements; ++i) {
+        if (mask[i]) {
+            num_selected++;
+        }
+    }
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    bool *d_mask;
+    cudaMalloc(&d_input, num_elements * sizeof(float));
+    cudaMalloc(&d_mask, num_elements * sizeof(bool));
+    cudaMalloc(&d_output, num_selected * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mask, mask, num_elements * sizeof(bool), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int threadsPerBlock = 256;
+    int numBlocks = (num_selected + threadsPerBlock - 1) / threadsPerBlock;
+
+    masked_select_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_mask, d_output, num_elements, num_selected
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, num_selected * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_mask);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

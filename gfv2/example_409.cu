@@ -1,0 +1,75 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// CUDA kernel for matrix multiplication and sigmoid activation
+__global__ void matmul_sigmoid_kernel(const float* input_tensor, const float* weight, float* output, 
+                                        int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += input_tensor[row * k + i] * weight[col * k + i];  // Transposed access
+        }
+        output[row * n + col] = 1.0f / (1.0f + expf(-sum));  // Sigmoid activation
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight tensor list
+    int num_weights = va_arg(args, int);  // Number of weight tensors
+    int* weight_dims = (int*)va_arg(args, void*);  // Array of weight dimensions
+    const float** weights = (const float**)va_arg(args, void*);  // Array of weight pointers
+
+    // Extract output tensors (assuming they're preallocated)
+    int num_outputs = va_arg(args, int);  // Number of output tensors
+    float** outputs = (float**)va_arg(args, void*);  // Array of output pointers
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weight_dims[0];  // Assuming all weights have the same output dimension
+
+    // Allocate device memory for input and weights
+    float *d_input, *d_weight;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, output_dim * input_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel for each weight tensor
+    for (int i = 0; i < num_weights; ++i) {
+        // Copy weight tensor to device
+        cudaMemcpy(d_weight, weights[i], output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Launch kernel
+        dim3 threadsPerBlock(16, 16);
+        dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                       (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+        matmul_sigmoid_kernel<<<numBlocks, threadsPerBlock>>>(
+            d_input, d_weight, outputs[i], batch_size, output_dim, input_dim
+        );
+    }
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+}
+
+}  // extern "C"

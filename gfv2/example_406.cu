@@ -1,0 +1,155 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for adaptive average pooling 1D
+__global__ void adaptive_avg_pool1d_kernel(const float* input, float* output, int batch_size, int input_channels, int input_length) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && channel_idx < input_channels) {
+        float sum = 0.0f;
+        for (int i = 0; i < input_length; ++i) {
+            sum += input[(batch_idx * input_channels + channel_idx) * input_length + i];
+        }
+        output[batch_idx * input_channels + channel_idx] = sum / input_length; 
+    }
+}
+
+// CUDA kernel for transposed convolution 1D
+__global__ void conv_transpose1d_kernel(const float* input, const float* weight, const float* bias, float* output, 
+                                            int batch_size, int output_channels, int input_channels, int kernel_size, int stride) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int output_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && output_idx < output_channels) {
+        int output_start = output_idx * stride;
+        int output_end = min(output_start + kernel_size, input_channels);
+        
+        float sum = 0.0f;
+        for (int i = output_start; i < output_end; ++i) {
+            sum += input[batch_idx * input_channels + i] * weight[(output_idx * input_channels + i) * kernel_size];
+        }
+        output[batch_idx * output_channels + output_idx] = sum + bias[output_idx]; 
+    }
+}
+
+// CUDA kernel for gradient penalty (bf16)
+__global__ void gradient_penalty_kernel(const float* input, const float* output, float* grad_input, 
+                                            int batch_size, int input_channels, int input_length) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = (batch_idx * input_channels + channel_idx) * input_length;
+    
+    if (batch_idx < batch_size && channel_idx < input_channels) {
+        float sum = 0.0f;
+        for (int i = 0; i < input_length; ++i) {
+            __nv_bfloat16 a = float_to_bfloat16(input[idx + i]);
+            __nv_bfloat16 b = float_to_bfloat16(output[batch_idx * input_channels + channel_idx]);
+            sum += bfloat16_to_float(__hmul(a, b));
+        }
+        grad_input[idx] = sum;
+    }
+}
+
+// CUDA kernel for ReLU activation
+__global__ void relu_kernel(float* input, float* output, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        output[i] = fmaxf(input[i], 0.0f);
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output_tensor = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_channels = input_tensor_dim1;
+    int input_length = input_tensor_dim2;
+
+    int output_channels = weight_dim0;
+    int kernel_size = weight_dim2;
+    int stride = 1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output, *d_pooled, *d_grad_input;
+    cudaMalloc(&d_input, batch_size * input_channels * input_length * sizeof(float));
+    cudaMalloc(&d_weight, output_channels * input_channels * kernel_size * sizeof(float));
+    cudaMalloc(&d_bias, output_channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_channels * (input_length + kernel_size - 1) * sizeof(float));
+    cudaMalloc(&d_pooled, batch_size * input_channels * sizeof(float));
+    cudaMalloc(&d_grad_input, batch_size * input_channels * input_length * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_channels * input_length * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_channels * input_channels * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, output_channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // 1. Adaptive Average Pooling 1D
+    dim3 threadsPerBlock_pool(32, 32);
+    dim3 numBlocks_pool((batch_size + threadsPerBlock_pool.x - 1) / threadsPerBlock_pool.x,
+                    (input_channels + threadsPerBlock_pool.y - 1) / threadsPerBlock_pool.y);
+    adaptive_avg_pool1d_kernel<<<numBlocks_pool, threadsPerBlock_pool>>>(d_input, d_pooled, batch_size, input_channels, input_length);
+
+    // 2. Transposed Convolution 1D
+    dim3 threadsPerBlock_conv(32, 32);
+    dim3 numBlocks_conv((batch_size + threadsPerBlock_conv.x - 1) / threadsPerBlock_conv.x,
+                    (output_channels + threadsPerBlock_conv.y - 1) / threadsPerBlock_conv.y);
+    conv_transpose1d_kernel<<<numBlocks_conv, threadsPerBlock_conv>>>(d_pooled, d_weight, d_bias, d_output, 
+                                                                        batch_size, output_channels, input_channels, kernel_size, stride);
+
+    // 3. Gradient Penalty (bf16)
+    gradient_penalty_kernel<<<numBlocks_conv, threadsPerBlock_conv>>>(d_input, d_output, d_grad_input, 
+                                                                batch_size, input_channels, input_length);
+
+    // 4. ReLU Activation
+    int output_size = batch_size * output_channels * (input_length + kernel_size - 1);
+    relu_kernel<<<(output_size + 255) / 256, 256>>>(d_output, d_output, output_size);
+
+    // Copy result back to host
+    cudaMemcpy(output_tensor, d_output, batch_size * output_channels * (input_length + kernel_size - 1) * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+    cudaFree(d_pooled);
+    cudaFree(d_grad_input);
+}
+
+}  // extern "C"

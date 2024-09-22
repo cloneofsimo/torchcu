@@ -1,0 +1,86 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// CUDA kernel for multi-label margin loss
+__global__ void multi_label_margin_loss_kernel(const float* input_tensor, const float* target_tensor, float* output, 
+                                              int batch_size, int num_classes, float margin) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size) {
+        float positive_sum = 0.0f;
+        float negative_sum = 0.0f;
+
+        for (int i = 0; i < num_classes; ++i) {
+            float input_val = input_tensor[idx * num_classes + i];
+            float target_val = target_tensor[idx * num_classes + i];
+
+            // Positive term
+            float positive_term = (1.0f - input_val * target_val);
+            positive_term = (positive_term > 0.0f) ? positive_term : 0.0f; // Clamp min=0
+            positive_sum += positive_term;
+
+            // Negative term
+            float negative_term = (input_val * (1.0f - target_val) + margin);
+            negative_term = (negative_term > 0.0f) ? negative_term : 0.0f; // Clamp min=0
+            negative_sum += negative_term;
+        }
+
+        output[idx] = (positive_sum + negative_sum) / num_classes;
+    }
+}
+
+extern "C" {
+
+void multi_label_margin_loss_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    const float* target_tensor = va_arg(args, const float*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+
+    // Extract margin
+    float margin = (float)va_arg(args, double);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int num_classes = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_target, *d_output;
+    cudaMalloc(&d_input, batch_size * num_classes * sizeof(float));
+    cudaMalloc(&d_target, batch_size * num_classes * sizeof(float));
+    cudaMalloc(&d_output, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * num_classes * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target_tensor, batch_size * num_classes * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int threadsPerBlock = 256;
+    int numBlocks = (batch_size + threadsPerBlock - 1) / threadsPerBlock;
+    multi_label_margin_loss_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_target, d_output, batch_size, num_classes, margin
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_target);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

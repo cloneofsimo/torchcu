@@ -1,0 +1,317 @@
+## func.py
+
+```python
+import torch
+import torch.nn as nn
+
+class MyModule(nn.Module):
+    def __init__(self, embed_dim, head_dim, num_heads, dropout):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+
+        self.W_q = nn.Linear(embed_dim, head_dim * num_heads)
+        self.W_k = nn.Linear(embed_dim, head_dim * num_heads)
+        self.W_v = nn.Linear(embed_dim, head_dim * num_heads)
+        self.W_o = nn.Linear(head_dim * num_heads, embed_dim)
+        self.dropout_layer = nn.Dropout(dropout)
+        self.scale = 1.0 / (head_dim ** 0.5)
+
+    def forward(self, x, mask):
+        # Shape: (batch_size, seq_len, embed_dim)
+        batch_size, seq_len, _ = x.shape
+
+        # (batch_size, seq_len, head_dim * num_heads)
+        q = self.W_q(x)
+        k = self.W_k(x)
+        v = self.W_v(x)
+
+        # (batch_size, num_heads, seq_len, head_dim)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # (batch_size, num_heads, seq_len, seq_len)
+        attention = torch.bmm(q, k.transpose(2, 3)) * self.scale
+        attention = torch.where(mask.unsqueeze(1).unsqueeze(1), attention, -1e9)
+        attention = torch.softmax(attention, dim=-1)
+        attention = self.dropout_layer(attention)
+
+        # (batch_size, num_heads, seq_len, head_dim)
+        context = torch.bmm(attention, v)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.num_heads * self.head_dim)
+
+        # (batch_size, seq_len, embed_dim)
+        output = self.W_o(context)
+        output = torch.relu(output)
+        return output
+
+def my_function(input_tensor: torch.Tensor, weight: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a simple linear transformation, applies tanh activation, 
+    pads the output with constant values, multiplies it by weight, 
+    and then performs masked attention.
+    """
+    # (batch_size, seq_len, embed_dim)
+    output = torch.matmul(input_tensor, weight.t())
+    output = torch.tanh(output)
+
+    # (batch_size, seq_len + 2, embed_dim)
+    output = torch.nn.functional.pad(output, (0, 0, 1, 1), "constant", 0.0)
+
+    # (batch_size, seq_len + 2, embed_dim)
+    output = output * weight
+
+    # (batch_size, seq_len + 2, embed_dim)
+    output = MyModule(embed_dim=output.shape[-1], head_dim=16, num_heads=4, dropout=0.1)(output, mask)
+
+    return output
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((10, 12, 32), torch.float32),
+        ((10, 12, 32), torch.float32),
+        ((10, 12), torch.bool)
+    ],
+    "outputs": [
+        ((10, 12, 32), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for matrix multiplication and tanh activation
+__global__ void matmul_tanh_kernel(const float* input_tensor, const float* weight, float* output, 
+                                        int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += input_tensor[row * k + i] * weight[col * k + i];  // Transposed access
+        }
+        output[row * n + col] = tanhf(sum);  // tanh activation
+    }
+}
+
+// CUDA kernel for constant padding
+__global__ void constant_pad_kernel(const float* input, float* output, int batch_size, int seq_len, int embed_dim, int pad_value) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < seq_len + 2) {
+        if (col == 0 || col == seq_len + 1) {
+            output[row * (seq_len + 2) + col] = pad_value;
+        } else {
+            output[row * (seq_len + 2) + col] = input[(row * seq_len) + (col - 1)];
+        }
+    }
+}
+
+// CUDA kernel for element-wise multiplication
+__global__ void mul_kernel(const float* input, const float* weight, float* output, int batch_size, int seq_len, int embed_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < seq_len + 2) {
+        output[row * (seq_len + 2) + col] = input[row * (seq_len + 2) + col] * weight[row * (seq_len + 2) + col];
+    }
+}
+
+// CUDA kernel for batched matrix multiplication
+__global__ void bmm_kernel(const float* q, const float* k, float* attention, int batch_size, int num_heads, int seq_len, float scale) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < seq_len) {
+        float sum = 0.0f;
+        for (int i = 0; i < seq_len; ++i) {
+            sum += q[(row * num_heads * seq_len) + (i * num_heads) + (threadIdx.x)] * 
+                   k[(row * num_heads * seq_len) + (col * num_heads) + (i * num_heads) + (threadIdx.x)];
+        }
+        attention[(row * seq_len * num_heads) + (col * num_heads) + (threadIdx.x)] = sum * scale;
+    }
+}
+
+// CUDA kernel for masked softmax
+__global__ void masked_softmax_kernel(float* attention, const bool* mask, int batch_size, int num_heads, int seq_len, float negative_inf) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < seq_len) {
+        if (mask[row * seq_len + col] == false) {
+            attention[(row * seq_len * num_heads) + (col * num_heads) + (threadIdx.x)] = negative_inf;
+        }
+    }
+}
+
+// CUDA kernel for batched matrix multiplication for attention output
+__global__ void bmm_attention_output_kernel(const float* attention, const float* v, float* context, int batch_size, int num_heads, int seq_len, int head_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < seq_len) {
+        float sum = 0.0f;
+        for (int i = 0; i < seq_len; ++i) {
+            sum += attention[(row * num_heads * seq_len) + (i * num_heads) + (threadIdx.x)] *
+                   v[(row * num_heads * seq_len) + (i * num_heads) + (threadIdx.x * head_dim) + (threadIdx.y)];
+        }
+        context[(row * seq_len * num_heads) + (col * num_heads) + (threadIdx.x * head_dim) + (threadIdx.y)] = sum;
+    }
+}
+
+// CUDA kernel for linear transformation and ReLU
+__global__ void linear_relu_kernel(const float* context, const float* W_o, float* output, int batch_size, int seq_len, int num_heads, int head_dim, int embed_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < seq_len) {
+        float sum = 0.0f;
+        for (int i = 0; i < num_heads * head_dim; ++i) {
+            sum += context[(row * seq_len * num_heads * head_dim) + (col * num_heads * head_dim) + i] * 
+                   W_o[(i * embed_dim) + threadIdx.x];
+        }
+        output[(row * seq_len * embed_dim) + (col * embed_dim) + threadIdx.x] = fmaxf(sum, 0.0f);
+    }
+}
+
+extern "C" {
+    void my_function(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        // Extract input tensor
+        const float* input_tensor = va_arg(args, const float*);
+        int input_tensor_dim0 = va_arg(args, int);
+        int input_tensor_dim1 = va_arg(args, int);
+        int input_tensor_dim2 = va_arg(args, int);
+
+        // Extract weight tensor
+        const float* weight = va_arg(args, const float*);
+        int weight_dim0 = va_arg(args, int);
+        int weight_dim1 = va_arg(args, int);
+        int weight_dim2 = va_arg(args, int);
+
+        // Extract mask tensor
+        const bool* mask = va_arg(args, const bool*);
+        int mask_dim0 = va_arg(args, int);
+        int mask_dim1 = va_arg(args, int);
+
+        // Extract output tensor (assuming it's preallocated)
+        float* output = va_arg(args, float*);
+
+        va_end(args);
+
+        int batch_size = input_tensor_dim0;
+        int seq_len = input_tensor_dim1;
+        int embed_dim = input_tensor_dim2;
+
+        // Allocate device memory
+        float *d_input, *d_weight, *d_output, *d_padded_output, *d_mul_output, *d_q, *d_k, *d_v, *d_attention, *d_context;
+        bool *d_mask;
+        cudaMalloc(&d_input, batch_size * seq_len * embed_dim * sizeof(float));
+        cudaMalloc(&d_weight, batch_size * (seq_len + 2) * embed_dim * sizeof(float));
+        cudaMalloc(&d_output, batch_size * seq_len * embed_dim * sizeof(float));
+        cudaMalloc(&d_padded_output, batch_size * (seq_len + 2) * embed_dim * sizeof(float));
+        cudaMalloc(&d_mul_output, batch_size * (seq_len + 2) * embed_dim * sizeof(float));
+        cudaMalloc(&d_q, batch_size * seq_len * 64 * sizeof(float));
+        cudaMalloc(&d_k, batch_size * seq_len * 64 * sizeof(float));
+        cudaMalloc(&d_v, batch_size * seq_len * 64 * sizeof(float));
+        cudaMalloc(&d_attention, batch_size * seq_len * 16 * sizeof(float));
+        cudaMalloc(&d_context, batch_size * seq_len * 64 * sizeof(float));
+        cudaMalloc(&d_mask, batch_size * seq_len * sizeof(bool));
+
+        // Copy input data to device
+        cudaMemcpy(d_input, input_tensor, batch_size * seq_len * embed_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_weight, weight, batch_size * (seq_len + 2) * embed_dim * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_mask, mask, batch_size * seq_len * sizeof(bool), cudaMemcpyHostToDevice);
+
+        // --- Matmul and Tanh ---
+        dim3 threadsPerBlock_matmul(32, 1);
+        dim3 numBlocks_matmul((seq_len + threadsPerBlock_matmul.x - 1) / threadsPerBlock_matmul.x, (batch_size + threadsPerBlock_matmul.y - 1) / threadsPerBlock_matmul.y);
+        matmul_tanh_kernel<<<numBlocks_matmul, threadsPerBlock_matmul>>>(d_input, d_weight, d_output, batch_size, seq_len, embed_dim);
+        cudaDeviceSynchronize();
+
+        // --- Constant Padding ---
+        dim3 threadsPerBlock_pad(32, 1);
+        dim3 numBlocks_pad((seq_len + 2 + threadsPerBlock_pad.x - 1) / threadsPerBlock_pad.x, (batch_size + threadsPerBlock_pad.y - 1) / threadsPerBlock_pad.y);
+        constant_pad_kernel<<<numBlocks_pad, threadsPerBlock_pad>>>(d_output, d_padded_output, batch_size, seq_len, embed_dim, 0.0);
+        cudaDeviceSynchronize();
+
+        // --- Element-wise Multiplication ---
+        dim3 threadsPerBlock_mul(32, 1);
+        dim3 numBlocks_mul((seq_len + 2 + threadsPerBlock_mul.x - 1) / threadsPerBlock_mul.x, (batch_size + threadsPerBlock_mul.y - 1) / threadsPerBlock_mul.y);
+        mul_kernel<<<numBlocks_mul, threadsPerBlock_mul>>>(d_padded_output, d_weight, d_mul_output, batch_size, seq_len, embed_dim);
+        cudaDeviceSynchronize();
+
+        // --- Masked Attention ---
+        // W_q, W_k, W_v
+        dim3 threadsPerBlock_wq(32, 1);
+        dim3 numBlocks_wq((seq_len + threadsPerBlock_wq.x - 1) / threadsPerBlock_wq.x, (batch_size + threadsPerBlock_wq.y - 1) / threadsPerBlock_wq.y);
+        matmul_tanh_kernel<<<numBlocks_wq, threadsPerBlock_wq>>>(d_mul_output, d_weight, d_q, batch_size, seq_len + 2, embed_dim);
+        matmul_tanh_kernel<<<numBlocks_wq, threadsPerBlock_wq>>>(d_mul_output, d_weight, d_k, batch_size, seq_len + 2, embed_dim);
+        matmul_tanh_kernel<<<numBlocks_wq, threadsPerBlock_wq>>>(d_mul_output, d_weight, d_v, batch_size, seq_len + 2, embed_dim);
+        cudaDeviceSynchronize();
+
+        // Attention
+        dim3 threadsPerBlock_bmm(16, 1);
+        dim3 numBlocks_bmm((seq_len + 2 + threadsPerBlock_bmm.x - 1) / threadsPerBlock_bmm.x, (batch_size + threadsPerBlock_bmm.y - 1) / threadsPerBlock_bmm.y);
+        bmm_kernel<<<numBlocks_bmm, threadsPerBlock_bmm>>>(d_q, d_k, d_attention, batch_size, 4, seq_len + 2, 0.125);
+        cudaDeviceSynchronize();
+
+        dim3 threadsPerBlock_mask(32, 1);
+        dim3 numBlocks_mask((seq_len + 2 + threadsPerBlock_mask.x - 1) / threadsPerBlock_mask.x, (batch_size + threadsPerBlock_mask.y - 1) / threadsPerBlock_mask.y);
+        masked_softmax_kernel<<<numBlocks_mask, threadsPerBlock_mask>>>(d_attention, d_mask, batch_size, 4, seq_len + 2, -1e9);
+        cudaDeviceSynchronize();
+
+        // Attention output
+        dim3 threadsPerBlock_bmm_output(16, 16);
+        dim3 numBlocks_bmm_output((seq_len + 2 + threadsPerBlock_bmm_output.x - 1) / threadsPerBlock_bmm_output.x, (batch_size + threadsPerBlock_bmm_output.y - 1) / threadsPerBlock_bmm_output.y);
+        bmm_attention_output_kernel<<<numBlocks_bmm_output, threadsPerBlock_bmm_output>>>(d_attention, d_v, d_context, batch_size, 4, seq_len + 2, 16);
+        cudaDeviceSynchronize();
+
+        // W_o
+        dim3 threadsPerBlock_wo(32, 1);
+        dim3 numBlocks_wo((seq_len + 2 + threadsPerBlock_wo.x - 1) / threadsPerBlock_wo.x, (batch_size + threadsPerBlock_wo.y - 1) / threadsPerBlock_wo.y);
+        linear_relu_kernel<<<numBlocks_wo, threadsPerBlock_wo>>>(d_context, d_weight, d_output, batch_size, seq_len + 2, 4, 16, embed_dim);
+        cudaDeviceSynchronize();
+
+        // Copy result back to host
+        cudaMemcpy(output, d_output, batch_size * (seq_len + 2) * embed_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_weight);
+        cudaFree(d_output);
+        cudaFree(d_padded_output);
+        cudaFree(d_mul_output);
+        cudaFree(d_q);
+        cudaFree(d_k);
+        cudaFree(d_v);
+        cudaFree(d_attention);
+        cudaFree(d_context);
+        cudaFree(d_mask);
+    }
+}
+```

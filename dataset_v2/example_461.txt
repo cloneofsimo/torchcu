@@ -1,0 +1,159 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def sigmoid_focal_loss_with_elu(input_tensor: torch.Tensor, target_tensor: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
+    """
+    Computes the sigmoid focal loss with an ELU activation on the input.
+
+    Args:
+        input_tensor: The input tensor, typically the output of a sigmoid layer.
+        target_tensor: The target tensor, typically a one-hot encoded tensor.
+        alpha: The weighting factor for the positive class.
+        gamma: The focusing parameter for the loss.
+
+    Returns:
+        The computed sigmoid focal loss with ELU activation.
+    """
+    input_tensor = input_tensor.to(torch.bfloat16)
+    target_tensor = target_tensor.to(torch.bfloat16)
+
+    # Apply ELU activation
+    input_tensor = F.elu(input_tensor)
+
+    # Calculate the sigmoid of the input
+    p = torch.sigmoid(input_tensor)
+
+    # Calculate the focal loss
+    ce_loss = -target_tensor * torch.log(p) - (1 - target_tensor) * torch.log(1 - p)
+    p_t = target_tensor * p + (1 - target_tensor) * (1 - p)
+    loss = alpha * (1 - p_t) ** gamma * ce_loss
+
+    return loss.to(torch.float32)
+
+function_signature = {
+    "name": "sigmoid_focal_loss_with_elu",
+    "inputs": [
+        ((1, 1), torch.float32),
+        ((1, 1), torch.float32),
+        (None, torch.float32),
+        (None, torch.float32),
+    ],
+    "outputs": [
+        ((1, 1), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Helper function for ELU activation
+__device__ __forceinline__ float elu(float x) {
+    return x > 0.0f ? x : expf(x) - 1.0f;
+}
+
+// CUDA kernel for sigmoid focal loss with ELU activation
+__global__ void sigmoid_focal_loss_with_elu_kernel(const float* input_tensor, const float* target_tensor, 
+                                                   float alpha, float gamma, float* output, 
+                                                   int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < m * n) {
+        int row = idx / n;
+        int col = idx % n;
+
+        __nv_bfloat16 input_bf16 = float_to_bfloat16(input_tensor[idx]);
+        __nv_bfloat16 target_bf16 = float_to_bfloat16(target_tensor[idx]);
+
+        // ELU activation
+        input_bf16 = float_to_bfloat16(elu(bfloat16_to_float(input_bf16)));
+
+        // Sigmoid
+        __nv_bfloat16 p = __expf(input_bf16) / (1.0f + __expf(input_bf16));
+
+        // Cross-entropy loss
+        __nv_bfloat16 ce_loss = -target_bf16 * __logf(p) - (1.0f - target_bf16) * __logf(1.0f - p);
+
+        // Focal loss
+        __nv_bfloat16 p_t = target_bf16 * p + (1.0f - target_bf16) * (1.0f - p);
+        __nv_bfloat16 loss_bf16 = alpha * __powf((1.0f - p_t), gamma) * ce_loss;
+
+        output[idx] = bfloat16_to_float(loss_bf16);
+    }
+}
+
+extern "C" {
+
+void sigmoid_focal_loss_with_elu(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract target tensor
+    const float* target_tensor = va_arg(args, const float*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+
+    // Extract alpha and gamma
+    float alpha = va_arg(args, float);
+    float gamma = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int m = input_tensor_dim0;
+    int n = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_target, *d_output;
+    cudaMalloc(&d_input, m * n * sizeof(float));
+    cudaMalloc(&d_target, m * n * sizeof(float));
+    cudaMalloc(&d_output, m * n * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, m * n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target_tensor, m * n * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((m * n + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    sigmoid_focal_loss_with_elu_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_target, alpha, gamma, d_output, m, n
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_target);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

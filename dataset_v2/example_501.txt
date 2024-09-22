@@ -1,0 +1,296 @@
+```python
+import torch
+
+def pruned_fused_layernorm_with_median(input_tensor: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,
+                                      gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    """
+    Performs pruned fused layer normalization with median calculation.
+
+    Args:
+        input_tensor: Input tensor of shape (batch_size, input_size).
+        weights: Pruning mask tensor of shape (input_size), containing 1s for selected features and 0s for pruned features.
+        indices: Indices of selected features, used for indexing after pruning.
+        gamma: Layer normalization scale factor.
+        beta: Layer normalization bias.
+
+    Returns:
+        A tensor of shape (batch_size, output_size) representing the output of the layer.
+    """
+
+    # Pruning
+    pruned_input = torch.mul(input_tensor, weights)  # Element-wise multiplication with pruning mask
+
+    # Fused Layer Normalization
+    mean = torch.mean(pruned_input, dim=1, keepdim=True)
+    variance = torch.var(pruned_input, dim=1, keepdim=True, unbiased=False)
+    normalized_input = (pruned_input - mean) / torch.sqrt(variance + 1e-5)  # Epsilon for numerical stability
+
+    # Apply scale and bias
+    output = gamma * normalized_input + beta
+
+    # Index select (optional)
+    output = torch.index_select(output, dim=1, index=indices)
+
+    # Median Calculation
+    median_value = torch.median(output, dim=1, keepdim=True)
+
+    return output, median_value
+
+function_signature = {
+    "name": "pruned_fused_layernorm_with_median",
+    "inputs": [
+        ((8, 16), torch.float32),  # Input Tensor
+        ((16,), torch.float32),  # Pruning Weights
+        ((8,), torch.int64),  # Indices
+        ((16,), torch.float32),  # Gamma
+        ((16,), torch.float32)  # Beta
+    ],
+    "outputs": [
+        ((8, 8), torch.float32),  # Output Tensor (after index_select)
+        ((8, 1), torch.float32)  # Median Value
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for fused layer normalization with pruning
+__global__ void fused_layernorm_pruned_kernel(const float* input, const float* weights, const int* indices,
+                                                const float* gamma, const float* beta, float* output, float* median,
+                                                int batch_size, int input_size, int output_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < output_size) {
+        float sum = 0.0f;
+        float sq_sum = 0.0f;
+        for (int i = 0; i < input_size; ++i) {
+            sum += input[row * input_size + i] * weights[i];
+            sq_sum += input[row * input_size + i] * input[row * input_size + i] * weights[i];
+        }
+
+        float mean = sum / input_size;
+        float variance = (sq_sum / input_size) - (mean * mean);
+        float normalized_val = (sum - (mean * input_size)) / sqrtf(variance + 1e-5f);
+
+        output[row * output_size + col] = gamma[indices[col]] * normalized_val + beta[indices[col]];
+    }
+
+    // Median Calculation (done on a separate thread block to avoid race conditions)
+    if (row < batch_size && col == 0) {
+        float* local_output = output + row * output_size;  // Pointer to the row's output
+        float median_val = 0.0f;
+        for (int i = 0; i < output_size; ++i) {
+            if (i == 0) {
+                median_val = local_output[i];
+            } else {
+                if (local_output[i] < median_val) {
+                    median_val = local_output[i];
+                }
+            }
+        }
+        median[row] = median_val;
+    }
+}
+
+extern "C" {
+
+void pruned_fused_layernorm_with_median(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+
+    const int* indices = va_arg(args, const int*);
+    int indices_dim0 = va_arg(args, int);
+
+    const float* gamma = va_arg(args, const float*);
+    int gamma_dim0 = va_arg(args, int);
+
+    const float* beta = va_arg(args, const float*);
+    int beta_dim0 = va_arg(args, int);
+
+    // Extract output tensors
+    float* output = va_arg(args, float*);
+    int output_dim0 = va_arg(args, int);
+    int output_dim1 = va_arg(args, int);
+
+    float* median = va_arg(args, float*);
+    int median_dim0 = va_arg(args, int);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int input_size = input_dim1;
+    int output_size = output_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_gamma, *d_beta, *d_output, *d_median;
+    cudaMalloc(&d_input, batch_size * input_size * sizeof(float));
+    cudaMalloc(&d_weights, input_size * sizeof(float));
+    cudaMalloc(&d_gamma, input_size * sizeof(float));
+    cudaMalloc(&d_beta, input_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_size * sizeof(float));
+    cudaMalloc(&d_median, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_gamma, gamma, input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_beta, beta, input_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernels
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    fused_layernorm_pruned_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weights, indices, d_gamma, d_beta, d_output, d_median, batch_size, input_size, output_size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(median, d_median, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_gamma);
+    cudaFree(d_beta);
+    cudaFree(d_output);
+    cudaFree(d_median);
+}
+
+}  // extern "C"
+
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for fused layer normalization with pruning
+__global__ void fused_layernorm_pruned_kernel(const float* input, const float* weights, const int* indices,
+                                                const float* gamma, const float* beta, float* output, float* median,
+                                                int batch_size, int input_size, int output_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < output_size) {
+        float sum = 0.0f;
+        float sq_sum = 0.0f;
+        for (int i = 0; i < input_size; ++i) {
+            sum += input[row * input_size + i] * weights[i];
+            sq_sum += input[row * input_size + i] * input[row * input_size + i] * weights[i];
+        }
+
+        float mean = sum / input_size;
+        float variance = (sq_sum / input_size) - (mean * mean);
+        float normalized_val = (sum - (mean * input_size)) / sqrtf(variance + 1e-5f);
+
+        output[row * output_size + col] = gamma[indices[col]] * normalized_val + beta[indices[col]];
+    }
+
+    // Median Calculation (done on a separate thread block to avoid race conditions)
+    if (row < batch_size && col == 0) {
+        float* local_output = output + row * output_size;  // Pointer to the row's output
+        float median_val = 0.0f;
+        for (int i = 0; i < output_size; ++i) {
+            if (i == 0) {
+                median_val = local_output[i];
+            } else {
+                if (local_output[i] < median_val) {
+                    median_val = local_output[i];
+                }
+            }
+        }
+        median[row] = median_val;
+    }
+}
+
+extern "C" {
+
+void pruned_fused_layernorm_with_median(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+
+    const int* indices = va_arg(args, const int*);
+    int indices_dim0 = va_arg(args, int);
+
+    const float* gamma = va_arg(args, const float*);
+    int gamma_dim0 = va_arg(args, int);
+
+    const float* beta = va_arg(args, const float*);
+    int beta_dim0 = va_arg(args, int);
+
+    // Extract output tensors
+    float* output = va_arg(args, float*);
+    int output_dim0 = va_arg(args, int);
+    int output_dim1 = va_arg(args, int);
+
+    float* median = va_arg(args, float*);
+    int median_dim0 = va_arg(args, int);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int input_size = input_dim1;
+    int output_size = output_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_gamma, *d_beta, *d_output, *d_median;
+    cudaMalloc(&d_input, batch_size * input_size * sizeof(float));
+    cudaMalloc(&d_weights, input_size * sizeof(float));
+    cudaMalloc(&d_gamma, input_size * sizeof(float));
+    cudaMalloc(&d_beta, input_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_size * sizeof(float));
+    cudaMalloc(&d_median, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_gamma, gamma, input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_beta, beta, input_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernels
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    fused_layernorm_pruned_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weights, indices, d_gamma, d_beta, d_output, d_median, batch_size, input_size, output_size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(median, d_median, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_gamma);
+    cudaFree(d_beta);
+    cudaFree(d_output);
+    cudaFree(d_median);
+}
+
+}  // extern "C"
+```

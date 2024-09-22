@@ -1,0 +1,288 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+from torch.fft import fftn, ifftn
+
+def complex_conv3d_fft_hadamard(input_tensor: torch.Tensor, kernel: torch.Tensor, 
+                                 hadamard_matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Performs 3D convolution using FFT, Hadamard product, and binary cross-entropy loss.
+
+    Args:
+        input_tensor: Input tensor of shape (batch_size, channels, D, H, W).
+        kernel: Kernel tensor of shape (out_channels, channels, kernel_D, kernel_H, kernel_W).
+        hadamard_matrix: Hadamard matrix of shape (out_channels, out_channels).
+
+    Returns:
+        Output tensor of shape (batch_size, out_channels, D, H, W).
+    """
+    
+    # FFT of input and kernel
+    input_fft = fftn(input_tensor, dim=(2, 3, 4))
+    kernel_fft = fftn(kernel, dim=(2, 3, 4))
+
+    # Convolution in frequency domain
+    output_fft = input_fft.unsqueeze(1) * kernel_fft.unsqueeze(0)
+
+    # Inverse FFT
+    output = ifftn(output_fft, dim=(2, 3, 4)).real
+
+    # Hadamard product
+    output = output.reshape(input_tensor.shape[0], -1)
+    output = torch.matmul(output, hadamard_matrix)
+    output = output.reshape(input_tensor.shape[0], kernel.shape[0], *input_tensor.shape[2:])
+
+    # Binary cross-entropy with logits
+    output = F.binary_cross_entropy_with_logits(output, input_tensor)
+
+    return output
+
+function_signature = {
+    "name": "complex_conv3d_fft_hadamard",
+    "inputs": [
+        ((1, 1, 4, 4, 4), torch.float32),
+        ((1, 1, 2, 2, 2), torch.float32),
+        ((1, 1), torch.float32)
+    ],
+    "outputs": [
+        ((1, 1, 4, 4, 4), torch.float32),
+    ]
+}
+
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <complex>
+#include <stdarg.h>
+
+#define PI 3.14159265358979323846
+
+// Helper functions for complex numbers
+__device__ std::complex<float> complex_mul(const std::complex<float>& a, const std::complex<float>& b) {
+    return std::complex<float>(a.real() * b.real() - a.imag() * b.imag(),
+                               a.real() * b.imag() + a.imag() * b.real());
+}
+
+__device__ std::complex<float> complex_exp(const std::complex<float>& z) {
+    float exp_real = expf(z.real());
+    return std::complex<float>(exp_real * cosf(z.imag()), exp_real * sinf(z.imag()));
+}
+
+// 3D FFT kernel
+__global__ void fft3d_kernel(const float* input, std::complex<float>* output, int batch_size, int channels, int D, int H, int W) {
+    int idx = blockIdx.z * gridDim.x * gridDim.y * blockDim.x * blockDim.y * blockDim.z +
+              blockIdx.y * gridDim.x * blockDim.x * blockDim.y * blockDim.z +
+              blockIdx.x * blockDim.x * blockDim.y * blockDim.z +
+              threadIdx.z * blockDim.x * blockDim.y +
+              threadIdx.y * blockDim.x +
+              threadIdx.x;
+
+    int b = idx / (channels * D * H * W);
+    int c = (idx % (channels * D * H * W)) / (D * H * W);
+    int d = (idx % (D * H * W)) / (H * W);
+    int h = (idx % (H * W)) / W;
+    int w = idx % W;
+
+    if (b < batch_size && c < channels && d < D && h < H && w < W) {
+        std::complex<float> sum(0.0f, 0.0f);
+        for (int k = 0; k < D; ++k) {
+            for (int j = 0; j < H; ++j) {
+                for (int i = 0; i < W; ++i) {
+                    float val = input[(b * channels + c) * D * H * W + k * H * W + j * W + i];
+                    float angle_d = -2.0f * PI * (k * d / D + j * h / H + i * w / W);
+                    std::complex<float> exp_term = complex_exp(std::complex<float>(0.0f, angle_d));
+                    sum = complex_mul(sum, exp_term);
+                    sum += std::complex<float>(val, 0.0f);
+                }
+            }
+        }
+        output[idx] = sum;
+    }
+}
+
+// 3D inverse FFT kernel
+__global__ void ifft3d_kernel(const std::complex<float>* input, float* output, int batch_size, int channels, int D, int H, int W) {
+    int idx = blockIdx.z * gridDim.x * gridDim.y * blockDim.x * blockDim.y * blockDim.z +
+              blockIdx.y * gridDim.x * blockDim.x * blockDim.y * blockDim.z +
+              blockIdx.x * blockDim.x * blockDim.y * blockDim.z +
+              threadIdx.z * blockDim.x * blockDim.y +
+              threadIdx.y * blockDim.x +
+              threadIdx.x;
+
+    int b = idx / (channels * D * H * W);
+    int c = (idx % (channels * D * H * W)) / (D * H * W);
+    int d = (idx % (D * H * W)) / (H * W);
+    int h = (idx % (H * W)) / W;
+    int w = idx % W;
+
+    if (b < batch_size && c < channels && d < D && h < H && w < W) {
+        std::complex<float> sum(0.0f, 0.0f);
+        for (int k = 0; k < D; ++k) {
+            for (int j = 0; j < H; ++j) {
+                for (int i = 0; i < W; ++i) {
+                    float angle_d = 2.0f * PI * (k * d / D + j * h / H + i * w / W);
+                    std::complex<float> exp_term = complex_exp(std::complex<float>(0.0f, angle_d));
+                    sum = complex_mul(sum, exp_term);
+                    sum += input[(b * channels + c) * D * H * W + k * H * W + j * W + i];
+                }
+            }
+        }
+        output[idx] = sum.real() / (D * H * W);
+    }
+}
+
+// Hadamard product kernel
+__global__ void hadamard_product_kernel(const float* input, const float* hadamard_matrix, float* output,
+                                         int batch_size, int in_channels, int out_channels, int D, int H, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size * out_channels * D * H * W) {
+        int b = idx / (out_channels * D * H * W);
+        int o = (idx % (out_channels * D * H * W)) / (D * H * W);
+        int d = (idx % (D * H * W)) / (H * W);
+        int h = (idx % (H * W)) / W;
+        int w = idx % W;
+
+        float sum = 0.0f;
+        for (int i = 0; i < in_channels; ++i) {
+            sum += input[(b * in_channels + i) * D * H * W + d * H * W + h * W + w] *
+                  hadamard_matrix[o * out_channels + i];
+        }
+        output[idx] = sum;
+    }
+}
+
+// Binary cross-entropy with logits kernel
+__global__ void bce_with_logits_kernel(const float* input, const float* target, float* output,
+                                         int batch_size, int out_channels, int D, int H, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size * out_channels * D * H * W) {
+        int b = idx / (out_channels * D * H * W);
+        int o = (idx % (out_channels * D * H * W)) / (D * H * W);
+        int d = (idx % (D * H * W)) / (H * W);
+        int h = (idx % (H * W)) / W;
+        int w = idx % W;
+
+        float pred = input[idx];
+        float label = target[idx];
+        output[idx] = - (label * logf(expf(pred)) + (1.0f - label) * logf(expf(1.0f - pred)));
+    }
+}
+
+extern "C" {
+
+void complex_conv3d_fft_hadamard(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+    int input_tensor_dim4 = va_arg(args, int);
+
+    // Extract kernel tensor
+    const float* kernel = va_arg(args, const float*);
+    int kernel_dim0 = va_arg(args, int);
+    int kernel_dim1 = va_arg(args, int);
+    int kernel_dim2 = va_arg(args, int);
+    int kernel_dim3 = va_arg(args, int);
+    int kernel_dim4 = va_arg(args, int);
+
+    // Extract hadamard matrix
+    const float* hadamard_matrix = va_arg(args, const float*);
+    int hadamard_matrix_dim0 = va_arg(args, int);
+    int hadamard_matrix_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int in_channels = input_tensor_dim1;
+    int D = input_tensor_dim2;
+    int H = input_tensor_dim3;
+    int W = input_tensor_dim4;
+    int out_channels = kernel_dim0;
+
+    // Allocate device memory
+    std::complex<float> *d_input_fft, *d_kernel_fft, *d_output_fft;
+    float *d_input, *d_kernel, *d_output, *d_hadamard_matrix;
+    cudaMalloc(&d_input_fft, batch_size * in_channels * D * H * W * sizeof(std::complex<float>));
+    cudaMalloc(&d_kernel_fft, out_channels * in_channels * D * H * W * sizeof(std::complex<float>));
+    cudaMalloc(&d_output_fft, batch_size * out_channels * D * H * W * sizeof(std::complex<float>));
+    cudaMalloc(&d_input, batch_size * in_channels * D * H * W * sizeof(float));
+    cudaMalloc(&d_kernel, out_channels * in_channels * D * H * W * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * D * H * W * sizeof(float));
+    cudaMalloc(&d_hadamard_matrix, out_channels * out_channels * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * D * H * W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kernel, kernel, out_channels * in_channels * D * H * W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hadamard_matrix, hadamard_matrix, out_channels * out_channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch FFT kernels
+    dim3 threadsPerBlock(8, 8, 8);
+    dim3 numBlocks((D + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (H + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size * in_channels + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    fft3d_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_input_fft, batch_size, in_channels, D, H, W);
+    fft3d_kernel<<<numBlocks, threadsPerBlock>>>(d_kernel, d_kernel_fft, out_channels, in_channels, D, H, W);
+
+    // Convolution in frequency domain
+    for (int b = 0; b < batch_size; ++b) {
+        for (int o = 0; o < out_channels; ++o) {
+            for (int c = 0; c < in_channels; ++c) {
+                for (int d = 0; d < D; ++d) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            int idx = (b * out_channels + o) * D * H * W + d * H * W + h * W + w;
+                            d_output_fft[idx] = complex_mul(d_input_fft[(b * in_channels + c) * D * H * W + d * H * W + h * W + w],
+                                                        d_kernel_fft[(o * in_channels + c) * D * H * W + d * H * W + h * W + w]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Launch inverse FFT kernel
+    ifft3d_kernel<<<numBlocks, threadsPerBlock>>>(d_output_fft, d_output, batch_size, out_channels, D, H, W);
+
+    // Launch Hadamard product kernel
+    threadsPerBlock = dim3(256, 1, 1);
+    numBlocks = (batch_size * out_channels * D * H * W + threadsPerBlock.x - 1) / threadsPerBlock.x;
+    hadamard_product_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_hadamard_matrix, d_output,
+                                                       batch_size, in_channels, out_channels, D, H, W);
+
+    // Launch binary cross-entropy with logits kernel
+    bce_with_logits_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_input, d_output,
+                                                      batch_size, out_channels, D, H, W);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * out_channels * D * H * W * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input_fft);
+    cudaFree(d_kernel_fft);
+    cudaFree(d_output_fft);
+    cudaFree(d_input);
+    cudaFree(d_kernel);
+    cudaFree(d_output);
+    cudaFree(d_hadamard_matrix);
+}
+
+} // extern "C"
+
+```

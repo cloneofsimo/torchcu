@@ -1,0 +1,130 @@
+## func.py
+
+```python
+import torch
+
+def complex_function(input_tensor: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on the input tensor and weights:
+    1. Calculates the outer product of input tensor and weights.
+    2. Computes the mean of the outer product along the last dimension.
+    3. Computes the pairwise Manhattan distances between each row of the mean result.
+    """
+    outer_product = torch.einsum('i,j->ij', input_tensor, weights)
+    mean_tensor = torch.mean(outer_product, dim=-1)
+    distances = torch.cdist(mean_tensor.unsqueeze(1), mean_tensor.unsqueeze(1), p=1)
+    return distances
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((4, 1), torch.float32),
+        ((1, 4), torch.float32)
+    ],
+    "outputs": [
+        ((4, 4), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+__global__ void outer_product_kernel(const float* input_tensor, const float* weights, float* output, int m, int n) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        output[row * n + col] = input_tensor[row] * weights[col];
+    }
+}
+
+__global__ void mean_kernel(const float* outer_product, float* mean_tensor, int m, int n) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (row < m) {
+        float sum = 0.0f;
+        for (int col = 0; col < n; ++col) {
+            sum += outer_product[row * n + col];
+        }
+        mean_tensor[row] = sum / n;
+    }
+}
+
+__global__ void manhattan_distance_kernel(const float* mean_tensor, float* distances, int m) {
+    int row1 = blockIdx.y * blockDim.y + threadIdx.y;
+    int row2 = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row1 < m && row2 < m) {
+        float distance = 0.0f;
+        for (int i = 0; i < m; ++i) {
+            distance += abs(mean_tensor[row1 * m + i] - mean_tensor[row2 * m + i]);
+        }
+        distances[row1 * m + row2] = distance;
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+    int weights_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* distances = va_arg(args, float*);
+
+    va_end(args);
+
+    int m = input_tensor_dim0;
+    int n = weights_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_outer_product, *d_mean_tensor;
+    cudaMalloc(&d_input, m * sizeof(float));
+    cudaMalloc(&d_weights, n * sizeof(float));
+    cudaMalloc(&d_outer_product, m * n * sizeof(float));
+    cudaMalloc(&d_mean_tensor, m * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, m * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, n * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Outer product
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((n + threadsPerBlock.x - 1) / threadsPerBlock.x, (m + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    outer_product_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weights, d_outer_product, m, n);
+
+    // Mean calculation
+    numBlocks = (m + threadsPerBlock.x - 1) / threadsPerBlock.x;
+    mean_kernel<<<numBlocks, threadsPerBlock>>>(d_outer_product, d_mean_tensor, m, n);
+
+    // Manhattan distance calculation
+    numBlocks = (m + threadsPerBlock.x - 1) / threadsPerBlock.x;
+    manhattan_distance_kernel<<<numBlocks, threadsPerBlock>>>(d_mean_tensor, distances, m);
+
+    // Copy result back to host
+    cudaMemcpy(distances, d_outer_product, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_outer_product);
+    cudaFree(d_mean_tensor);
+}
+
+} // extern "C"
+```

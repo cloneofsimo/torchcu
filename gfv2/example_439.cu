@@ -1,0 +1,68 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+extern "C" {
+
+__global__ void logsumexp_ge_kernel(const float* input_tensor, float threshold, float* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        if (input_tensor[i] >= threshold) {
+            output[i] = input_tensor[i];
+        } else {
+            float max_val = input_tensor[i];
+            for (int j = 0; j < n; ++j) {
+                max_val = fmaxf(max_val, input_tensor[j]);
+            }
+            float sum = 0.0f;
+            for (int j = 0; j < n; ++j) {
+                sum += expf(input_tensor[j] - max_val);
+            }
+            output[i] = max_val + logf(sum);
+        }
+    }
+}
+
+void logsumexp_ge_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+
+    // Extract threshold
+    float threshold = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int n = input_tensor_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, n * sizeof(float));
+    cudaMalloc(&d_output, n * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, n * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((n + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    logsumexp_ge_kernel<<<numBlocks, threadsPerBlock>>>(d_input, threshold, d_output, n);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+} // extern "C"

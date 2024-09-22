@@ -1,0 +1,112 @@
+## func.py
+
+```python
+import torch
+
+def my_complex_function(input_tensor1: torch.Tensor, input_tensor2: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on two input tensors, including:
+    1. Element-wise multiplication
+    2. Summation across a specific dimension
+    3. ReLU activation
+    4. Scaling by a constant
+    """
+    output = input_tensor1 * input_tensor2
+    output = torch.sum(output, dim=1)
+    output = torch.relu(output)
+    output = output * 2.0
+    return output
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((2, 3), torch.float32),
+        ((2, 3), torch.float32)
+    ],
+    "outputs": [
+        ((2,), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+__global__ void my_complex_function_kernel(const float* input_tensor1, const float* input_tensor2, float* output,
+                                        int batch_size, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < dim; ++i) {
+            sum += input_tensor1[idx * dim + i] * input_tensor2[idx * dim + i];
+        }
+        output[idx] = fmaxf(sum * 2.0f, 0.0f); // ReLU and scaling
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor1 = va_arg(args, const float*);
+    int input_tensor1_dim0 = va_arg(args, int);
+    int input_tensor1_dim1 = va_arg(args, int);
+
+    const float* input_tensor2 = va_arg(args, const float*);
+    int input_tensor2_dim0 = va_arg(args, int);
+    int input_tensor2_dim1 = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor1_dim0;
+    int dim = input_tensor1_dim1;
+
+    // Allocate device memory
+    float* d_input1, *d_input2, *d_output;
+    cudaMalloc(&d_input1, batch_size * dim * sizeof(float));
+    cudaMalloc(&d_input2, batch_size * dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input_tensor1, batch_size * dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input_tensor2, batch_size * dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    my_complex_function_kernel<<<numBlocks, threadsPerBlock>>>(d_input1, d_input2, d_output, batch_size, dim);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```
+
+**Explanation:**
+
+* **func.py:**  The Python code defines a function `my_complex_function` that takes two input tensors, performs element-wise multiplication, sums along dimension 1, applies ReLU activation, and scales the result by 2.
+* **func.cu:** The CUDA code implements the equivalent functionality of `my_complex_function`. 
+    * It defines a kernel `my_complex_function_kernel` that performs the calculations in parallel on the GPU.
+    * The kernel uses a loop to iterate over elements of the input tensors, performs element-wise multiplication, and then sums the results for each row.
+    * The result is then passed through ReLU activation and scaled by 2.
+    * Memory management is handled by allocating device memory for the input and output tensors, copying the data to the device, launching the kernel, copying the results back to the host, and freeing the device memory. 
+* **Performance:** The CUDA implementation is expected to be significantly faster than the Python version, especially for larger input tensors, due to the parallel nature of GPU computation.
+
+This example demonstrates how to implement a more complex function in CUDA and the key steps involved in data transfer, kernel launch, and memory management.  

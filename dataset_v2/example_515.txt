@@ -1,0 +1,187 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def complex_function(input_tensor: torch.Tensor, weights: torch.Tensor, biases: torch.Tensor, decomposition_matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Performs a series of operations on the input tensor:
+    1. Matrix multiplication with weights and addition of biases
+    2. Applies ReLU activation
+    3. Decomposes the result using the provided decomposition matrix
+    4. Applies Gumbel-Softmax sampling
+    5. Checks for elements present in a predefined set
+    
+    Returns:
+    - The decomposed and sampled output tensor
+    - A tensor indicating which elements are present in the predefined set
+    """
+    
+    # 1. Linear Transformation and ReLU
+    output = F.relu(torch.matmul(input_tensor, weights.t()) + biases)
+    
+    # 2. Tensor Decomposition
+    decomposed_output = torch.matmul(output, decomposition_matrix.t())
+
+    # 3. Gumbel-Softmax Sampling
+    # Apply Gumbel-Softmax for categorical distribution sampling
+    gumbel_output = F.gumbel_softmax(decomposed_output, tau=1.0, hard=True)
+
+    # 4. Element Checking
+    predefined_set = torch.tensor([1, 3, 5])
+    is_in_set = (gumbel_output.argmax(dim=1) == predefined_set.unsqueeze(0)).any(dim=1)
+
+    return gumbel_output, is_in_set
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((10, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4,), torch.float32),
+        ((4, 8), torch.float32)
+    ],
+    "outputs": [
+        ((10, 8), torch.float32),
+        ((10,), torch.bool),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+#include <curand_kernel.h> // Include for CUDA random number generation
+
+// Helper functions for Gumbel-Softmax sampling
+__device__ float gumbel_sample(curandState_t &state) {
+    return -log(-logf(curand_uniform(&state)));
+}
+
+__device__ float softmax(float x, float sum_exp) {
+    return expf(x) / sum_exp;
+}
+
+__global__ void complex_function_kernel(
+    const float* input_tensor, const float* weights, const float* biases, const float* decomposition_matrix,
+    float* gumbel_output, bool* is_in_set, int batch_size, int input_dim, int output_dim, int decomposition_dim
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < output_dim) {
+        // 1. Linear Transformation and ReLU
+        float sum = 0.0f;
+        for (int i = 0; i < input_dim; ++i) {
+            sum += input_tensor[row * input_dim + i] * weights[col * input_dim + i];
+        }
+        sum += biases[col];
+        float relu_output = max(sum, 0.0f);
+
+        // 2. Tensor Decomposition
+        float decomposed_output[decomposition_dim];
+        for (int i = 0; i < decomposition_dim; ++i) {
+            decomposed_output[i] = 0.0f;
+            for (int j = 0; j < input_dim; ++j) {
+                decomposed_output[i] += relu_output * decomposition_matrix[col * decomposition_dim + i];
+            }
+        }
+
+        // 3. Gumbel-Softmax Sampling
+        curandState_t state;
+        curand_init(12345 + row * output_dim + col, 0, 0, &state); // Initialize random number generator
+        float gumbel_noise[decomposition_dim];
+        float sum_exp = 0.0f;
+        for (int i = 0; i < decomposition_dim; ++i) {
+            gumbel_noise[i] = gumbel_sample(state);
+            sum_exp += expf(decomposed_output[i] + gumbel_noise[i]);
+        }
+        for (int i = 0; i < decomposition_dim; ++i) {
+            gumbel_output[row * output_dim + col * decomposition_dim + i] = softmax(decomposed_output[i] + gumbel_noise[i], sum_exp);
+        }
+
+        // 4. Element Checking
+        int argmax = 0;
+        float max_val = gumbel_output[row * output_dim + col * decomposition_dim];
+        for (int i = 1; i < decomposition_dim; ++i) {
+            if (gumbel_output[row * output_dim + col * decomposition_dim + i] > max_val) {
+                argmax = i;
+                max_val = gumbel_output[row * output_dim + col * decomposition_dim + i];
+            }
+        }
+        is_in_set[row] = (argmax == 0 || argmax == 2 || argmax == 4); // Check if argmax is in the predefined set
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+    int weights_dim1 = va_arg(args, int);
+
+    const float* biases = va_arg(args, const float*);
+    int biases_dim = va_arg(args, int);
+
+    const float* decomposition_matrix = va_arg(args, const float*);
+    int decomposition_matrix_dim0 = va_arg(args, int);
+    int decomposition_matrix_dim1 = va_arg(args, int);
+
+    // Extract output tensors
+    float* gumbel_output = va_arg(args, float*);
+    bool* is_in_set = va_arg(args, bool*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weights_dim0;
+    int decomposition_dim = decomposition_matrix_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_biases, *d_decomposition_matrix;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weights, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_biases, output_dim * sizeof(float));
+    cudaMalloc(&d_decomposition_matrix, output_dim * decomposition_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_biases, biases, output_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_decomposition_matrix, decomposition_matrix, output_dim * decomposition_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    complex_function_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weights, d_biases, d_decomposition_matrix, 
+        gumbel_output, is_in_set, batch_size, input_dim, output_dim, decomposition_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(gumbel_output, d_gumbel_output, batch_size * output_dim * decomposition_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_biases);
+    cudaFree(d_decomposition_matrix);
+}
+
+} // extern "C"
+```

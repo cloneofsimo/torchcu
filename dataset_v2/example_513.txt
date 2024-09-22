@@ -1,0 +1,175 @@
+## func.py
+
+```python
+import torch
+
+def my_complex_function(input_tensor: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a 3D convolution, sorts the output along the last dimension,
+    and returns the identity of the largest element.
+    """
+    output = torch.nn.functional.conv3d(input_tensor.unsqueeze(0), kernel.unsqueeze(0), padding=1)
+    output = torch.squeeze(output, 0)
+    sorted_output, indices = torch.sort(output, dim=-1)
+    max_indices = indices[:, :, :, :, -1]
+    return max_indices.to(torch.float32)
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((2, 2, 2, 2), torch.float32),  # Input tensor with shape (2, 2, 2, 2)
+        ((2, 2, 2), torch.float32)  # Kernel with shape (2, 2, 2)
+    ],
+    "outputs": [
+        ((2, 2, 2), torch.float32)  # Output tensor with shape (2, 2, 2)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper function for 3D convolution
+__global__ void conv3d_kernel(const float* input, const float* kernel, float* output,
+                                 int input_height, int input_width, int input_depth,
+                                 int kernel_height, int kernel_width, int kernel_depth,
+                                 int output_height, int output_width, int output_depth) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (x < output_width && y < output_height && z < output_depth) {
+        float sum = 0.0f;
+        for (int kh = 0; kh < kernel_height; ++kh) {
+            for (int kw = 0; kw < kernel_width; ++kw) {
+                for (int kd = 0; kd < kernel_depth; ++kd) {
+                    int ix = x + kw - kernel_width / 2;
+                    int iy = y + kh - kernel_height / 2;
+                    int iz = z + kd - kernel_depth / 2;
+
+                    if (ix >= 0 && ix < input_width && iy >= 0 && iy < input_height && iz >= 0 && iz < input_depth) {
+                        sum += input[((iz * input_height + iy) * input_width + ix)] *
+                              kernel[(kd * kernel_height + kh) * kernel_width + kw];
+                    }
+                }
+            }
+        }
+        output[(z * output_height + y) * output_width + x] = sum;
+    }
+}
+
+// Helper function for sorting an array on the device
+__global__ void sort_kernel(float* data, int* indices, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        indices[i] = i;
+    }
+}
+
+__global__ void sort_kernel_step(float* data, int* indices, int n, int step) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i + step < n) {
+        int i1 = i;
+        int i2 = i + step;
+        if (data[indices[i1]] > data[indices[i2]]) {
+            int tmp = indices[i1];
+            indices[i1] = indices[i2];
+            indices[i2] = tmp;
+        }
+    }
+}
+
+// Function to sort an array on the device using Bitonic Sort
+void sort_on_device(float* data, int* indices, int n) {
+    int threadsPerBlock = 256;
+    int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+
+    // Initialize indices
+    sort_kernel<<<numBlocks, threadsPerBlock>>>(data, indices, n);
+
+    // Perform Bitonic sort steps
+    for (int step = 1; step < n; step *= 2) {
+        for (int stride = step; stride > 0; stride /= 2) {
+            sort_kernel_step<<<numBlocks, threadsPerBlock>>>(data, indices, n, stride);
+        }
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract kernel tensor
+    const float* kernel = va_arg(args, const float*);
+    int kernel_dim0 = va_arg(args, int);
+    int kernel_dim1 = va_arg(args, int);
+    int kernel_dim2 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Calculate output dimensions
+    int output_dim0 = input_tensor_dim0;
+    int output_dim1 = input_tensor_dim1;
+    int output_dim2 = input_tensor_dim2;
+
+    // Allocate device memory
+    float *d_input, *d_kernel, *d_output;
+    int *d_indices;
+    cudaMalloc(&d_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float));
+    cudaMalloc(&d_kernel, kernel_dim0 * kernel_dim1 * kernel_dim2 * sizeof(float));
+    cudaMalloc(&d_output, output_dim0 * output_dim1 * output_dim2 * sizeof(float));
+    cudaMalloc(&d_indices, output_dim0 * output_dim1 * output_dim2 * sizeof(int));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kernel, kernel, kernel_dim0 * kernel_dim1 * kernel_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch convolution kernel
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((output_dim2 + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (output_dim1 + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (output_dim0 + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    conv3d_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_kernel, d_output,
+        input_tensor_dim1, input_tensor_dim2, input_tensor_dim3,
+        kernel_dim0, kernel_dim1, kernel_dim2,
+        output_dim1, output_dim2, output_dim0
+    );
+
+    // Perform sorting on the device
+    sort_on_device(d_output, d_indices, output_dim0 * output_dim1 * output_dim2);
+
+    // Extract the indices of the largest elements from the sorted output
+    for (int i = 0; i < output_dim0 * output_dim1 * output_dim2; ++i) {
+        output[i] = static_cast<float>(d_indices[i]);
+    }
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, output_dim0 * output_dim1 * output_dim2 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_kernel);
+    cudaFree(d_output);
+    cudaFree(d_indices);
+}
+
+}  // extern "C"
+```

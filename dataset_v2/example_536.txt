@@ -1,0 +1,263 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def complex_function(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations including multinomial sampling, MSE loss calculation, channel attention, and SVD.
+
+    Args:
+        input_tensor: Input tensor of shape (B, C, H, W).
+        weight: Weight tensor of shape (C, C).
+        bias: Bias tensor of shape (C).
+
+    Returns:
+        Output tensor of shape (B, C, H, W).
+    """
+
+    # 1. Multinomial sampling:
+    # - Reshape input tensor to (B, C, H*W)
+    # - Apply softmax across the channel dimension (C)
+    # - Sample from the distribution using multinomial
+    # - Reshape the result back to (B, C, H, W)
+    B, C, H, W = input_tensor.size()
+    input_tensor_reshaped = input_tensor.view(B, C, H * W)
+    softmax_output = F.softmax(input_tensor_reshaped, dim=1)
+    sampled_indices = torch.multinomial(softmax_output, 1, replacement=True)
+    sampled_values = torch.gather(input_tensor_reshaped, dim=1, index=sampled_indices).view(B, C, H, W)
+
+    # 2. MSE loss:
+    # - Calculate the MSE loss between sampled values and original input
+    mse_loss = F.mse_loss(sampled_values, input_tensor)
+
+    # 3. Channel attention:
+    # - Perform matrix multiplication with the weight tensor
+    # - Apply ReLU activation
+    # - Apply softmax across the channel dimension (C)
+    attention_weights = torch.matmul(input_tensor.view(B, C, -1), weight).view(B, C, H, W)
+    attention_weights = F.relu(attention_weights)
+    attention_weights = F.softmax(attention_weights, dim=1)
+
+    # 4. SVD:
+    # - Perform singular value decomposition on the weight tensor
+    U, S, V = torch.linalg.svd(weight)
+
+    # 5. Output calculation:
+    # - Multiply sampled values with attention weights
+    # - Add bias
+    # - Multiply with the first singular vector (U[:, 0])
+    # - Return the result
+    output = sampled_values * attention_weights + bias
+    output = torch.mul(output, U[:, 0].view(1, 1, 1, C))
+
+    return output
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((1, 4, 3, 3), torch.float32),
+        ((4, 4), torch.float32),
+        ((4,), torch.float32)
+    ],
+    "outputs": [
+        ((1, 4, 3, 3), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h> 
+
+// Function to perform softmax across a dimension
+__global__ void softmax_kernel(float* input, int batch_size, int channels, int width, int height) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int hw = threadIdx.z;
+
+    if (b < batch_size && c < channels && hw < width * height) {
+        float sum = 0.0f;
+        int offset = b * channels * width * height + c * width * height + hw;
+        for (int i = 0; i < channels; i++) {
+            sum += expf(input[offset + i * width * height]);
+        }
+        input[offset] = expf(input[offset]) / sum; 
+    }
+}
+
+// Function to perform multinomial sampling
+__global__ void multinomial_kernel(float* input, int* indices, int batch_size, int channels, int width, int height) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int hw = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && hw < width * height) {
+        int offset = b * channels * width * height + hw;
+        float sum = 0.0f;
+        int sampled_index = 0;
+
+        // Generate a random number between 0 and 1
+        float random_value = (float)rand() / RAND_MAX;
+
+        for (int c = 0; c < channels; c++) {
+            sum += input[offset + c * width * height];
+            if (random_value < sum) {
+                sampled_index = c;
+                break;
+            }
+        }
+        indices[offset] = sampled_index;
+    }
+}
+
+// Function to perform channel attention
+__global__ void channel_attention_kernel(const float* input, const float* weight, float* output, int batch_size, 
+                                         int channels, int width, int height) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int hw = threadIdx.z;
+
+    if (b < batch_size && c < channels && hw < width * height) {
+        float sum = 0.0f;
+        int offset = b * channels * width * height + c * width * height + hw;
+        for (int i = 0; i < channels; i++) {
+            sum += input[offset + i * width * height] * weight[c * channels + i];
+        }
+        output[offset] = fmaxf(sum, 0.0f);  // ReLU activation
+    }
+}
+
+// Function to perform softmax across channels for attention weights
+__global__ void softmax_attention_kernel(float* input, int batch_size, int channels, int width, int height) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int hw = threadIdx.z;
+
+    if (b < batch_size && c < channels && hw < width * height) {
+        float sum = 0.0f;
+        int offset = b * channels * width * height + c * width * height + hw;
+        for (int i = 0; i < channels; i++) {
+            sum += expf(input[offset + i * width * height]);
+        }
+        input[offset] = expf(input[offset]) / sum; 
+    }
+}
+
+// Function to perform SVD on a matrix
+__global__ void svd_kernel(float* weight, float* U, float* S, float* V, int size) {
+    // Implement SVD kernel here. This is a simplified example; actual SVD is complex.
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < size && col < size) {
+        U[row * size + col] = weight[row * size + col];
+        // ... (simplified calculations for S and V)
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int channels = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_size = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output;
+    float *d_sampled_values, *d_attention_weights, *d_U, *d_S, *d_V;
+    int *d_sampled_indices;
+
+    cudaMalloc(&d_input, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_weight, weight_size * weight_size * sizeof(float));
+    cudaMalloc(&d_bias, channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_sampled_values, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_attention_weights, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_U, weight_size * weight_size * sizeof(float));
+    cudaMalloc(&d_S, weight_size * sizeof(float));
+    cudaMalloc(&d_V, weight_size * weight_size * sizeof(float));
+    cudaMalloc(&d_sampled_indices, batch_size * height * width * sizeof(int));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, weight_size * weight_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // 1. Multinomial sampling:
+    // - Reshape input tensor to (B, C, H*W)
+    // - Apply softmax across the channel dimension (C)
+    // - Sample from the distribution using multinomial
+    // - Reshape the result back to (B, C, H, W)
+    dim3 threadsPerBlock(32, 1, 1);
+    dim3 numBlocks(batch_size / threadsPerBlock.x, channels / threadsPerBlock.y, 1);
+    softmax_kernel<<<numBlocks, threadsPerBlock>>>(d_input, batch_size, channels, width, height);
+
+    numBlocks = dim3((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, (height * width + threadsPerBlock.y - 1) / threadsPerBlock.y, 1);
+    multinomial_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_sampled_indices, batch_size, channels, width, height);
+
+    // Gather sampled values
+    cudaMemcpy(d_sampled_values, d_input, batch_size * channels * height * width * sizeof(float), cudaMemcpyDeviceToDevice);
+
+    // 2. Channel attention:
+    // - Perform matrix multiplication with the weight tensor
+    // - Apply ReLU activation
+    // - Apply softmax across the channel dimension (C)
+    numBlocks = dim3(batch_size / threadsPerBlock.x, channels / threadsPerBlock.y, height * width / threadsPerBlock.z);
+    channel_attention_kernel<<<numBlocks, threadsPerBlock>>>(d_sampled_values, d_weight, d_attention_weights, batch_size, channels, width, height);
+
+    softmax_attention_kernel<<<numBlocks, threadsPerBlock>>>(d_attention_weights, batch_size, channels, width, height);
+
+    // 3. SVD:
+    // - Perform singular value decomposition on the weight tensor
+    numBlocks = dim3((weight_size + threadsPerBlock.x - 1) / threadsPerBlock.x, (weight_size + threadsPerBlock.y - 1) / threadsPerBlock.y, 1);
+    svd_kernel<<<numBlocks, threadsPerBlock>>>(d_weight, d_U, d_S, d_V, weight_size);
+
+    // 4. Output calculation:
+    // - Multiply sampled values with attention weights
+    // - Add bias
+    // - Multiply with the first singular vector (U[:, 0])
+    // - Return the result
+    for (int i = 0; i < batch_size * channels * height * width; i++) {
+        d_output[i] = d_sampled_values[i] * d_attention_weights[i] + d_bias[i / (height * width)];
+        d_output[i] *= d_U[i / (height * width) * weight_size];
+    }
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * channels * height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+    cudaFree(d_sampled_values);
+    cudaFree(d_attention_weights);
+    cudaFree(d_U);
+    cudaFree(d_S);
+    cudaFree(d_V);
+    cudaFree(d_sampled_indices);
+}
+
+}  // extern "C"
+```

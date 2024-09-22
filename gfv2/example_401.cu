@@ -1,0 +1,157 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+#define CUDA_CHECK(x) \
+    do { \
+        cudaError_t err = (x); \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA Error: %s:%d, %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(1); \
+        } \
+    } while (0)
+
+#define THREADS_PER_BLOCK 16
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for Swin Transformer windowed attention
+__global__ void swin_attention_kernel(const float* input, const float* attention_weights, float* output,
+                                        int B, int C, int H, int W, int window_size, int shift_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < H && col < W) {
+        int window_row = row / window_size;
+        int window_col = col / window_size;
+        int local_row = row % window_size;
+        int local_col = col % window_size;
+
+        int global_row = (row + shift_size) % H;
+        int global_col = (col + shift_size) % W;
+
+        int global_window_row = global_row / window_size;
+        int global_window_col = global_col / window_size;
+
+        int index = global_window_row * (W / window_size) + global_window_col;
+        int offset = B * (H / window_size) * (W / window_size) * C * window_size * window_size;
+
+        float sum = 0.0f;
+        for (int i = 0; i < C; ++i) {
+            for (int j = 0; j < window_size; ++j) {
+                for (int k = 0; k < window_size; ++k) {
+                    int input_index = i * window_size * window_size + j * window_size + k;
+                    int weight_index = index * C * window_size * window_size + input_index;
+                    sum += input[offset + window_row * window_size * W + window_col * window_size + i * window_size * window_size + j * window_size + k] *
+                           attention_weights[weight_index];
+                }
+            }
+        }
+        output[row * W + col] = sum;
+    }
+}
+
+// CUDA kernel for ELU activation
+__global__ void elu_kernel(float* output, int B, int C, int H, int W) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < H && col < W) {
+        int index = row * W + col;
+        output[index] = (output[index] > 0.0f) ? output[index] : expf(output[index]) - 1.0f;
+    }
+}
+
+// CUDA kernel for max pooling
+__global__ void max_pooling_kernel(const float* input, float* output, int B, int C, int H, int W) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < H && col < W) {
+        int index = row * W + col;
+        int pool_row = row * 2;
+        int pool_col = col * 2;
+
+        float max_value = input[pool_row * W + pool_col];
+        max_value = max(max_value, input[pool_row * W + (pool_col + 1)]);
+        max_value = max(max_value, input[(pool_row + 1) * W + pool_col]);
+        max_value = max(max_value, input[(pool_row + 1) * W + (pool_col + 1)]);
+
+        output[index] = max_value;
+    }
+}
+
+extern "C" {
+
+void swin_transformer_elu_max(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int B = va_arg(args, int);
+    int C = va_arg(args, int);
+    int H = va_arg(args, int);
+    int W = va_arg(args, int);
+
+    // Extract attention weights
+    const float* attention_weights = va_arg(args, const float*);
+
+    // Extract shift size
+    int shift_size = va_arg(args, int);
+
+    // Extract window size
+    int window_size = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_attention_weights, *d_output;
+    CUDA_CHECK(cudaMalloc(&d_input, B * C * H * W * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_attention_weights, B * (H / window_size) * (W / window_size) * C * window_size * window_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, B * C * H * W * sizeof(float)));
+
+    // Copy input data to device
+    CUDA_CHECK(cudaMemcpy(d_input, input, B * C * H * W * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_attention_weights, attention_weights, B * (H / window_size) * (W / window_size) * C * window_size * window_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Launch Swin Transformer attention kernel
+    dim3 threadsPerBlock(THREADS_PER_BLOCK, THREADS_PER_BLOCK);
+    dim3 numBlocks((W + threadsPerBlock.x - 1) / threadsPerBlock.x, (H + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    swin_attention_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_attention_weights, d_output, B, C, H, W, window_size, shift_size);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Launch ELU activation kernel
+    elu_kernel<<<numBlocks, threadsPerBlock>>>(d_output, B, C, H, W);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Launch max pooling kernel
+    int new_H = H / 2;
+    int new_W = W / 2;
+    dim3 numBlocks_pool((new_W + threadsPerBlock.x - 1) / threadsPerBlock.x, (new_H + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    max_pooling_kernel<<<numBlocks_pool, threadsPerBlock>>>(d_output, d_output, B, C, new_H, new_W);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Copy result back to host
+    CUDA_CHECK(cudaMemcpy(output, d_output, B * C * new_H * new_W * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Free device memory
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_attention_weights));
+    CUDA_CHECK(cudaFree(d_output));
+}
+
+}  // extern "C"

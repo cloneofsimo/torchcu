@@ -1,0 +1,200 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def local_attention_prelu_flatten(input_tensor: torch.Tensor, query_weight: torch.Tensor, key_weight: torch.Tensor, value_weight: torch.Tensor, prelu_weight: torch.Tensor) -> torch.Tensor:
+    """
+    Performs local attention, PReLU activation, and flattening.
+
+    Args:
+        input_tensor: Input tensor of shape (B, S, D).
+        query_weight: Weight for query transformation of shape (D, Q).
+        key_weight: Weight for key transformation of shape (D, K).
+        value_weight: Weight for value transformation of shape (D, V).
+        prelu_weight: Weight for PReLU activation of shape (V).
+
+    Returns:
+        Flattened output tensor of shape (B, Q * V).
+    """
+    B, S, D = input_tensor.shape
+
+    # Local Attention
+    query = torch.matmul(input_tensor, query_weight)  # (B, S, Q)
+    key = torch.matmul(input_tensor, key_weight)  # (B, S, K)
+    value = torch.matmul(input_tensor, value_weight)  # (B, S, V)
+
+    attention_scores = torch.matmul(query, key.transpose(1, 2))  # (B, S, S)
+    attention_weights = F.softmax(attention_scores, dim=-1)  # (B, S, S)
+
+    context = torch.matmul(attention_weights, value)  # (B, S, V)
+
+    # PReLU Activation
+    output = F.prelu(context, prelu_weight)  # (B, S, V)
+
+    # Flatten
+    output = output.view(B, -1)  # (B, Q * V)
+
+    return output
+
+function_signature = {
+    "name": "local_attention_prelu_flatten",
+    "inputs": [
+        ((1, 16, 64), torch.float32),
+        ((64, 32), torch.float32),
+        ((64, 32), torch.float32),
+        ((64, 32), torch.float32),
+        ((32,), torch.float32)
+    ],
+    "outputs": [
+        ((1, 1024), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+#define BLOCK_SIZE 16
+
+__global__ void local_attention_kernel(const float* input_tensor, const float* query_weight, 
+                                       const float* key_weight, const float* value_weight, 
+                                       float* output, int B, int S, int D, int Q, int K, int V) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int s = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < B && s < S && d < D) {
+        // Calculate query, key, and value
+        float query_val = 0.0f;
+        float key_val = 0.0f;
+        float value_val = 0.0f;
+
+        for (int i = 0; i < D; ++i) {
+            query_val += input_tensor[b * S * D + s * D + i] * query_weight[i * Q + d];
+            key_val += input_tensor[b * S * D + s * D + i] * key_weight[i * K + d];
+            value_val += input_tensor[b * S * D + s * D + i] * value_weight[i * V + d];
+        }
+
+        // Calculate attention scores and weights
+        float attention_scores[S] = {0.0f};
+        for (int j = 0; j < S; ++j) {
+            for (int k = 0; k < K; ++k) {
+                attention_scores[j] += query_val * key_weight[k * K + d] * input_tensor[b * S * D + j * D + k];
+            }
+        }
+
+        float attention_weights[S];
+        float sum_exp = 0.0f;
+        for (int j = 0; j < S; ++j) {
+            sum_exp += expf(attention_scores[j]);
+        }
+        for (int j = 0; j < S; ++j) {
+            attention_weights[j] = expf(attention_scores[j]) / sum_exp;
+        }
+
+        // Calculate context vector
+        float context_val = 0.0f;
+        for (int j = 0; j < S; ++j) {
+            context_val += attention_weights[j] * value_val;
+        }
+
+        // Write to output tensor
+        output[b * S * V + s * V + d] = context_val;
+    }
+}
+
+__global__ void prelu_kernel(const float* input, const float* prelu_weight, float* output, int B, int S, int V) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int s = blockIdx.y * blockDim.y + threadIdx.y;
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < B && s < S && v < V) {
+        output[b * S * V + s * V + v] = input[b * S * V + s * V + v] > 0 ? input[b * S * V + s * V + v] : prelu_weight[v] * input[b * S * V + s * V + v];
+    }
+}
+
+extern "C" {
+    void local_attention_prelu_flatten(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        const float* input_tensor = va_arg(args, const float*);
+        int input_tensor_dim0 = va_arg(args, int);
+        int input_tensor_dim1 = va_arg(args, int);
+        int input_tensor_dim2 = va_arg(args, int);
+
+        const float* query_weight = va_arg(args, const float*);
+        int query_weight_dim0 = va_arg(args, int);
+        int query_weight_dim1 = va_arg(args, int);
+
+        const float* key_weight = va_arg(args, const float*);
+        int key_weight_dim0 = va_arg(args, int);
+        int key_weight_dim1 = va_arg(args, int);
+
+        const float* value_weight = va_arg(args, const float*);
+        int value_weight_dim0 = va_arg(args, int);
+        int value_weight_dim1 = va_arg(args, int);
+
+        const float* prelu_weight = va_arg(args, const float*);
+        int prelu_weight_dim0 = va_arg(args, int);
+
+        float* output = va_arg(args, float*);
+
+        va_end(args);
+
+        int B = input_tensor_dim0;
+        int S = input_tensor_dim1;
+        int D = input_tensor_dim2;
+        int Q = query_weight_dim1;
+        int K = key_weight_dim1;
+        int V = value_weight_dim1;
+
+        // Allocate device memory
+        float* d_input_tensor; cudaMalloc(&d_input_tensor, B * S * D * sizeof(float));
+        float* d_query_weight; cudaMalloc(&d_query_weight, D * Q * sizeof(float));
+        float* d_key_weight; cudaMalloc(&d_key_weight, D * K * sizeof(float));
+        float* d_value_weight; cudaMalloc(&d_value_weight, D * V * sizeof(float));
+        float* d_prelu_weight; cudaMalloc(&d_prelu_weight, V * sizeof(float));
+        float* d_output; cudaMalloc(&d_output, B * S * V * sizeof(float));
+
+        // Copy data to device
+        cudaMemcpy(d_input_tensor, input_tensor, B * S * D * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_query_weight, query_weight, D * Q * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_key_weight, key_weight, D * K * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_value_weight, value_weight, D * V * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_prelu_weight, prelu_weight, V * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Launch local attention kernel
+        dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+        dim3 numBlocks((D + BLOCK_SIZE - 1) / BLOCK_SIZE, (S + BLOCK_SIZE - 1) / BLOCK_SIZE, (B + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        local_attention_kernel<<<numBlocks, threadsPerBlock>>>(d_input_tensor, d_query_weight, d_key_weight, d_value_weight, d_output, B, S, D, Q, K, V);
+
+        // Launch prelu kernel
+        numBlocks = ((V + BLOCK_SIZE - 1) / BLOCK_SIZE, (S + BLOCK_SIZE - 1) / BLOCK_SIZE, (B + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        prelu_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_prelu_weight, d_output, B, S, V);
+
+        // Flatten and copy to host
+        for (int b = 0; b < B; ++b) {
+            for (int s = 0; s < S; ++s) {
+                for (int v = 0; v < V; ++v) {
+                    output[b * S * V + s * V + v] = d_output[b * S * V + s * V + v];
+                }
+            }
+        }
+
+        // Free device memory
+        cudaFree(d_input_tensor);
+        cudaFree(d_query_weight);
+        cudaFree(d_key_weight);
+        cudaFree(d_value_weight);
+        cudaFree(d_prelu_weight);
+        cudaFree(d_output);
+    }
+}
+```

@@ -1,0 +1,85 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// CUDA kernel for logspace calculation, einsum contraction, bias addition, and ReLU activation
+__global__ void complex_kernel(const float* input_tensor, const float* weights, const float* biases, float* output, 
+                                        int batch_size, int input_dim, int output_dim) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = threadIdx.z;
+
+    if (batch_idx < batch_size && row < input_dim && col < output_dim) {
+        float sum = 0.0f;
+        for (int k = 0; k < input_dim; ++k) {
+            sum += input_tensor[batch_idx * input_dim * output_dim + row * output_dim + col] *
+                   weights[k * output_dim + col] * pow(2, k / (float)input_dim); // logspace calculation
+        }
+        sum += biases[col]; // Bias addition
+        output[batch_idx * input_dim * output_dim + row * output_dim + col] = fmaxf(sum, 0.0f); // ReLU activation
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+    int weights_dim1 = va_arg(args, int);
+
+    // Extract biases tensor
+    const float* biases = va_arg(args, const float*);
+    int biases_dim0 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weights_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_biases, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * output_dim * sizeof(float));
+    cudaMalloc(&d_weights, weights_dim0 * weights_dim1 * sizeof(float));
+    cudaMalloc(&d_biases, biases_dim0 * sizeof(float));
+    cudaMalloc(&d_output, batch_size * input_dim * output_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * output_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, weights_dim0 * weights_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_biases, biases, biases_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16, 16); // Block size, for fast calculations
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (input_dim + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                   (output_dim + threadsPerBlock.z - 1) / threadsPerBlock.z); // Number of blocks for efficient memory access
+
+    complex_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weights, d_biases, d_output,
+                                                    batch_size, input_dim, output_dim);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_dim * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_biases);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

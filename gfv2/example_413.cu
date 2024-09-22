@@ -1,0 +1,77 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+extern "C" {
+
+__global__ void my_function_kernel(const float* input_tensor, const float* weight, const float* bias, 
+                                    float* output, int m, int k, float l2_reg) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < k) {
+        float sum = 0.0f;
+        for (int i = 0; i < m; ++i) {
+            sum += input_tensor[i] * weight[col * m + i];
+        }
+        output[row * k + col] = fmaxf(sum + bias[col], 0.0f);  // ReLU activation
+    }
+}
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract l2_reg
+    float l2_reg = va_arg(args, double); 
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output;
+    cudaMalloc(&d_input, input_tensor_dim0 * sizeof(float));
+    cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * sizeof(float));
+    cudaMalloc(&d_bias, bias_dim0 * sizeof(float));
+    cudaMalloc(&d_output, weight_dim0 * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, bias_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((weight_dim0 + threadsPerBlock.x - 1) / threadsPerBlock.x, 1);
+
+    my_function_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output, input_tensor_dim0, weight_dim0, l2_reg
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, weight_dim0 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

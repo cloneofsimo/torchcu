@@ -1,0 +1,75 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for PReLU using bfloat16
+__global__ void prelu_kernel_bf16(const float* input_tensor, const float* weight, float* output, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < N) {
+        __nv_bfloat16 input_bf16 = float_to_bfloat16(input_tensor[i]);
+        __nv_bfloat16 weight_bf16 = float_to_bfloat16(weight[0]); // Assuming weight is a scalar
+
+        output[i] = bfloat16_to_float(
+            (input_bf16 > 0) ? input_bf16 : __hmul(input_bf16, weight_bf16)
+        );
+    }
+}
+
+extern "C" {
+
+void prelu_bfloat16_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int); // Input size
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int); // Weight size
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, input_tensor_dim0 * sizeof(float));
+    cudaMalloc(&d_weight, weight_dim0 * sizeof(float));
+    cudaMalloc(&d_output, input_tensor_dim0 * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, weight_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int threadsPerBlock = 256;
+    int numBlocks = (input_tensor_dim0 + threadsPerBlock - 1) / threadsPerBlock;
+
+    prelu_kernel_bf16<<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_output, input_tensor_dim0);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, input_tensor_dim0 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

@@ -1,0 +1,132 @@
+```python
+import torch
+
+def my_complex_function(input_tensor: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on the input tensor:
+    1. Matrix multiplication with weight1
+    2. ReLU activation
+    3. Matrix multiplication with weight2
+    4. Add bias
+    5. Apply sigmoid activation
+    
+    Returns the resulting tensor.
+    """
+    output = torch.matmul(input_tensor, weight1.t())
+    output = torch.relu(output)
+    output = torch.matmul(output, weight2.t())
+    output = output + bias
+    output = torch.sigmoid(output)
+    return output
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4,), torch.float32),
+    ],
+    "outputs": [
+        ((4, 4), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// CUDA kernel for the complex function
+__global__ void complex_function_kernel(const float* input_tensor, const float* weight1, const float* weight2, const float* bias, 
+                                        float* output, int m, int n1, int n2, int k1, int k2) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n2) {
+        float sum1 = 0.0f;
+        for (int i = 0; i < k1; ++i) {
+            sum1 += input_tensor[row * k1 + i] * weight1[col * k1 + i];
+        }
+        float relu_output = fmaxf(sum1, 0.0f);
+
+        float sum2 = 0.0f;
+        for (int i = 0; i < k2; ++i) {
+            sum2 += relu_output * weight2[col * k2 + i];
+        }
+
+        output[row * n2 + col] = 1.0f / (1.0f + expf(-(sum2 + bias[col])));
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight1 tensor
+    const float* weight1 = va_arg(args, const float*);
+    int weight1_dim0 = va_arg(args, int);
+    int weight1_dim1 = va_arg(args, int);
+
+    // Extract weight2 tensor
+    const float* weight2 = va_arg(args, const float*);
+    int weight2_dim0 = va_arg(args, int);
+    int weight2_dim1 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weight2_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weight1, *d_weight2, *d_bias, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight1, weight1_dim0 * weight1_dim1 * sizeof(float));
+    cudaMalloc(&d_weight2, weight2_dim0 * weight2_dim1 * sizeof(float));
+    cudaMalloc(&d_bias, bias_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight1, weight1, weight1_dim0 * weight1_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight2, weight2, weight2_dim0 * weight2_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, bias_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    complex_function_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight1, d_weight2, d_bias, d_output, batch_size, input_dim, output_dim, weight1_dim1, weight2_dim1
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight1);
+    cudaFree(d_weight2);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

@@ -1,0 +1,220 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def complex_function(input_tensor: torch.Tensor, weights: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a transposed convolution, applies softmax, calculates NLL loss, 
+    samples from the probability distribution, and returns the sampled index.
+    """
+    # Transposed convolution
+    output = F.conv_transpose1d(input_tensor.unsqueeze(1), weights, bias=bias, stride=2)
+    output = output.squeeze(1)
+
+    # Softmax
+    output = F.softmax(output, dim=1)
+
+    # NLL Loss (assuming target is a 1D tensor of class indices)
+    target = torch.randint(0, output.shape[1], (input_tensor.shape[0],))  # Example target
+    loss = F.nll_loss(torch.log(output), target) 
+
+    # Sample from the distribution
+    sampled_indices = torch.multinomial(output, num_samples=1)
+
+    return sampled_indices.squeeze(1)
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4, 4), torch.float32),
+        ((4,), torch.float32)
+    ],
+    "outputs": [
+        ((4,), torch.int64),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for transposed convolution (adapted from PyTorch source)
+__device__ inline float __ldg(const float* ptr) { return *ptr; }
+__device__ inline float __ldcg(const float* ptr) { return *ptr; }
+
+template <typename T>
+__device__ inline T __ldg_shared(const T* ptr) { return *ptr; }
+
+// CUDA kernel for transposed convolution
+template<int stride, int dilation>
+__global__ void transposed_conv1d_kernel(const float* input, const float* weight, const float* bias, 
+                                         float* output, const int batch, const int input_channels, 
+                                         const int input_length, const int output_channels, 
+                                         const int output_length, const int kernel_size) {
+    const int output_channel = blockIdx.x * blockDim.x + threadIdx.x;
+    const int output_index = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (output_channel < output_channels && output_index < output_length) {
+        float sum = 0.0f;
+        for (int input_channel = 0; input_channel < input_channels; ++input_channel) {
+            for (int k = 0; k < kernel_size; ++k) {
+                const int input_index = output_index * stride + k - (kernel_size - 1) * dilation;
+
+                if (input_index >= 0 && input_index < input_length) {
+                    sum += __ldcg(input + (batch * input_channels * input_length + input_channel * input_length + input_index)) 
+                        * __ldcg(weight + (output_channel * input_channels * kernel_size + input_channel * kernel_size + k));
+                }
+            }
+        }
+
+        output[output_channel * output_length + output_index] = sum + __ldcg(bias + output_channel);
+    }
+}
+
+// CUDA kernel for softmax
+__global__ void softmax_kernel(float* data, int batch_size, int num_classes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size * num_classes) {
+        int batch = idx / num_classes;
+        int class_idx = idx % num_classes;
+
+        float max_val = data[batch * num_classes + class_idx];
+        for (int i = 0; i < num_classes; ++i) {
+            max_val = max(max_val, data[batch * num_classes + i]);
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < num_classes; ++i) {
+            sum += expf(data[batch * num_classes + i] - max_val);
+        }
+
+        data[batch * num_classes + class_idx] = expf(data[batch * num_classes + class_idx] - max_val) / sum;
+    }
+}
+
+// CUDA kernel for multinomial sampling
+__global__ void multinomial_kernel(float* prob_dist, int* samples, int batch_size, int num_classes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < num_classes; ++i) {
+            sum += prob_dist[idx * num_classes + i];
+        }
+
+        float rand_val = sum * __ldg(samples + idx); // Assuming samples are pre-populated with random values
+
+        int selected_class = 0;
+        sum = 0.0f;
+        while (selected_class < num_classes && sum < rand_val) {
+            sum += prob_dist[idx * num_classes + selected_class];
+            selected_class++;
+        }
+
+        samples[idx] = selected_class - 1;
+    }
+}
+
+// CUDA kernel for NLL loss
+__global__ void nll_loss_kernel(const float* log_probs, const int* targets, float* loss, int batch_size, int num_classes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size) {
+        loss[0] += -log_probs[idx * num_classes + targets[idx]];
+    }
+}
+
+extern "C" {
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    int* output = va_arg(args, int*);
+
+    va_end(args);
+
+    const int batch_size = input_dim0;
+    const int input_channels = 1;
+    const int input_length = input_dim1;
+    const int output_channels = weight_dim0;
+    const int kernel_size = weight_dim2;
+    const int output_length = (input_length - kernel_size + 1) / 2 + 1; // Assuming stride=2
+    const int num_classes = output_channels;
+
+    // Allocate device memory
+    float* d_input;
+    float* d_weight;
+    float* d_bias;
+    float* d_output;
+    float* d_log_probs;
+    int* d_samples;
+    float* d_loss;
+
+    cudaMalloc(&d_input, batch_size * input_channels * input_length * sizeof(float));
+    cudaMalloc(&d_weight, output_channels * input_channels * kernel_size * sizeof(float));
+    cudaMalloc(&d_bias, output_channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_channels * output_length * sizeof(float));
+    cudaMalloc(&d_log_probs, batch_size * output_channels * sizeof(float));
+    cudaMalloc(&d_samples, batch_size * sizeof(int));
+    cudaMalloc(&d_loss, sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * input_channels * input_length * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_channels * input_channels * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, output_channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Perform transposed convolution
+    dim3 threadsPerBlock(32, 1);
+    dim3 numBlocks((output_channels + threadsPerBlock.x - 1) / threadsPerBlock.x, (output_length + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    transposed_conv1d_kernel<2, 1><<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_bias, d_output, batch_size, input_channels, 
+                                                        input_length, output_channels, output_length, kernel_size);
+
+    // Apply softmax
+    threadsPerBlock = dim3(256, 1);
+    numBlocks = dim3((batch_size * output_channels + threadsPerBlock.x - 1) / threadsPerBlock.x, 1);
+    softmax_kernel<<<numBlocks, threadsPerBlock>>>(d_output, batch_size, output_channels);
+
+    // Calculate NLL loss
+    threadsPerBlock = dim3(256, 1);
+    numBlocks = dim3((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, 1);
+    nll_loss_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_samples, d_loss, batch_size, output_channels); 
+
+    // Sample from the distribution (requires pre-populated random values in d_samples)
+    threadsPerBlock = dim3(256, 1);
+    numBlocks = dim3((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, 1);
+    multinomial_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_samples, batch_size, output_channels);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_samples, batch_size * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+    cudaFree(d_log_probs);
+    cudaFree(d_samples);
+    cudaFree(d_loss);
+}
+}
+```

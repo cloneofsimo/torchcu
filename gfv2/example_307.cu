@@ -1,0 +1,71 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// CUDA kernel for 2D max pooling with kernel size 2 and stride 2
+__global__ void max_pool2d_kernel(const float* input, float* output, int batch, int channels, 
+                                 int height, int width) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = blockIdx.z;
+
+    if (row < height / 2 && col < width / 2 && b < batch) {
+        int idx = (b * channels * height * width) + (row * width) + col;
+        int idx00 = idx;
+        int idx01 = idx + width;
+        int idx10 = idx + height * width;
+        int idx11 = idx + height * width + width;
+
+        float max_val = input[idx00];
+        max_val = fmaxf(max_val, input[idx01]);
+        max_val = fmaxf(max_val, input[idx10]);
+        max_val = fmaxf(max_val, input[idx11]);
+
+        output[(b * channels * (height / 2) * (width / 2)) + (row * (width / 2)) + col] = max_val;
+    }
+}
+
+extern "C" {
+
+void max_pool_fp32_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int batch = va_arg(args, int);
+    int channels = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, batch * channels * height * width * sizeof(float));
+    cudaMalloc(&d_output, batch * channels * (height / 2) * (width / 2) * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((width / 2 + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (height / 2 + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   batch);
+
+    max_pool2d_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, batch, channels, height, width);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch * channels * (height / 2) * (width / 2) * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

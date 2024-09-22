@@ -1,0 +1,346 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def global_attention_margin_loss(query_tensor: torch.Tensor, key_tensor: torch.Tensor, positive_tensor: torch.Tensor, negative_tensor: torch.Tensor, margin: float = 1.0) -> torch.Tensor:
+    """
+    Calculates a margin ranking loss based on global attention scores.
+
+    Args:
+        query_tensor: Query tensor of shape (batch_size, query_dim).
+        key_tensor: Key tensor of shape (batch_size, key_dim).
+        positive_tensor: Positive tensor of shape (batch_size, key_dim).
+        negative_tensor: Negative tensor of shape (batch_size, key_dim).
+        margin: Margin value for the ranking loss.
+
+    Returns:
+        A tensor of shape (batch_size,) containing the margin ranking loss for each sample.
+    """
+    batch_size = query_tensor.size(0)
+
+    # Calculate attention scores
+    query_key_scores = torch.matmul(query_tensor, key_tensor.t())
+    query_positive_scores = torch.matmul(query_tensor, positive_tensor.t())
+    query_negative_scores = torch.matmul(query_tensor, negative_tensor.t())
+
+    # Apply softmax to normalize scores
+    query_key_scores = F.softmax(query_key_scores, dim=1)
+    query_positive_scores = F.softmax(query_positive_scores, dim=1)
+    query_negative_scores = F.softmax(query_negative_scores, dim=1)
+
+    # Calculate margin ranking loss
+    loss = torch.max(torch.zeros(batch_size, device=query_tensor.device),
+                     margin + query_negative_scores.diag() - query_positive_scores.diag())
+
+    return loss
+
+
+function_signature = {
+    "name": "global_attention_margin_loss",
+    "inputs": [
+        ((1, 10), torch.float32),
+        ((1, 10), torch.float32),
+        ((1, 10), torch.float32),
+        ((1, 10), torch.float32),
+    ],
+    "outputs": [
+        ((1,), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversion
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Kernel for calculating attention scores
+__global__ void calculate_attention_scores(const float* query, const float* key,
+                                            __nv_bfloat16* scores, int batch_size, int query_dim, int key_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < batch_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < query_dim; ++i) {
+            sum += query[row * query_dim + i] * key[col * key_dim + i];
+        }
+        scores[row * batch_size + col] = float_to_bfloat16(sum);
+    }
+}
+
+// Kernel for softmax normalization
+__global__ void softmax_normalization(const __nv_bfloat16* scores, __nv_bfloat16* output, int batch_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < batch_size) {
+        __nv_bfloat16 sum = 0.0f;
+        for (int i = 0; i < batch_size; ++i) {
+            sum += __expf(scores[row * batch_size + i]);
+        }
+        output[row * batch_size + col] = __expf(scores[row * batch_size + col]) / sum;
+    }
+}
+
+// Kernel for calculating margin ranking loss
+__global__ void margin_ranking_loss_kernel(const __nv_bfloat16* query_key_scores, 
+                                            const __nv_bfloat16* query_positive_scores,
+                                            const __nv_bfloat16* query_negative_scores,
+                                            float* loss, int batch_size, float margin) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < batch_size) {
+        float negative_score = bfloat16_to_float(query_negative_scores[i * batch_size + i]);
+        float positive_score = bfloat16_to_float(query_positive_scores[i * batch_size + i]);
+        loss[i] = fmaxf(0.0f, margin + negative_score - positive_score);
+    }
+}
+
+extern "C" {
+
+void global_attention_margin_loss(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+
+    const float* positive = va_arg(args, const float*);
+    int positive_dim0 = va_arg(args, int);
+    int positive_dim1 = va_arg(args, int);
+
+    const float* negative = va_arg(args, const float*);
+    int negative_dim0 = va_arg(args, int);
+    int negative_dim1 = va_arg(args, int);
+
+    // Extract margin
+    float margin = va_arg(args, double);
+
+    // Extract output tensor (assuming preallocated)
+    float* loss = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = query_dim0;
+    int query_dim = query_dim1;
+    int key_dim = key_dim1;
+
+    // Allocate device memory
+    __nv_bfloat16* d_query_key_scores;
+    __nv_bfloat16* d_query_positive_scores;
+    __nv_bfloat16* d_query_negative_scores;
+    __nv_bfloat16* d_query_key_scores_softmax;
+    __nv_bfloat16* d_query_positive_scores_softmax;
+    __nv_bfloat16* d_query_negative_scores_softmax;
+    float* d_loss;
+
+    cudaMalloc(&d_query_key_scores, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_positive_scores, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_negative_scores, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_key_scores_softmax, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_positive_scores_softmax, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_negative_scores_softmax, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_loss, batch_size * sizeof(float));
+
+    // Calculate attention scores on the device
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    calculate_attention_scores<<<numBlocks, threadsPerBlock>>>(query, key,
+                                                    d_query_key_scores, batch_size, query_dim, key_dim);
+    calculate_attention_scores<<<numBlocks, threadsPerBlock>>>(query, positive,
+                                                    d_query_positive_scores, batch_size, query_dim, key_dim);
+    calculate_attention_scores<<<numBlocks, threadsPerBlock>>>(query, negative,
+                                                    d_query_negative_scores, batch_size, query_dim, key_dim);
+
+    // Apply softmax normalization
+    softmax_normalization<<<numBlocks, threadsPerBlock>>>(d_query_key_scores, d_query_key_scores_softmax, batch_size);
+    softmax_normalization<<<numBlocks, threadsPerBlock>>>(d_query_positive_scores, d_query_positive_scores_softmax, batch_size);
+    softmax_normalization<<<numBlocks, threadsPerBlock>>>(d_query_negative_scores, d_query_negative_scores_softmax, batch_size);
+
+    // Calculate margin ranking loss
+    margin_ranking_loss_kernel<<<(batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, threadsPerBlock>>>(
+        d_query_key_scores_softmax, d_query_positive_scores_softmax, d_query_negative_scores_softmax,
+        d_loss, batch_size, margin
+    );
+
+    // Copy loss back to host
+    cudaMemcpy(loss, d_loss, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_query_key_scores);
+    cudaFree(d_query_positive_scores);
+    cudaFree(d_query_negative_scores);
+    cudaFree(d_query_key_scores_softmax);
+    cudaFree(d_query_positive_scores_softmax);
+    cudaFree(d_query_negative_scores_softmax);
+    cudaFree(d_loss);
+}
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversion
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Kernel for calculating attention scores
+__global__ void calculate_attention_scores(const float* query, const float* key,
+                                            __nv_bfloat16* scores, int batch_size, int query_dim, int key_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < batch_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < query_dim; ++i) {
+            sum += query[row * query_dim + i] * key[col * key_dim + i];
+        }
+        scores[row * batch_size + col] = float_to_bfloat16(sum);
+    }
+}
+
+// Kernel for softmax normalization
+__global__ void softmax_normalization(const __nv_bfloat16* scores, __nv_bfloat16* output, int batch_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < batch_size) {
+        __nv_bfloat16 sum = 0.0f;
+        for (int i = 0; i < batch_size; ++i) {
+            sum += __expf(scores[row * batch_size + i]);
+        }
+        output[row * batch_size + col] = __expf(scores[row * batch_size + col]) / sum;
+    }
+}
+
+// Kernel for calculating margin ranking loss
+__global__ void margin_ranking_loss_kernel(const __nv_bfloat16* query_key_scores, 
+                                            const __nv_bfloat16* query_positive_scores,
+                                            const __nv_bfloat16* query_negative_scores,
+                                            float* loss, int batch_size, float margin) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < batch_size) {
+        float negative_score = bfloat16_to_float(query_negative_scores[i * batch_size + i]);
+        float positive_score = bfloat16_to_float(query_positive_scores[i * batch_size + i]);
+        loss[i] = fmaxf(0.0f, margin + negative_score - positive_score);
+    }
+}
+
+extern "C" {
+
+void global_attention_margin_loss(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+
+    const float* positive = va_arg(args, const float*);
+    int positive_dim0 = va_arg(args, int);
+    int positive_dim1 = va_arg(args, int);
+
+    const float* negative = va_arg(args, const float*);
+    int negative_dim0 = va_arg(args, int);
+    int negative_dim1 = va_arg(args, int);
+
+    // Extract margin
+    float margin = va_arg(args, double);
+
+    // Extract output tensor (assuming preallocated)
+    float* loss = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = query_dim0;
+    int query_dim = query_dim1;
+    int key_dim = key_dim1;
+
+    // Allocate device memory
+    __nv_bfloat16* d_query_key_scores;
+    __nv_bfloat16* d_query_positive_scores;
+    __nv_bfloat16* d_query_negative_scores;
+    __nv_bfloat16* d_query_key_scores_softmax;
+    __nv_bfloat16* d_query_positive_scores_softmax;
+    __nv_bfloat16* d_query_negative_scores_softmax;
+    float* d_loss;
+
+    cudaMalloc(&d_query_key_scores, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_positive_scores, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_negative_scores, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_key_scores_softmax, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_positive_scores_softmax, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_query_negative_scores_softmax, batch_size * batch_size * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_loss, batch_size * sizeof(float));
+
+    // Calculate attention scores on the device
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    calculate_attention_scores<<<numBlocks, threadsPerBlock>>>(query, key,
+                                                    d_query_key_scores, batch_size, query_dim, key_dim);
+    calculate_attention_scores<<<numBlocks, threadsPerBlock>>>(query, positive,
+                                                    d_query_positive_scores, batch_size, query_dim, key_dim);
+    calculate_attention_scores<<<numBlocks, threadsPerBlock>>>(query, negative,
+                                                    d_query_negative_scores, batch_size, query_dim, key_dim);
+
+    // Apply softmax normalization
+    softmax_normalization<<<numBlocks, threadsPerBlock>>>(d_query_key_scores, d_query_key_scores_softmax, batch_size);
+    softmax_normalization<<<numBlocks, threadsPerBlock>>>(d_query_positive_scores, d_query_positive_scores_softmax, batch_size);
+    softmax_normalization<<<numBlocks, threadsPerBlock>>>(d_query_negative_scores, d_query_negative_scores_softmax, batch_size);
+
+    // Calculate margin ranking loss
+    margin_ranking_loss_kernel<<<(batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, threadsPerBlock>>>(
+        d_query_key_scores_softmax, d_query_positive_scores_softmax, d_query_negative_scores_softmax,
+        d_loss, batch_size, margin
+    );
+
+    // Copy loss back to host
+    cudaMemcpy(loss, d_loss, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_query_key_scores);
+    cudaFree(d_query_positive_scores);
+    cudaFree(d_query_negative_scores);
+    cudaFree(d_query_key_scores_softmax);
+    cudaFree(d_query_positive_scores_softmax);
+    cudaFree(d_query_negative_scores_softmax);
+    cudaFree(d_loss);
+}
+}  // extern "C"
+```

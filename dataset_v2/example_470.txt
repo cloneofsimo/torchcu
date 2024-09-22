@@ -1,0 +1,111 @@
+## func.py
+
+```python
+import torch
+import numpy as np
+
+def my_complex_function(input_tensor: torch.Tensor, scaling_factor: float, decay_rate: float) -> torch.Tensor:
+    """
+    Performs a series of operations on the input tensor:
+    1. Creates an identity matrix with the same size as the input tensor.
+    2. Scales the identity matrix by the scaling factor.
+    3. Applies an element-wise decay to the scaled identity matrix based on the decay rate.
+    4. Adds the decayed identity matrix to the input tensor.
+    5. Applies a sigmoid activation to the result.
+    6. Returns the final output tensor.
+    """
+    # Create identity matrix
+    identity_matrix = torch.eye(input_tensor.shape[0], dtype=torch.float32)
+
+    # Scale identity matrix
+    scaled_identity = identity_matrix * scaling_factor
+
+    # Apply decay
+    decayed_identity = scaled_identity * torch.pow(decay_rate, torch.arange(input_tensor.shape[0], dtype=torch.float32))
+
+    # Add to input tensor
+    output = input_tensor + decayed_identity
+
+    # Apply sigmoid activation
+    output = torch.sigmoid(output)
+
+    return output
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((1, 1), torch.float32),  # Example input shape, can be any size with at least 1 dimension
+        (None, torch.float32),  # Scaling factor
+        (None, torch.float32)   # Decay rate
+    ],
+    "outputs": [
+        ((1, 1), torch.float32)  # Example output shape, can be any size with at least 1 dimension
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+extern "C" {
+
+__global__ void my_complex_function_kernel(const float* input_tensor, const float* output, float scaling_factor, float decay_rate, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float decayed_value = scaling_factor * powf(decay_rate, (float)idx);
+        output[idx] = input_tensor[idx] + decayed_value;
+        output[idx] = 1.0f / (1.0f + expf(-output[idx]));  // Sigmoid activation
+    }
+}
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    
+    // Extract scaling factor
+    float scaling_factor = (float)va_arg(args, double); 
+    
+    // Extract decay rate
+    float decay_rate = (float)va_arg(args, double);
+    
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int size = input_tensor_dim0 * input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, size * sizeof(float));
+    cudaMalloc(&d_output, size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256); 
+    dim3 numBlocks((size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    my_complex_function_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, scaling_factor, decay_rate, size);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

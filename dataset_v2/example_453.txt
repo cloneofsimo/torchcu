@@ -1,0 +1,193 @@
+## func.py
+
+```python
+import torch
+
+def my_complex_function(input_tensor: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations:
+    1. Layer normalization
+    2. Matrix multiplication with weights
+    3. Top-k selection (k=2)
+    4. Returns the top-k values in bfloat16 precision
+    """
+    # Layer normalization
+    normalized_tensor = torch.nn.functional.layer_norm(input_tensor, input_tensor.shape[1:])
+
+    # Matrix multiplication
+    output = torch.matmul(normalized_tensor, weights.t())
+
+    # Top-k selection
+    top_k_values, _ = torch.topk(output, 2, dim=1)
+
+    # Convert to bfloat16
+    top_k_bf16 = top_k_values.to(torch.bfloat16)
+
+    return top_k_bf16
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32)
+    ],
+    "outputs": [
+        ((4, 2), torch.bfloat16),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversion
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Shared memory for layer normalization
+__shared__ float shared_data[1024];
+
+// CUDA kernel for layer normalization
+__global__ void layer_norm_kernel(const float* input, float* output, int batch_size, int features) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < features) {
+        float sum = 0.0f;
+        for (int i = 0; i < features; i++) {
+            sum += input[row * features + i];
+        }
+
+        float mean = sum / features;
+
+        float sum_sq = 0.0f;
+        for (int i = 0; i < features; i++) {
+            sum_sq += (input[row * features + i] - mean) * (input[row * features + i] - mean);
+        }
+
+        float stddev = sqrtf(sum_sq / features);
+
+        output[row * features + col] = (input[row * features + col] - mean) / stddev;
+    }
+}
+
+// CUDA kernel for matrix multiplication
+__global__ void matmul_kernel(const float* input, const float* weight, float* output,
+                                int batch_size, int input_dim, int output_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < output_dim) {
+        float sum = 0.0f;
+        for (int i = 0; i < input_dim; i++) {
+            sum += input[row * input_dim + i] * weight[col * input_dim + i];
+        }
+        output[row * output_dim + col] = sum;
+    }
+}
+
+// CUDA kernel for top-k selection
+__global__ void topk_kernel(const float* input, __nv_bfloat16* output, int batch_size, int output_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < 2) {
+        int idx = col;
+        float max1 = input[row * output_dim];
+        float max2 = input[row * output_dim + 1];
+
+        if (max1 < max2) {
+            max1 = max2;
+            idx = 1;
+        }
+
+        for (int i = 2; i < output_dim; i++) {
+            if (input[row * output_dim + i] > max1) {
+                max2 = max1;
+                max1 = input[row * output_dim + i];
+                idx = i;
+            } else if (input[row * output_dim + i] > max2) {
+                max2 = input[row * output_dim + i];
+            }
+        }
+
+        output[row * 2 + col] = float_to_bfloat16(col == 0 ? max1 : max2);
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+
+    const float* weights = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int input_features = input_dim1;
+    int output_features = weight_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_normalized, *d_matmul_output;
+    cudaMalloc(&d_input, batch_size * input_features * sizeof(float));
+    cudaMalloc(&d_weights, output_features * input_features * sizeof(float));
+    cudaMalloc(&d_normalized, batch_size * input_features * sizeof(float));
+    cudaMalloc(&d_matmul_output, batch_size * output_features * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * input_features * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, output_features * input_features * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Layer normalization
+    dim3 threadsPerBlockLN(16, 16);
+    dim3 numBlocksLN((input_features + threadsPerBlockLN.x - 1) / threadsPerBlockLN.x,
+                    (batch_size + threadsPerBlockLN.y - 1) / threadsPerBlockLN.y);
+
+    layer_norm_kernel<<<numBlocksLN, threadsPerBlockLN>>>(d_input, d_normalized, batch_size, input_features);
+
+    // Matrix multiplication
+    dim3 threadsPerBlockMM(16, 16);
+    dim3 numBlocksMM((output_features + threadsPerBlockMM.x - 1) / threadsPerBlockMM.x,
+                    (batch_size + threadsPerBlockMM.y - 1) / threadsPerBlockMM.y);
+
+    matmul_kernel<<<numBlocksMM, threadsPerBlockMM>>>(d_normalized, d_weights, d_matmul_output,
+                                                        batch_size, input_features, output_features);
+
+    // Top-k selection
+    dim3 threadsPerBlockTK(16, 2);
+    dim3 numBlocksTK((output_features + threadsPerBlockTK.x - 1) / threadsPerBlockTK.x,
+                    (batch_size + threadsPerBlockTK.y - 1) / threadsPerBlockTK.y);
+
+    topk_kernel<<<numBlocksTK, threadsPerBlockTK>>>(d_matmul_output, output, batch_size, output_features);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_normalized);
+    cudaFree(d_matmul_output);
+}
+
+}
+```

@@ -1,0 +1,58 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// CUDA kernel for creating a tensor filled with ones in bfloat16
+__global__ void ones_bf16_kernel(float* input_tensor, __nv_bfloat16* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        output[idx] = float_to_bfloat16(1.0f);
+    }
+}
+
+extern "C" {
+
+void ones_bfloat16_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+    va_end(args);
+
+    int size = input_tensor_dim0 * input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input;
+    cudaMalloc(&d_input, size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    ones_bf16_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, output, size
+    );
+
+    // Free device memory
+    cudaFree(d_input);
+}
+
+} // extern "C"

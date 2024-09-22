@@ -1,0 +1,353 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def my_conv3d_function(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a 3D convolution with ReLU activation and returns the result in bfloat16.
+    """
+    output = F.conv3d(input_tensor.to(torch.bfloat16), weight.to(torch.bfloat16), bias.to(torch.bfloat16))
+    output = F.relu(output).to(torch.bfloat16)
+    return output
+
+function_signature = {
+    "name": "my_conv3d_function",
+    "inputs": [
+        ((1, 16, 3, 3, 3), torch.float32),  # Example input shape (batch, channels, D, H, W)
+        ((8, 16, 3, 3, 3), torch.float32),  # Example weight shape (out_channels, in_channels, kernel_D, kernel_H, kernel_W)
+        ((8,), torch.float32)  # Example bias shape (out_channels)
+    ],
+    "outputs": [
+        ((1, 8, 1, 1, 1), torch.bfloat16),  # Example output shape
+    ]
+}
+
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper functions for bfloat16 conversion
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for 3D convolution with ReLU using bfloat16
+__global__ void conv3d_relu_kernel_bf16(const float* input_tensor, const float* weight, const float* bias, __nv_bfloat16* output,
+                                        int batch_size, int in_channels, int out_channels, int input_D, int input_H, int input_W,
+                                        int kernel_D, int kernel_H, int kernel_W, int padding_D, int padding_H, int padding_W,
+                                        int stride_D, int stride_H, int stride_W) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int out_channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int output_D = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Calculate output dimensions
+    int output_H = (input_H + 2 * padding_H - kernel_H) / stride_H + 1;
+    int output_W = (input_W + 2 * padding_W - kernel_W) / stride_W + 1;
+
+    // Check bounds
+    if (batch_idx < batch_size && out_channel_idx < out_channels && output_D < output_D) {
+        int output_h = (threadIdx.y * stride_H) - padding_H;
+        int output_w = (threadIdx.x * stride_W) - padding_W;
+
+        __nv_bfloat16 sum = float_to_bfloat16(0.0f);
+        for (int in_channel_idx = 0; in_channel_idx < in_channels; ++in_channel_idx) {
+            for (int kernel_d = 0; kernel_d < kernel_D; ++kernel_d) {
+                for (int kernel_h = 0; kernel_h < kernel_H; ++kernel_h) {
+                    for (int kernel_w = 0; kernel_w < kernel_W; ++kernel_w) {
+                        int input_d = output_D * stride_D + kernel_d - padding_D;
+                        int input_h = output_h + kernel_h;
+                        int input_w = output_w + kernel_w;
+
+                        if (input_d >= 0 && input_d < input_D && input_h >= 0 && input_h < input_H && input_w >= 0 && input_w < input_W) {
+                            int input_idx = batch_idx * in_channels * input_D * input_H * input_W + in_channel_idx * input_D * input_H * input_W +
+                                            input_d * input_H * input_W + input_h * input_W + input_w;
+                            int weight_idx = out_channel_idx * in_channels * kernel_D * kernel_H * kernel_W + in_channel_idx * kernel_D * kernel_H * kernel_W +
+                                            kernel_d * kernel_H * kernel_W + kernel_h * kernel_W + kernel_w;
+                            
+                            sum += __hmul(float_to_bfloat16(input_tensor[input_idx]), float_to_bfloat16(weight[weight_idx]));
+                        }
+                    }
+                }
+            }
+        }
+
+        sum = __hadd(sum, float_to_bfloat16(bias[out_channel_idx])); // Add bias
+        sum = __hmax(sum, float_to_bfloat16(0.0f)); // ReLU activation
+        
+        output[batch_idx * out_channels * output_D * output_H * output_W + out_channel_idx * output_D * output_H * output_W + 
+               output_D * output_H * output_W + output_h * output_W + output_w] = sum;
+    }
+}
+
+extern "C" {
+
+void my_conv3d_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+    int input_tensor_dim4 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+    int weight_dim3 = va_arg(args, int);
+    int weight_dim4 = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract output tensor
+    __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int in_channels = input_tensor_dim1;
+    int out_channels = weight_dim0;
+
+    int input_D = input_tensor_dim2;
+    int input_H = input_tensor_dim3;
+    int input_W = input_tensor_dim4;
+
+    int kernel_D = weight_dim2;
+    int kernel_H = weight_dim3;
+    int kernel_W = weight_dim4;
+
+    // Assume default padding and stride
+    int padding_D = 1;
+    int padding_H = 1;
+    int padding_W = 1;
+
+    int stride_D = 1;
+    int stride_H = 1;
+    int stride_W = 1;
+
+    // Calculate output dimensions
+    int output_D = (input_D + 2 * padding_D - kernel_D) / stride_D + 1;
+    int output_H = (input_H + 2 * padding_H - kernel_H) / stride_H + 1;
+    int output_W = (input_W + 2 * padding_W - kernel_W) / stride_W + 1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias;
+    __nv_bfloat16 *d_output;
+    cudaMalloc(&d_input, batch_size * in_channels * input_D * input_H * input_W * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * in_channels * kernel_D * kernel_H * kernel_W * sizeof(float));
+    cudaMalloc(&d_bias, bias_dim0 * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * output_D * output_H * output_W * sizeof(__nv_bfloat16));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * input_D * input_H * input_W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, out_channels * in_channels * kernel_D * kernel_H * kernel_W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, bias_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((output_D + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    conv3d_relu_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output, 
+        batch_size, in_channels, out_channels, 
+        input_D, input_H, input_W, 
+        kernel_D, kernel_H, kernel_W, 
+        padding_D, padding_H, padding_W, 
+        stride_D, stride_H, stride_W
+    );
+
+    // Copy result back to host (cast to float)
+    float* output_float = new float[batch_size * out_channels * output_D * output_H * output_W];
+    for (int i = 0; i < batch_size * out_channels * output_D * output_H * output_W; ++i) {
+        output_float[i] = bfloat16_to_float(d_output[i]);
+    }
+    cudaMemcpy(output, output_float, batch_size * out_channels * output_D * output_H * output_W * sizeof(float), cudaMemcpyDeviceToHost);
+    delete[] output_float;
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper functions for bfloat16 conversion
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for 3D convolution with ReLU using bfloat16
+__global__ void conv3d_relu_kernel_bf16(const float* input_tensor, const float* weight, const float* bias, __nv_bfloat16* output,
+                                        int batch_size, int in_channels, int out_channels, int input_D, int input_H, int input_W,
+                                        int kernel_D, int kernel_H, int kernel_W, int padding_D, int padding_H, int padding_W,
+                                        int stride_D, int stride_H, int stride_W) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int out_channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int output_D = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Calculate output dimensions
+    int output_H = (input_H + 2 * padding_H - kernel_H) / stride_H + 1;
+    int output_W = (input_W + 2 * padding_W - kernel_W) / stride_W + 1;
+
+    // Check bounds
+    if (batch_idx < batch_size && out_channel_idx < out_channels && output_D < output_D) {
+        int output_h = (threadIdx.y * stride_H) - padding_H;
+        int output_w = (threadIdx.x * stride_W) - padding_W;
+
+        __nv_bfloat16 sum = float_to_bfloat16(0.0f);
+        for (int in_channel_idx = 0; in_channel_idx < in_channels; ++in_channel_idx) {
+            for (int kernel_d = 0; kernel_d < kernel_D; ++kernel_d) {
+                for (int kernel_h = 0; kernel_h < kernel_H; ++kernel_h) {
+                    for (int kernel_w = 0; kernel_w < kernel_W; ++kernel_w) {
+                        int input_d = output_D * stride_D + kernel_d - padding_D;
+                        int input_h = output_h + kernel_h;
+                        int input_w = output_w + kernel_w;
+
+                        if (input_d >= 0 && input_d < input_D && input_h >= 0 && input_h < input_H && input_w >= 0 && input_w < input_W) {
+                            int input_idx = batch_idx * in_channels * input_D * input_H * input_W + in_channel_idx * input_D * input_H * input_W +
+                                            input_d * input_H * input_W + input_h * input_W + input_w;
+                            int weight_idx = out_channel_idx * in_channels * kernel_D * kernel_H * kernel_W + in_channel_idx * kernel_D * kernel_H * kernel_W +
+                                            kernel_d * kernel_H * kernel_W + kernel_h * kernel_W + kernel_w;
+                            
+                            sum += __hmul(float_to_bfloat16(input_tensor[input_idx]), float_to_bfloat16(weight[weight_idx]));
+                        }
+                    }
+                }
+            }
+        }
+
+        sum = __hadd(sum, float_to_bfloat16(bias[out_channel_idx])); // Add bias
+        sum = __hmax(sum, float_to_bfloat16(0.0f)); // ReLU activation
+        
+        output[batch_idx * out_channels * output_D * output_H * output_W + out_channel_idx * output_D * output_H * output_W + 
+               output_D * output_H * output_W + output_h * output_W + output_w] = sum;
+    }
+}
+
+extern "C" {
+
+void my_conv3d_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+    int input_tensor_dim4 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+    int weight_dim3 = va_arg(args, int);
+    int weight_dim4 = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract output tensor
+    __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int in_channels = input_tensor_dim1;
+    int out_channels = weight_dim0;
+
+    int input_D = input_tensor_dim2;
+    int input_H = input_tensor_dim3;
+    int input_W = input_tensor_dim4;
+
+    int kernel_D = weight_dim2;
+    int kernel_H = weight_dim3;
+    int kernel_W = weight_dim4;
+
+    // Assume default padding and stride
+    int padding_D = 1;
+    int padding_H = 1;
+    int padding_W = 1;
+
+    int stride_D = 1;
+    int stride_H = 1;
+    int stride_W = 1;
+
+    // Calculate output dimensions
+    int output_D = (input_D + 2 * padding_D - kernel_D) / stride_D + 1;
+    int output_H = (input_H + 2 * padding_H - kernel_H) / stride_H + 1;
+    int output_W = (input_W + 2 * padding_W - kernel_W) / stride_W + 1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias;
+    __nv_bfloat16 *d_output;
+    cudaMalloc(&d_input, batch_size * in_channels * input_D * input_H * input_W * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * in_channels * kernel_D * kernel_H * kernel_W * sizeof(float));
+    cudaMalloc(&d_bias, bias_dim0 * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * output_D * output_H * output_W * sizeof(__nv_bfloat16));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * input_D * input_H * input_W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, out_channels * in_channels * kernel_D * kernel_H * kernel_W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, bias_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((output_D + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    conv3d_relu_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output, 
+        batch_size, in_channels, out_channels, 
+        input_D, input_H, input_W, 
+        kernel_D, kernel_H, kernel_W, 
+        padding_D, padding_H, padding_W, 
+        stride_D, stride_H, stride_W
+    );
+
+    // Copy result back to host (cast to float)
+    float* output_float = new float[batch_size * out_channels * output_D * output_H * output_W];
+    for (int i = 0; i < batch_size * out_channels * output_D * output_H * output_W; ++i) {
+        output_float[i] = bfloat16_to_float(d_output[i]);
+    }
+    cudaMemcpy(output, output_float, batch_size * out_channels * output_D * output_H * output_W * sizeof(float), cudaMemcpyDeviceToHost);
+    delete[] output_float;
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

@@ -1,0 +1,252 @@
+```python
+import torch
+
+def complex_function(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+                   grid_size: int) -> torch.Tensor:
+    """
+    Performs a series of operations:
+    1. Matrix multiplication with weight.
+    2. Addition of bias.
+    3. Creates a grid of coordinates using meshgrid.
+    4. Calculates the distance between each element in the input tensor and the grid points.
+    5. Applies a threshold to the distance.
+    6. Performs an einsum contraction with the result of the matrix multiplication and the threshold.
+    """
+    output = torch.matmul(input_tensor, weight.t()) + bias  # Matrix multiplication and bias addition
+    
+    # Create a grid of coordinates
+    grid_x, grid_y = torch.meshgrid(torch.arange(grid_size), torch.arange(grid_size))
+    grid_x = grid_x.float()
+    grid_y = grid_y.float()
+
+    # Calculate the distance between each element in the input tensor and the grid points
+    distances = torch.sqrt(
+        ((grid_x.unsqueeze(0).unsqueeze(0) - input_tensor[:, 0].unsqueeze(1).unsqueeze(1))**2) +
+        ((grid_y.unsqueeze(0).unsqueeze(0) - input_tensor[:, 1].unsqueeze(1).unsqueeze(1))**2)
+    )
+
+    # Apply a threshold to the distance
+    threshold = 2.0
+    threshold_mask = distances <= threshold
+
+    # Perform einsum contraction
+    output = torch.einsum('ijk,ij->ik', output.unsqueeze(1), threshold_mask.float())
+
+    return output
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((10, 2), torch.float32),
+        ((4, 2), torch.float32),
+        ((4,), torch.float32),
+        ((), torch.int32)
+    ],
+    "outputs": [
+        ((10, 4), torch.float32),
+    ]
+}
+
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h> 
+
+// CUDA kernel for the complex function
+__global__ void complex_function_kernel(const float* input_tensor, const float* weight, const float* bias,
+                                         int grid_size, float* output, int batch_size, int input_dim, int output_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < output_dim) {
+        // Matrix multiplication and bias addition
+        float sum = 0.0f;
+        for (int i = 0; i < input_dim; ++i) {
+            sum += input_tensor[row * input_dim + i] * weight[col * input_dim + i];
+        }
+        sum += bias[col];
+
+        // Grid coordinates
+        float grid_x = (float)col / (float)grid_size;
+        float grid_y = (float)row / (float)grid_size;
+
+        // Distance calculation
+        float distance = sqrtf(
+            ((grid_x - input_tensor[row * input_dim]) * (grid_x - input_tensor[row * input_dim])) +
+            ((grid_y - input_tensor[row * input_dim + 1]) * (grid_y - input_tensor[row * input_dim + 1]))
+        );
+
+        // Threshold
+        float threshold = 2.0f;
+        if (distance <= threshold) {
+            output[row * output_dim + col] = sum;
+        }
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input arguments
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+    int bias_dim = va_arg(args, int);
+
+    int grid_size = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weight_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_bias, output_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, output_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    complex_function_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, grid_size, d_output, batch_size, input_dim, output_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h> 
+
+// CUDA kernel for the complex function
+__global__ void complex_function_kernel(const float* input_tensor, const float* weight, const float* bias,
+                                         int grid_size, float* output, int batch_size, int input_dim, int output_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < output_dim) {
+        // Matrix multiplication and bias addition
+        float sum = 0.0f;
+        for (int i = 0; i < input_dim; ++i) {
+            sum += input_tensor[row * input_dim + i] * weight[col * input_dim + i];
+        }
+        sum += bias[col];
+
+        // Grid coordinates
+        float grid_x = (float)col / (float)grid_size;
+        float grid_y = (float)row / (float)grid_size;
+
+        // Distance calculation
+        float distance = sqrtf(
+            ((grid_x - input_tensor[row * input_dim]) * (grid_x - input_tensor[row * input_dim])) +
+            ((grid_y - input_tensor[row * input_dim + 1]) * (grid_y - input_tensor[row * input_dim + 1]))
+        );
+
+        // Threshold
+        float threshold = 2.0f;
+        if (distance <= threshold) {
+            output[row * output_dim + col] = sum;
+        }
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input arguments
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+    int bias_dim = va_arg(args, int);
+
+    int grid_size = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weight_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_bias, output_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, output_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    complex_function_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, grid_size, d_output, batch_size, input_dim, output_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

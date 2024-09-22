@@ -1,0 +1,58 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+__global__ void inner_product_inplace_kernel(float* input_tensor, const float* weight, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        input_tensor[i] *= weight[i]; 
+    }
+}
+
+extern "C" {
+
+void inner_product_inplace(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    va_end(args);
+
+    int size = input_tensor_dim0 * input_tensor_dim1;
+
+    // Allocate device memory for input tensor
+    float* d_input_tensor;
+    cudaMalloc(&d_input_tensor, size * sizeof(float));
+
+    // Copy input tensor to device
+    cudaMemcpy(d_input_tensor, input_tensor, size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Allocate device memory for weight tensor
+    float* d_weight;
+    cudaMalloc(&d_weight, size * sizeof(float));
+
+    // Copy weight tensor to device
+    cudaMemcpy(d_weight, weight, size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    inner_product_inplace_kernel<<<numBlocks, threadsPerBlock>>>(d_input_tensor, d_weight, size);
+
+    // Copy modified input tensor back to host
+    cudaMemcpy(input_tensor, d_input_tensor, size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input_tensor);
+    cudaFree(d_weight);
+}
+
+} // extern "C"

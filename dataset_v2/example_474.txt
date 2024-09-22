@@ -1,0 +1,138 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def my_complex_function(input_tensor: torch.Tensor, target: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on input tensor, including:
+    1. Matrix multiplication with weight.
+    2. Ceil operation on the result.
+    3. Cross-entropy loss calculation with target.
+    """
+    output = torch.matmul(input_tensor, weight.t())
+    output = torch.ceil(output)
+    loss = F.cross_entropy(output, target, weight=weight)
+    return loss
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4,), torch.long),
+        ((4, 4), torch.float32)
+    ],
+    "outputs": [
+        ((1,), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// CUDA kernel for matrix multiplication and ceiling operation
+__global__ void matmul_ceil_kernel(const float* input_tensor, const float* weight, float* output, 
+                                        int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += input_tensor[row * k + i] * weight[col * k + i];  // Transposed access
+        }
+        output[row * n + col] = ceilf(sum);  // Ceil operation
+    }
+}
+
+// CUDA kernel for cross-entropy loss calculation
+__global__ void cross_entropy_kernel(const float* output, const int* target, const float* weight, float* loss,
+                                    int batch_size, int num_classes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        int label = target[idx];
+        float sum = 0.0f;
+        for (int i = 0; i < num_classes; ++i) {
+            if (i == label) {
+                sum += weight[label] * expf(-output[idx * num_classes + label]);
+            } else {
+                sum += weight[label] * expf(-output[idx * num_classes + i]);
+            }
+        }
+        loss[idx] = -logf(sum);
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract target tensor
+    const int* target = va_arg(args, const int*);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+    float* loss = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weight_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch matmul_ceil kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    matmul_ceil_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, batch_size, output_dim, input_dim
+    );
+
+    // Launch cross_entropy kernel
+    numBlocks = (batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x;
+
+    cross_entropy_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, target, weight, loss, batch_size, output_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(loss, loss, batch_size * sizeof(float), cudaMemcpyDeviceToHost);  
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

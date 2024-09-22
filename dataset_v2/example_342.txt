@@ -1,0 +1,320 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+
+def sparse_attention_with_bf16_encoding(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
+                                       sparse_mask: torch.Tensor,
+                                       positional_encoding: torch.Tensor,
+                                       relative_position_bias: torch.Tensor) -> torch.Tensor:
+    """
+    Sparse attention with relative positional encoding and bfloat16 intermediate computation.
+    """
+    # Permute query and key for efficient batch matrix multiplication
+    query = query.permute(0, 2, 1)
+    key = key.permute(0, 2, 1)
+
+    # Apply weight sparsity mask
+    key = key * sparse_mask
+
+    # Compute attention scores with relative positional encoding
+    scores = torch.matmul(query.bfloat16(), key.bfloat16())
+    scores = scores + positional_encoding.bfloat16() + relative_position_bias.bfloat16()
+
+    # Softmax normalization and apply attention
+    attention = F.softmax(scores, dim=-1).bfloat16()
+    output = torch.matmul(attention, value.bfloat16())
+
+    # Permute output back to original shape
+    output = output.permute(0, 2, 1).float()
+
+    return output
+
+function_signature = {
+    "name": "sparse_attention_with_bf16_encoding",
+    "inputs": [
+        ((1, 128, 128), torch.float32),
+        ((1, 128, 128), torch.float32),
+        ((1, 128, 128), torch.float32),
+        ((1, 128, 128), torch.bool),
+        ((1, 128, 128), torch.float32),
+        ((1, 128, 128), torch.float32)
+    ],
+    "outputs": [
+        ((1, 128, 128), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversion
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for sparse attention with relative positional encoding
+__global__ void sparse_attention_kernel(const float* query, const float* key, const float* value, 
+                                       const bool* sparse_mask, const float* positional_encoding, 
+                                       const float* relative_position_bias, float* output,
+                                       int batch_size, int seq_len, int head_dim) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int head_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && head_idx < head_dim) {
+        float sum = 0.0f;
+        for (int i = 0; i < seq_len; ++i) {
+            // Apply sparse mask
+            if (sparse_mask[batch_idx * seq_len * head_dim + i * head_dim + head_idx]) {
+                // Compute attention scores with bf16 for efficiency
+                __nv_bfloat16 q = float_to_bfloat16(query[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                __nv_bfloat16 k = float_to_bfloat16(key[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                __nv_bfloat16 p = float_to_bfloat16(positional_encoding[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                __nv_bfloat16 r = float_to_bfloat16(relative_position_bias[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                
+                __nv_bfloat16 score = __hmul(q, k) + p + r;
+                score = __expf(score);
+
+                // Accumulate weighted value with bf16
+                __nv_bfloat16 v = float_to_bfloat16(value[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                sum += bfloat16_to_float(__hmul(score, v));
+            }
+        }
+
+        output[batch_idx * seq_len * head_dim + head_idx * seq_len + i] = sum; 
+    }
+}
+
+extern "C" {
+
+void sparse_attention_with_bf16_encoding(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+    int query_dim2 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+    int key_dim2 = va_arg(args, int);
+
+    const float* value = va_arg(args, const float*);
+    int value_dim0 = va_arg(args, int);
+    int value_dim1 = va_arg(args, int);
+    int value_dim2 = va_arg(args, int);
+
+    const bool* sparse_mask = va_arg(args, const bool*);
+    int mask_dim0 = va_arg(args, int);
+    int mask_dim1 = va_arg(args, int);
+    int mask_dim2 = va_arg(args, int);
+
+    const float* positional_encoding = va_arg(args, const float*);
+    int encoding_dim0 = va_arg(args, int);
+    int encoding_dim1 = va_arg(args, int);
+    int encoding_dim2 = va_arg(args, int);
+
+    const float* relative_position_bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+    int bias_dim1 = va_arg(args, int);
+    int bias_dim2 = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = query_dim0;
+    int seq_len = query_dim1;
+    int head_dim = query_dim2;
+
+    // Allocate device memory
+    float *d_query, *d_key, *d_value, *d_positional_encoding, *d_relative_position_bias;
+    bool *d_sparse_mask;
+    cudaMalloc(&d_query, batch_size * seq_len * head_dim * sizeof(float));
+    cudaMalloc(&d_key, batch_size * seq_len * head_dim * sizeof(float));
+    cudaMalloc(&d_value, batch_size * seq_len * head_dim * sizeof(float));
+    cudaMalloc(&d_sparse_mask, batch_size * seq_len * head_dim * sizeof(bool));
+    cudaMalloc(&d_positional_encoding, batch_size * seq_len * head_dim * sizeof(float));
+    cudaMalloc(&d_relative_position_bias, batch_size * seq_len * head_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_query, query, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_key, key, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_value, value, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sparse_mask, sparse_mask, batch_size * seq_len * head_dim * sizeof(bool), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_positional_encoding, positional_encoding, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_relative_position_bias, relative_position_bias, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (head_dim + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    sparse_attention_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_query, d_key, d_value, d_sparse_mask, d_positional_encoding, d_relative_position_bias, output,
+        batch_size, seq_len, head_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, output, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_query);
+    cudaFree(d_key);
+    cudaFree(d_value);
+    cudaFree(d_sparse_mask);
+    cudaFree(d_positional_encoding);
+    cudaFree(d_relative_position_bias);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversion
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for sparse attention with relative positional encoding
+__global__ void sparse_attention_kernel(const float* query, const float* key, const float* value, 
+                                       const bool* sparse_mask, const float* positional_encoding, 
+                                       const float* relative_position_bias, float* output,
+                                       int batch_size, int seq_len, int head_dim) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int head_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && head_idx < head_dim) {
+        float sum = 0.0f;
+        for (int i = 0; i < seq_len; ++i) {
+            // Apply sparse mask
+            if (sparse_mask[batch_idx * seq_len * head_dim + i * head_dim + head_idx]) {
+                // Compute attention scores with bf16 for efficiency
+                __nv_bfloat16 q = float_to_bfloat16(query[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                __nv_bfloat16 k = float_to_bfloat16(key[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                __nv_bfloat16 p = float_to_bfloat16(positional_encoding[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                __nv_bfloat16 r = float_to_bfloat16(relative_position_bias[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                
+                __nv_bfloat16 score = __hmul(q, k) + p + r;
+                score = __expf(score);
+
+                // Accumulate weighted value with bf16
+                __nv_bfloat16 v = float_to_bfloat16(value[batch_idx * seq_len * head_dim + i * head_dim + head_idx]);
+                sum += bfloat16_to_float(__hmul(score, v));
+            }
+        }
+
+        output[batch_idx * seq_len * head_dim + head_idx * seq_len + i] = sum; 
+    }
+}
+
+extern "C" {
+
+void sparse_attention_with_bf16_encoding(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+    int query_dim2 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+    int key_dim2 = va_arg(args, int);
+
+    const float* value = va_arg(args, const float*);
+    int value_dim0 = va_arg(args, int);
+    int value_dim1 = va_arg(args, int);
+    int value_dim2 = va_arg(args, int);
+
+    const bool* sparse_mask = va_arg(args, const bool*);
+    int mask_dim0 = va_arg(args, int);
+    int mask_dim1 = va_arg(args, int);
+    int mask_dim2 = va_arg(args, int);
+
+    const float* positional_encoding = va_arg(args, const float*);
+    int encoding_dim0 = va_arg(args, int);
+    int encoding_dim1 = va_arg(args, int);
+    int encoding_dim2 = va_arg(args, int);
+
+    const float* relative_position_bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+    int bias_dim1 = va_arg(args, int);
+    int bias_dim2 = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = query_dim0;
+    int seq_len = query_dim1;
+    int head_dim = query_dim2;
+
+    // Allocate device memory
+    float *d_query, *d_key, *d_value, *d_positional_encoding, *d_relative_position_bias;
+    bool *d_sparse_mask;
+    cudaMalloc(&d_query, batch_size * seq_len * head_dim * sizeof(float));
+    cudaMalloc(&d_key, batch_size * seq_len * head_dim * sizeof(float));
+    cudaMalloc(&d_value, batch_size * seq_len * head_dim * sizeof(float));
+    cudaMalloc(&d_sparse_mask, batch_size * seq_len * head_dim * sizeof(bool));
+    cudaMalloc(&d_positional_encoding, batch_size * seq_len * head_dim * sizeof(float));
+    cudaMalloc(&d_relative_position_bias, batch_size * seq_len * head_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_query, query, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_key, key, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_value, value, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sparse_mask, sparse_mask, batch_size * seq_len * head_dim * sizeof(bool), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_positional_encoding, positional_encoding, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_relative_position_bias, relative_position_bias, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (head_dim + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    sparse_attention_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_query, d_key, d_value, d_sparse_mask, d_positional_encoding, d_relative_position_bias, output,
+        batch_size, seq_len, head_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, output, batch_size * seq_len * head_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_query);
+    cudaFree(d_key);
+    cudaFree(d_value);
+    cudaFree(d_sparse_mask);
+    cudaFree(d_positional_encoding);
+    cudaFree(d_relative_position_bias);
+}
+
+}  // extern "C"
+```

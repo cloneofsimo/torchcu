@@ -1,0 +1,487 @@
+## func.py
+
+```python
+import torch
+
+def complex_function(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on the input tensor:
+    1. Matrix multiplication with weight
+    2. Adds bias
+    3. Applies element-wise maximum with identity matrix
+    4. Converts result to bfloat16
+    5. Applies tanh activation
+    6. Converts result back to float32
+    """
+    output = torch.matmul(input_tensor, weight.t())
+    output = output + bias
+    identity = torch.eye(output.shape[1], dtype=torch.float32, device=output.device)
+    output = torch.max(output, identity)
+    output = output.to(torch.bfloat16)
+    output = torch.tanh(output)
+    return output.to(torch.float32)
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4,), torch.float32)
+    ],
+    "outputs": [
+        ((4, 4), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for the complex function
+__global__ void complex_function_kernel(const float* input_tensor, const float* weight, const float* bias,
+                                        float* output, int m, int n, int k, int bias_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += input_tensor[row * k + i] * weight[col * k + i];
+        }
+        sum += bias[col];
+
+        // Apply element-wise maximum with identity
+        float identity_val = (row == col) ? 1.0f : 0.0f;
+        sum = fmaxf(sum, identity_val);
+
+        // Convert to bfloat16, apply tanh, and convert back to float32
+        __nv_bfloat16 bf_sum = float_to_bfloat16(sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_sum);
+        bf_sum = __hmul(bf_sum, bf_

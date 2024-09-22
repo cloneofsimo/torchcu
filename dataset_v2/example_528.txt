@@ -1,0 +1,233 @@
+```python
+import torch
+
+def my_complex_function(input_tensor: torch.Tensor, target_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Performs a simple linear transformation, applies tanh activation, and calculates the MSE loss. 
+    """
+    weight = torch.ones(input_tensor.size(1), 1, dtype=torch.float32)  # Assuming a simple linear transformation
+    output = torch.matmul(input_tensor, weight)
+    output = torch.tanh(output)
+    loss = torch.nn.functional.mse_loss(output, target_tensor)
+    return output, loss
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 1), torch.float32)
+    ],
+    "outputs": [
+        ((4, 1), torch.float32),
+        ((), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for matrix multiplication and tanh activation
+__global__ void matmul_tanh_kernel(const float* input_tensor, const float* weight, float* output, 
+                                        int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += input_tensor[row * k + i] * weight[col * k + i]; 
+        }
+        output[row * n + col] = tanhf(sum); 
+    }
+}
+
+// CUDA kernel for MSE loss calculation
+__global__ void mse_loss_kernel(const float* output, const float* target, float* loss, int m) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < m) {
+        float diff = output[i] - target[i];
+        loss[0] += diff * diff;
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract target tensor
+    const float* target_tensor = va_arg(args, const float*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+    
+    // Extract loss tensor (assuming it's preallocated)
+    float* loss = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = 1;  // Assuming a simple linear transformation
+
+    // Allocate device memory
+    float *d_input, *d_target, *d_output, *d_weight, *d_loss;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_target, batch_size * output_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+    cudaMalloc(&d_weight, input_dim * output_dim * sizeof(float)); // Weight tensor
+    cudaMalloc(&d_loss, sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target_tensor, batch_size * output_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Initialize weight tensor on device
+    float host_weight[input_dim * output_dim];
+    for (int i = 0; i < input_dim * output_dim; ++i) {
+        host_weight[i] = 1.0f;
+    }
+    cudaMemcpy(d_weight, host_weight, input_dim * output_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel for matrix multiplication and tanh activation
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    matmul_tanh_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, batch_size, output_dim, input_dim
+    );
+
+    // Launch kernel for MSE loss calculation
+    numBlocks = (batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x;
+    mse_loss_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_target, d_loss, batch_size);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_target);
+    cudaFree(d_output);
+    cudaFree(d_weight);
+    cudaFree(d_loss);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for matrix multiplication and tanh activation
+__global__ void matmul_tanh_kernel(const float* input_tensor, const float* weight, float* output, 
+                                        int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += input_tensor[row * k + i] * weight[col * k + i]; 
+        }
+        output[row * n + col] = tanhf(sum); 
+    }
+}
+
+// CUDA kernel for MSE loss calculation
+__global__ void mse_loss_kernel(const float* output, const float* target, float* loss, int m) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < m) {
+        float diff = output[i] - target[i];
+        loss[0] += diff * diff;
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract target tensor
+    const float* target_tensor = va_arg(args, const float*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+    
+    // Extract loss tensor (assuming it's preallocated)
+    float* loss = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = 1;  // Assuming a simple linear transformation
+
+    // Allocate device memory
+    float *d_input, *d_target, *d_output, *d_weight, *d_loss;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_target, batch_size * output_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+    cudaMalloc(&d_weight, input_dim * output_dim * sizeof(float)); // Weight tensor
+    cudaMalloc(&d_loss, sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target_tensor, batch_size * output_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Initialize weight tensor on device
+    float host_weight[input_dim * output_dim];
+    for (int i = 0; i < input_dim * output_dim; ++i) {
+        host_weight[i] = 1.0f;
+    }
+    cudaMemcpy(d_weight, host_weight, input_dim * output_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel for matrix multiplication and tanh activation
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    matmul_tanh_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, batch_size, output_dim, input_dim
+    );
+
+    // Launch kernel for MSE loss calculation
+    numBlocks = (batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x;
+    mse_loss_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_target, d_loss, batch_size);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(loss, d_loss, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_target);
+    cudaFree(d_output);
+    cudaFree(d_weight);
+    cudaFree(d_loss);
+}
+
+}  // extern "C"
+```

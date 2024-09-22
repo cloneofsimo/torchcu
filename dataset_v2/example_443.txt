@@ -1,0 +1,191 @@
+## func.py
+
+```python
+import torch
+import random
+import numpy as np
+
+def bucketize_cutmix_function(input_tensor: torch.Tensor, target_tensor: torch.Tensor, 
+                                  buckets: list, cutmix_alpha: float, cutmix_beta: float) -> list:
+    """
+    Applies bucketization and cutmix augmentation to input and target tensors.
+
+    Args:
+        input_tensor: Input tensor of shape (N, C, H, W).
+        target_tensor: Target tensor of shape (N,).
+        buckets: List of bucket boundaries for bucketization.
+        cutmix_alpha: Alpha parameter for cutmix augmentation.
+        cutmix_beta: Beta parameter for cutmix augmentation.
+
+    Returns:
+        A list containing:
+            - Augmented input tensor of shape (N, C, H, W).
+            - Augmented target tensor of shape (N,).
+    """
+
+    # Bucketize
+    input_tensor = torch.bucketize(input_tensor, buckets)
+    
+    # CutMix Augmentation
+    N = input_tensor.shape[0]
+    for i in range(N):
+        if random.random() < 0.5:  # Apply cutmix with 50% probability
+            j = random.randint(0, N-1)
+            if i != j:
+                # Generate random cutmix parameters
+                lam = np.random.beta(cutmix_alpha, cutmix_beta)
+                w = int(input_tensor.shape[2] * np.sqrt(lam))
+                h = int(input_tensor.shape[3] * np.sqrt(lam))
+                x = random.randint(0, input_tensor.shape[2]-w)
+                y = random.randint(0, input_tensor.shape[3]-h)
+
+                # Cutmix the input tensor
+                input_tensor[i, :, x:x+w, y:y+h] = input_tensor[j, :, x:x+w, y:y+h]
+
+                # Cutmix the target tensor
+                target_tensor[i] = (1 - lam) * target_tensor[i] + lam * target_tensor[j]
+
+    return [input_tensor, target_tensor]
+
+function_signature = {
+    "name": "bucketize_cutmix_function",
+    "inputs": [
+        ((1, 3, 32, 32), torch.float32),
+        ((1,), torch.int64),
+        ([0.0, 0.25, 0.5, 0.75, 1.0], None),  # Bucket boundaries
+        (1.0, None),  # cutmix_alpha
+        (1.0, None)  # cutmix_beta
+    ],
+    "outputs": [
+        ((1, 3, 32, 32), torch.int64),  # Augmented input
+        ((1,), torch.int64)  # Augmented target
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <curand_kernel.h>
+#include <stdarg.h>
+
+__device__ float rand_float(curandState_t *state) {
+  return curand_uniform(state); 
+}
+
+__global__ void bucketize_cutmix_kernel(const float *input_tensor, const int *buckets, int *output_tensor,
+                                        const int *target_tensor, int *output_target,
+                                        int N, int C, int H, int W, int num_buckets,
+                                        float cutmix_alpha, float cutmix_beta) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < N) {
+        // Bucketize
+        int out_val = 0;
+        float val = input_tensor[idx * C * H * W];  // Assuming single value for bucketization
+        for (int i = 0; i < num_buckets; ++i) {
+            if (val < buckets[i]) {
+                out_val = i;
+                break;
+            }
+        }
+        output_tensor[idx * C * H * W] = out_val;
+
+        // CutMix with 50% probability
+        if (rand_float(&threadIdx) < 0.5) {
+            int j = rand() % N;  // Random index for cutmix
+            if (idx != j) {
+                // Generate random cutmix parameters
+                float lam = rand_float(&threadIdx);  // Assuming uniform distribution for beta
+                int w = int(H * sqrtf(lam));
+                int h = int(W * sqrtf(lam));
+                int x = rand() % (H - w);
+                int y = rand() % (W - h);
+
+                // CutMix the input tensor
+                for (int c = 0; c < C; ++c) {
+                    for (int dy = 0; dy < h; ++dy) {
+                        for (int dx = 0; dx < w; ++dx) {
+                            output_tensor[(idx * C * H * W) + c * H * W + (y + dy) * W + (x + dx)] = 
+                                output_tensor[(j * C * H * W) + c * H * W + (y + dy) * W + (x + dx)];
+                        }
+                    }
+                }
+
+                // CutMix the target tensor
+                output_target[idx] = (1 - lam) * target_tensor[idx] + lam * target_tensor[j];
+            }
+        } else {
+            // No cutmix
+            output_target[idx] = target_tensor[idx];
+        }
+    }
+}
+
+extern "C" {
+
+void bucketize_cutmix_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract target tensor
+    const int* target_tensor = va_arg(args, const int*);
+    int target_tensor_dim0 = va_arg(args, int);
+
+    // Extract buckets
+    const float* buckets = va_arg(args, const float*);
+    int num_buckets = va_arg(args, int);
+
+    // Extract cutmix parameters
+    float cutmix_alpha = va_arg(args, float);
+    float cutmix_beta = va_arg(args, float);
+
+    // Extract output tensors
+    int* output_tensor = va_arg(args, int*);
+    int* output_target = va_arg(args, int*);
+
+    va_end(args);
+
+    // Allocate device memory
+    int *d_input, *d_target, *d_output, *d_output_target, *d_buckets;
+    cudaMalloc(&d_input, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(int));
+    cudaMalloc(&d_target, target_tensor_dim0 * sizeof(int));
+    cudaMalloc(&d_output, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(int));
+    cudaMalloc(&d_output_target, target_tensor_dim0 * sizeof(int));
+    cudaMalloc(&d_buckets, num_buckets * sizeof(int));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target_tensor, target_tensor_dim0 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_buckets, buckets, num_buckets * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (input_tensor_dim0 + threadsPerBlock - 1) / threadsPerBlock;
+    bucketize_cutmix_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_input, d_buckets, d_output, d_target, d_output_target,
+                                                            input_tensor_dim0, input_tensor_dim1, input_tensor_dim2, input_tensor_dim3, 
+                                                            num_buckets, cutmix_alpha, cutmix_beta);
+
+    // Copy result back to host
+    cudaMemcpy(output_tensor, d_output, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(output_target, d_output_target, target_tensor_dim0 * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_target);
+    cudaFree(d_output);
+    cudaFree(d_output_target);
+    cudaFree(d_buckets);
+}
+}
+```

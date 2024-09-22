@@ -1,0 +1,421 @@
+```python
+import torch
+import torch.nn as nn
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, num_layers, dropout=0.1):
+        super(TransformerEncoder, self).__init__()
+        self.encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout)
+        self.transformer_encoder = nn.TransformerEncoder(self.encoder_layers, num_layers)
+
+    def forward(self, src):
+        src = self.transformer_encoder(src)
+        return src
+
+def my_function(input_tensor: torch.Tensor, weight: torch.Tensor, num_layers: int, d_model: int, nhead: int, dim_feedforward: int) -> torch.Tensor:
+    """
+    Performs a dot product between input tensor and weight, then applies a Transformer encoder.
+    """
+    output = torch.dot(input_tensor, weight)
+    encoder = TransformerEncoder(d_model, nhead, dim_feedforward, num_layers)
+    output = encoder(output.unsqueeze(0))
+    return output.squeeze(0).to(torch.bfloat16)
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        (1, torch.int32),
+        (1, torch.int32),
+        (1, torch.int32),
+        (1, torch.int32),
+    ],
+    "outputs": [
+        ((4, 4), torch.bfloat16),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for dot product
+__global__ void dot_product_kernel(const float* input_tensor, const float* weight, float* output, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        output[i] = input_tensor[i] * weight[i];
+    }
+}
+
+// CUDA kernel for Transformer encoder layer
+__global__ void transformer_encoder_layer_kernel(const float* src, float* dst, int seq_len, int d_model, int nhead,
+                                               int dim_feedforward, float dropout, int head_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < seq_len) {
+        // Assume src and dst are laid out in a row-major fashion (i.e., [seq_len, d_model])
+        // TODO: Implement actual Transformer encoder layer logic here, including multi-head attention,
+        // feed-forward network, and dropout.
+        // You would need to handle attention mask, positional encoding, and other Transformer components.
+        // This is a simplified example demonstrating the kernel structure.
+        dst[i * d_model] = src[i * d_model]; // Simple copy for now
+    }
+}
+
+// CUDA kernel for Transformer encoder
+__global__ void transformer_encoder_kernel(const float* src, float* dst, int seq_len, int d_model, int nhead,
+                                         int dim_feedforward, float dropout, int num_layers, int head_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < seq_len) {
+        for (int layer = 0; layer < num_layers; ++layer) {
+            // Call encoder layer kernel for each layer
+            transformer_encoder_layer_kernel<<<1, 256>>>(
+                src + i * d_model, dst + i * d_model, 1, d_model, nhead, dim_feedforward, dropout, head_dim
+            );
+            // Copy output back to src for next layer
+            src = dst;
+        }
+    }
+}
+
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract num_layers, d_model, nhead, dim_feedforward
+    int num_layers = va_arg(args, int);
+    int d_model = va_arg(args, int);
+    int nhead = va_arg(args, int);
+    int dim_feedforward = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, input_dim * sizeof(float));  // Assuming weight is a vector
+    cudaMalloc(&d_output, batch_size * input_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch dot product kernel
+    dot_product_kernel<<<(batch_size * input_dim + 255) / 256, 256>>>(
+        d_input, d_weight, d_output, batch_size * input_dim
+    );
+
+    // Launch Transformer encoder kernel
+    int head_dim = d_model / nhead;
+    transformer_encoder_kernel<<<(batch_size + 255) / 256, 256>>>(
+        d_output, d_output, batch_size, d_model, nhead, dim_feedforward, 0.1f, num_layers, head_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for dot product
+__global__ void dot_product_kernel(const float* input_tensor, const float* weight, float* output, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        output[i] = input_tensor[i] * weight[i];
+    }
+}
+
+// CUDA kernel for Transformer encoder layer
+__global__ void transformer_encoder_layer_kernel(const float* src, float* dst, int seq_len, int d_model, int nhead,
+                                               int dim_feedforward, float dropout, int head_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < seq_len) {
+        // Assume src and dst are laid out in a row-major fashion (i.e., [seq_len, d_model])
+        // TODO: Implement actual Transformer encoder layer logic here, including multi-head attention,
+        // feed-forward network, and dropout.
+        // You would need to handle attention mask, positional encoding, and other Transformer components.
+        // This is a simplified example demonstrating the kernel structure.
+        dst[i * d_model] = src[i * d_model]; // Simple copy for now
+    }
+}
+
+// CUDA kernel for Transformer encoder
+__global__ void transformer_encoder_kernel(const float* src, float* dst, int seq_len, int d_model, int nhead,
+                                         int dim_feedforward, float dropout, int num_layers, int head_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < seq_len) {
+        for (int layer = 0; layer < num_layers; ++layer) {
+            // Call encoder layer kernel for each layer
+            transformer_encoder_layer_kernel<<<1, 256>>>(
+                src + i * d_model, dst + i * d_model, 1, d_model, nhead, dim_feedforward, dropout, head_dim
+            );
+            // Copy output back to src for next layer
+            src = dst;
+        }
+    }
+}
+
+__global__ void bfloat16_convert_kernel(const float* src, __nv_bfloat16* dst, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        dst[i] = float_to_bfloat16(src[i]);
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract num_layers, d_model, nhead, dim_feedforward
+    int num_layers = va_arg(args, int);
+    int d_model = va_arg(args, int);
+    int nhead = va_arg(args, int);
+    int dim_feedforward = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    __nv_bfloat16 *d_output_bf16;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, input_dim * sizeof(float));  // Assuming weight is a vector
+    cudaMalloc(&d_output, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_output_bf16, batch_size * input_dim * sizeof(__nv_bfloat16));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch dot product kernel
+    dot_product_kernel<<<(batch_size * input_dim + 255) / 256, 256>>>(
+        d_input, d_weight, d_output, batch_size * input_dim
+    );
+
+    // Launch Transformer encoder kernel
+    int head_dim = d_model / nhead;
+    transformer_encoder_kernel<<<(batch_size + 255) / 256, 256>>>(
+        d_output, d_output, batch_size, d_model, nhead, dim_feedforward, 0.1f, num_layers, head_dim
+    );
+
+    // Convert output to bfloat16
+    bfloat16_convert_kernel<<<(batch_size * input_dim + 255) / 256, 256>>>(
+        d_output, d_output_bf16, batch_size * input_dim
+    );
+
+    // Copy result back to host (as float)
+    cudaMemcpy(output, d_output_bf16, batch_size * input_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+    cudaFree(d_output_bf16);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for dot product
+__global__ void dot_product_kernel(const float* input_tensor, const float* weight, float* output, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        output[i] = input_tensor[i] * weight[i];
+    }
+}
+
+// CUDA kernel for Transformer encoder layer
+__global__ void transformer_encoder_layer_kernel(const float* src, float* dst, int seq_len, int d_model, int nhead,
+                                               int dim_feedforward, float dropout, int head_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < seq_len) {
+        // Assume src and dst are laid out in a row-major fashion (i.e., [seq_len, d_model])
+        // TODO: Implement actual Transformer encoder layer logic here, including multi-head attention,
+        // feed-forward network, and dropout.
+        // You would need to handle attention mask, positional encoding, and other Transformer components.
+        // This is a simplified example demonstrating the kernel structure.
+        dst[i * d_model] = src[i * d_model]; // Simple copy for now
+    }
+}
+
+// CUDA kernel for Transformer encoder
+__global__ void transformer_encoder_kernel(const float* src, float* dst, int seq_len, int d_model, int nhead,
+                                         int dim_feedforward, float dropout, int num_layers, int head_dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < seq_len) {
+        for (int layer = 0; layer < num_layers; ++layer) {
+            // Call encoder layer kernel for each layer
+            transformer_encoder_layer_kernel<<<1, 256>>>(
+                src + i * d_model, dst + i * d_model, 1, d_model, nhead, dim_feedforward, dropout, head_dim
+            );
+            // Copy output back to src for next layer
+            src = dst;
+        }
+    }
+}
+
+// CUDA kernel for converting float to bfloat16 and storing in a separate buffer
+__global__ void float_to_bfloat16_kernel(const float* src, __nv_bfloat16* dst, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        dst[i] = float_to_bfloat16(src[i]);
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract num_layers, d_model, nhead, dim_feedforward
+    int num_layers = va_arg(args, int);
+    int d_model = va_arg(args, int);
+    int nhead = va_arg(args, int);
+    int dim_feedforward = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    __nv_bfloat16 *d_output_bf16;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, input_dim * sizeof(float));  // Assuming weight is a vector
+    cudaMalloc(&d_output, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_output_bf16, batch_size * input_dim * sizeof(__nv_bfloat16));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch dot product kernel
+    dot_product_kernel<<<(batch_size * input_dim + 255) / 256, 256>>>(
+        d_input, d_weight, d_output, batch_size * input_dim
+    );
+
+    // Launch Transformer encoder kernel
+    int head_dim = d_model / nhead;
+    transformer_encoder_kernel<<<(batch_size + 255) / 256, 256>>>(
+        d_output, d_output, batch_size, d_model, nhead, dim_feedforward, 0.1f, num_layers, head_dim
+    );
+
+    // Convert output to bfloat16 (in a separate buffer)
+    float_to_bfloat16_kernel<<<(batch_size * input_dim + 255) / 256, 256>>>(
+        d_output, d_output_bf16, batch_size * input_dim
+    );
+
+    // Copy result back to host (as float)
+    cudaMemcpy(output, d_output_bf16, batch_size * input_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+    cudaFree(d_output_bf16);
+}
+
+}  // extern "C"
+```

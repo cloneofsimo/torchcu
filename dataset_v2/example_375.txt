@@ -1,0 +1,131 @@
+## func.py
+
+```python
+import torch
+
+def my_function(input_tensor: torch.Tensor, gt: torch.Tensor, target_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Computes a score based on pairwise distances between input and target tensors, compared to a ground truth.
+    """
+    # Ensure all tensors are in fp16 for efficiency
+    input_tensor = input_tensor.to(torch.float16)
+    gt = gt.to(torch.float16)
+    target_tensor = target_tensor.to(torch.float16)
+
+    # Calculate pairwise Euclidean distances between input and target tensors
+    distances = torch.cdist(input_tensor, target_tensor, p=2)
+
+    # Compute element-wise difference between distances and ground truth
+    diff = torch.abs(distances - gt.unsqueeze(0))
+
+    # Sum across the second dimension (distance pairs) and apply sigmoid
+    score = torch.sigmoid(torch.sum(diff, dim=1))
+
+    return score
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((1, 4), torch.float32),
+        ((1, 4), torch.float32),
+        ((1, 4), torch.float32),
+    ],
+    "outputs": [
+        ((1,), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h> 
+
+__device__ float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void my_function_kernel(const half* input_tensor, const half* gt, const half* target_tensor, 
+                                      half* output, int batch_size, int feature_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size) {
+        float sum = 0.0f;
+
+        // Iterate over feature dimensions
+        for (int j = 0; j < feature_dim; ++j) {
+            // Compute pairwise distance between input and target
+            float diff = abs(input_tensor[idx * feature_dim + j] - target_tensor[j]); 
+
+            // Add absolute difference to the sum
+            sum += diff;
+        }
+
+        // Calculate the absolute difference between the distance and GT
+        float distance_diff = abs(sum - gt[idx]);
+
+        // Apply sigmoid and store the score
+        output[idx] = sigmoid(distance_diff);
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    const float* gt = va_arg(args, const float*);
+    int gt_dim0 = va_arg(args, int);
+    int gt_dim1 = va_arg(args, int);
+
+    const float* target_tensor = va_arg(args, const float*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int feature_dim = input_tensor_dim1;
+
+    // Allocate device memory
+    half* d_input, *d_gt, *d_target, *d_output;
+    cudaMalloc(&d_input, batch_size * feature_dim * sizeof(half));
+    cudaMalloc(&d_gt, batch_size * sizeof(half));
+    cudaMalloc(&d_target, feature_dim * sizeof(half));
+    cudaMalloc(&d_output, batch_size * sizeof(half));
+
+    // Copy input data to device (as half)
+    cudaMemcpy(d_input, input_tensor, batch_size * feature_dim * sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_gt, gt, batch_size * sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target_tensor, feature_dim * sizeof(half), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int threadsPerBlock = 256;
+    int numBlocks = (batch_size + threadsPerBlock - 1) / threadsPerBlock;
+    my_function_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_gt, d_target, d_output, batch_size, feature_dim);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_gt);
+    cudaFree(d_target);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

@@ -1,0 +1,210 @@
+## func.py
+
+```python
+import torch
+import torch.nn as nn
+
+class CosFaceLoss(nn.Module):
+    def __init__(self, s=64.0, m=0.40):
+        super(CosFaceLoss, self).__init__()
+        self.s = s
+        self.m = m
+
+    def forward(self, cosine, label):
+        index = torch.arange(0, label.size(0))
+        
+        # Pick out correct class scores
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1), 1)
+        
+        # Modify cosine for correct class
+        modified_cosine = cosine * one_hot + (1 - one_hot) * (cosine - self.m)
+        
+        # Scale the result
+        output = self.s * modified_cosine
+        loss = torch.mean(torch.logsumexp(output, dim=1) - output[index, label])
+        return loss
+
+def my_complex_function(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a 3D convolution, then calculates CosFace loss with the output.
+    """
+    conv3d = nn.Conv3d(in_channels=input_tensor.shape[1], out_channels=weight.shape[0], kernel_size=3, padding=1)
+    conv3d.weight.data = weight
+    output = conv3d(input_tensor)
+    output = torch.flatten(output, start_dim=1)  # Flatten for CosFace loss
+    loss = CosFaceLoss()(output, torch.randint(0, weight.shape[0], (output.shape[0],)))
+    return loss
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((1, 4, 5, 5, 5), torch.float32), 
+        ((16, 4, 3, 3, 3), torch.float32) 
+    ],
+    "outputs": [
+        ((1,), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper function for calculating CosFace loss
+__device__ float cosface_loss_kernel(float* cosine, int* label, int batch_size, int num_classes, float s, float m) {
+    float loss = 0.0f;
+    for (int i = 0; i < batch_size; ++i) {
+        int correct_class = label[i];
+        float max_score = cosine[i * num_classes + correct_class];
+        
+        // Calculate modified cosine for correct class
+        float modified_cosine = max_score;
+        for (int j = 0; j < num_classes; ++j) {
+            if (j == correct_class) {
+                continue;
+            }
+            modified_cosine = max(modified_cosine, cosine[i * num_classes + j] - m);
+        }
+        
+        // Scale and add to loss
+        float output = s * modified_cosine;
+        loss += logf(expf(output) + expf(output - s * max_score));
+    }
+    return loss / batch_size;
+}
+
+// CUDA kernel for 3D convolution
+__global__ void conv3d_kernel(const float* input, const float* weight, float* output, 
+                                   int batch_size, int in_channels, int out_channels,
+                                   int in_depth, int in_height, int in_width,
+                                   int kernel_depth, int kernel_height, int kernel_width) {
+
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int out_channel = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_depth = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && out_channel < out_channels && out_depth < in_depth) {
+        for (int out_height = 0; out_height < in_height; ++out_height) {
+            for (int out_width = 0; out_width < in_width; ++out_width) {
+                float sum = 0.0f;
+                for (int in_channel = 0; in_channel < in_channels; ++in_channel) {
+                    for (int kernel_d = 0; kernel_d < kernel_depth; ++kernel_d) {
+                        for (int kernel_h = 0; kernel_h < kernel_height; ++kernel_h) {
+                            for (int kernel_w = 0; kernel_w < kernel_width; ++kernel_w) {
+                                int input_idx = ((batch_idx * in_channels + in_channel) * in_depth + out_depth + kernel_d) * in_height * in_width + 
+                                               (out_height + kernel_h) * in_width + (out_width + kernel_w);
+                                int weight_idx = (out_channel * in_channels + in_channel) * kernel_depth * kernel_height * kernel_width +
+                                                (kernel_d * kernel_height + kernel_h) * kernel_width + kernel_w;
+
+                                sum += input[input_idx] * weight[weight_idx];
+                            }
+                        }
+                    }
+                }
+                output[((batch_idx * out_channels + out_channel) * in_depth + out_depth) * in_height * in_width + 
+                       out_height * in_width + out_width] = sum; 
+            }
+        }
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+    int input_tensor_dim4 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+    int weight_dim3 = va_arg(args, int);
+    int weight_dim4 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int in_channels = input_tensor_dim1;
+    int in_depth = input_tensor_dim2;
+    int in_height = input_tensor_dim3;
+    int in_width = input_tensor_dim4;
+
+    int out_channels = weight_dim0;
+    int kernel_depth = weight_dim2;
+    int kernel_height = weight_dim3;
+    int kernel_width = weight_dim4;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, batch_size * in_channels * in_depth * in_height * in_width * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * in_channels * kernel_depth * kernel_height * kernel_width * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * in_depth * in_height * in_width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * in_depth * in_height * in_width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, out_channels * in_channels * kernel_depth * kernel_height * kernel_width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Perform 3D convolution
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((in_depth + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    conv3d_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, batch_size, in_channels, out_channels,
+        in_depth, in_height, in_width, kernel_depth, kernel_height, kernel_width
+    );
+
+    // Calculate CosFace loss
+    int* d_label;
+    cudaMalloc(&d_label, batch_size * sizeof(int));
+    cudaMemcpy(d_label, (int*)malloc(batch_size * sizeof(int)), batch_size * sizeof(int), cudaMemcpyHostToDevice);
+
+    float* d_cosine;
+    cudaMalloc(&d_cosine, batch_size * out_channels * sizeof(float));
+
+    // Flatten output
+    dim3 threadsPerBlock_flatten(16, 16);
+    dim3 numBlocks_flatten((out_channels * in_depth + threadsPerBlock_flatten.x - 1) / threadsPerBlock_flatten.x,
+                          (batch_size + threadsPerBlock_flatten.y - 1) / threadsPerBlock_flatten.y);
+
+    // Perform flattening (equivalent to torch.flatten(output, start_dim=1))
+    // Note: This could be optimized further by using a more efficient kernel 
+    // for flattening in the convolution kernel directly
+    // ... (Implementation for flattening kernel) ...
+
+    // Calculate CosFace loss on device
+    float loss = cosface_loss_kernel<<<1, 1>>>(d_cosine, d_label, batch_size, out_channels, 64.0f, 0.40f);
+
+    // Copy result back to host
+    cudaMemcpy(output, &loss, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+    cudaFree(d_label);
+    cudaFree(d_cosine);
+}
+
+}  // extern "C"
+
+```

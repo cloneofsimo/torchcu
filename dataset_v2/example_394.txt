@@ -1,0 +1,284 @@
+## func.py
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MyModel(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=4, kernel_size=3, padding=1):
+        super(MyModel, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, 
+                              padding=padding, groups=groups, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.dropout = nn.Dropout(p=0.2)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        return x
+
+def my_function(input_tensor: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, 
+                  model: MyModel, alpha: float = 0.01) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Performs a grouped convolution, applies log softmax, calculates NLL loss, and
+    adds L1 regularization on the weights. Returns the loss and the log probabilities.
+    """
+    # Move to fp16 for efficiency
+    input_tensor = input_tensor.to(torch.float16)
+    weight = weight.to(torch.float16)
+    
+    # Apply grouped convolution
+    output = model(input_tensor)
+
+    # Calculate log probabilities
+    log_probs = F.log_softmax(output, dim=1)
+
+    # Calculate NLL loss
+    loss = F.nll_loss(log_probs, labels)
+
+    # L1 regularization
+    l1_reg = alpha * torch.sum(torch.abs(weight))
+    loss += l1_reg
+
+    return loss, log_probs
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((16, 3, 28, 28), torch.float32),  # Input tensor
+        ((16, 3, 3, 3), torch.float32),   # Weight tensor
+        ((16,), torch.int64),             # Labels
+        (None, MyModel)                    # Model
+    ],
+    "outputs": [
+        ((), torch.float32),                # Loss
+        ((16, 10), torch.float32)           # Log probabilities
+    ]
+}
+
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// Grouped convolution kernel (without bias)
+__global__ void grouped_conv2d_kernel(const float* input, const float* weight, 
+                                     float* output, int batch_size, int in_channels, 
+                                     int out_channels, int groups, int height, 
+                                     int width, int kernel_size, int padding) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = threadIdx.z;
+
+    if (b < batch_size && h < height && w < width) {
+        int g = (in_channels / groups);
+        int in_channel_idx = (b * in_channels + g) * height * width; 
+        int out_channel_idx = (b * out_channels + g) * height * width;
+
+        for (int k = 0; k < kernel_size; ++k) {
+            for (int l = 0; l < kernel_size; ++l) {
+                int input_idx = in_channel_idx + (h + k - padding) * width + (w + l - padding);
+                int weight_idx = (g * kernel_size * kernel_size + k * kernel_size + l) * out_channels / groups;
+                
+                for (int o = 0; o < out_channels / groups; ++o) {
+                    half input_val = float_to_half(input[input_idx]);
+                    half weight_val = float_to_half(weight[weight_idx + o]);
+                    output[out_channel_idx + o * height * width + h * width + w] =
+                        half_to_float(__hmul(input_val, weight_val)) + output[out_channel_idx + o * height * width + h * width + w];
+                }
+            }
+        }
+    }
+}
+
+// LogSoftmax kernel (using float for better accuracy)
+__global__ void log_softmax_kernel(const float* input, float* output, 
+                                      int batch_size, int num_classes, int height, 
+                                      int width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && c < num_classes) {
+        float max_val = -INFINITY;
+        for (int i = 0; i < num_classes; ++i) {
+            max_val = fmaxf(max_val, input[b * num_classes * height * width + i * height * width]);
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < num_classes; ++i) {
+            sum += expf(input[b * num_classes * height * width + i * height * width] - max_val);
+        }
+
+        output[b * num_classes * height * width + c * height * width] = 
+            input[b * num_classes * height * width + c * height * width] - max_val - logf(sum);
+    }
+}
+
+__global__ void nll_loss_kernel(const float* log_probs, const int* labels, float* loss,
+                                 int batch_size, int num_classes) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch_size) {
+        int label = labels[b];
+        loss[0] += -log_probs[b * num_classes + label]; 
+    }
+}
+
+__global__ void l1_regularization_kernel(const float* weight, float* reg_loss, 
+                                          int num_weights) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < num_weights) {
+        reg_loss[0] += fabsf(weight[i]);
+    }
+}
+
+
+extern "C" {
+    
+    void my_function(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        const float* input_tensor = va_arg(args, const float*);
+        int input_tensor_dim0 = va_arg(args, int);
+        int input_tensor_dim1 = va_arg(args, int);
+        int input_tensor_dim2 = va_arg(args, int);
+        int input_tensor_dim3 = va_arg(args, int);
+
+        const float* weight = va_arg(args, const float*);
+        int weight_dim0 = va_arg(args, int);
+        int weight_dim1 = va_arg(args, int);
+        int weight_dim2 = va_arg(args, int);
+        int weight_dim3 = va_arg(args, int);
+
+        const int* labels = va_arg(args, const int*);
+        int labels_dim0 = va_arg(args, int);
+
+        // Extract model parameters
+        const float* conv_weight = va_arg(args, const float*);
+        int conv_weight_dim0 = va_arg(args, int);
+        int conv_weight_dim1 = va_arg(args, int);
+        int conv_weight_dim2 = va_arg(args, int);
+        int conv_weight_dim3 = va_arg(args, int);
+        const float* bn_weight = va_arg(args, const float*);
+        int bn_weight_dim0 = va_arg(args, int);
+        const float* bn_bias = va_arg(args, const float*);
+        int bn_bias_dim0 = va_arg(args, int);
+        const float* bn_running_mean = va_arg(args, const float*);
+        int bn_running_mean_dim0 = va_arg(args, int);
+        const float* bn_running_var = va_arg(args, const float*);
+        int bn_running_var_dim0 = va_arg(args, int);
+
+        // Extract output tensors (assuming preallocated)
+        float* loss = va_arg(args, float*);
+        float* log_probs = va_arg(args, float*);
+        int log_probs_dim0 = va_arg(args, int);
+        int log_probs_dim1 = va_arg(args, int);
+
+        va_end(args);
+
+        const float alpha = 0.01f;
+
+        int batch_size = input_tensor_dim0;
+        int in_channels = input_tensor_dim1;
+        int height = input_tensor_dim2;
+        int width = input_tensor_dim3;
+        int out_channels = weight_dim0;
+        int num_classes = log_probs_dim1;
+        int groups = conv_weight_dim1 / conv_weight_dim0;
+        int kernel_size = conv_weight_dim2;
+        int padding = 1;  // Assuming padding is 1
+
+        // Allocate device memory
+        float *d_input, *d_weight, *d_output, *d_log_probs, *d_conv_weight, 
+              *d_bn_weight, *d_bn_bias, *d_bn_running_mean, *d_bn_running_var;
+        cudaMalloc(&d_input, batch_size * in_channels * height * width * sizeof(float));
+        cudaMalloc(&d_weight, out_channels * in_channels * height * width * sizeof(float));
+        cudaMalloc(&d_output, batch_size * out_channels * height * width * sizeof(float));
+        cudaMalloc(&d_log_probs, batch_size * num_classes * height * width * sizeof(float));
+        cudaMalloc(&d_conv_weight, conv_weight_dim0 * conv_weight_dim1 * conv_weight_dim2 * conv_weight_dim3 * sizeof(float));
+        cudaMalloc(&d_bn_weight, bn_weight_dim0 * sizeof(float));
+        cudaMalloc(&d_bn_bias, bn_bias_dim0 * sizeof(float));
+        cudaMalloc(&d_bn_running_mean, bn_running_mean_dim0 * sizeof(float));
+        cudaMalloc(&d_bn_running_var, bn_running_var_dim0 * sizeof(float));
+
+        // Copy data to device
+        cudaMemcpy(d_input, input_tensor, batch_size * in_channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_weight, weight, out_channels * in_channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_conv_weight, conv_weight, conv_weight_dim0 * conv_weight_dim1 * conv_weight_dim2 * conv_weight_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_bn_weight, bn_weight, bn_weight_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_bn_bias, bn_bias, bn_bias_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_bn_running_mean, bn_running_mean, bn_running_mean_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_bn_running_var, bn_running_var, bn_running_var_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Launch grouped convolution kernel
+        dim3 threadsPerBlock(16, 16, 4);
+        dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                       (height + threadsPerBlock.y - 1) / threadsPerBlock.y, 1);
+        grouped_conv2d_kernel<<<numBlocks, threadsPerBlock>>>(
+            d_input, d_conv_weight, d_output, batch_size, in_channels, 
+            out_channels, groups, height, width, kernel_size, padding
+        );
+
+        // Launch log softmax kernel
+        dim3 threadsPerBlock2(16, 16, 1);
+        dim3 numBlocks2((batch_size + threadsPerBlock2.x - 1) / threadsPerBlock2.x, 
+                       (num_classes + threadsPerBlock2.y - 1) / threadsPerBlock2.y, 1);
+        log_softmax_kernel<<<numBlocks2, threadsPerBlock2>>>(
+            d_output, d_log_probs, batch_size, num_classes, height, width
+        );
+
+        // Calculate NLL loss
+        float d_loss = 0.0f;
+        dim3 threadsPerBlock3(256, 1, 1);
+        dim3 numBlocks3((batch_size + threadsPerBlock3.x - 1) / threadsPerBlock3.x, 1, 1);
+        nll_loss_kernel<<<numBlocks3, threadsPerBlock3>>>(
+            d_log_probs, labels, &d_loss, batch_size, num_classes
+        );
+
+        // Calculate L1 regularization
+        float d_l1_reg = 0.0f;
+        dim3 threadsPerBlock4(256, 1, 1);
+        dim3 numBlocks4((conv_weight_dim0 * conv_weight_dim1 * conv_weight_dim2 * conv_weight_dim3 + threadsPerBlock4.x - 1) / threadsPerBlock4.x, 1, 1);
+        l1_regularization_kernel<<<numBlocks4, threadsPerBlock4>>>(
+            d_conv_weight, &d_l1_reg, conv_weight_dim0 * conv_weight_dim1 * conv_weight_dim2 * conv_weight_dim3
+        );
+        d_loss += alpha * d_l1_reg;
+
+        // Copy results back to host
+        cudaMemcpy(loss, &d_loss, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(log_probs, d_log_probs, batch_size * num_classes * height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_weight);
+        cudaFree(d_output);
+        cudaFree(d_log_probs);
+        cudaFree(d_conv_weight);
+        cudaFree(d_bn_weight);
+        cudaFree(d_bn_bias);
+        cudaFree(d_bn_running_mean);
+        cudaFree(d_bn_running_var);
+    }
+}
+```

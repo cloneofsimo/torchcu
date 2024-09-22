@@ -1,0 +1,210 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def my_complex_function(input_tensor1: torch.Tensor, input_tensor2: torch.Tensor, target: torch.Tensor, margin: float) -> torch.Tensor:
+    """
+    This function demonstrates a more complex example with multiple inputs, including a target tensor
+    and a margin parameter. It performs the following operations:
+
+    1. Calculates the difference between input_tensor1 and input_tensor2.
+    2. Applies a LeakyReLU activation to the difference.
+    3. Computes the Margin Ranking Loss between the activated difference and the target tensor.
+    4. Returns the computed loss value.
+    """
+    diff = input_tensor1 - input_tensor2
+    diff = F.leaky_relu(diff, negative_slope=0.1)
+    loss = F.margin_ranking_loss(diff, target, margin=margin)
+    return loss
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4,), torch.float32),  # Target tensor
+        (torch.float32)          # Margin parameter
+    ],
+    "outputs": [
+        ((1,), torch.float32),  # Output is a scalar loss value
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+__global__ void my_complex_function_kernel(const float* input_tensor1, const float* input_tensor2, 
+                                           const float* target, float margin, float* output,
+                                           int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < m) {
+        float diff = input_tensor1[idx] - input_tensor2[idx];
+        diff = fmaxf(diff, 0.1f * diff); // Leaky ReLU
+        output[0] += fmaxf(margin + target[idx] - diff, 0.0f); // Margin Ranking Loss
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor1 = va_arg(args, const float*);
+    int input_tensor1_dim0 = va_arg(args, int);
+    int input_tensor1_dim1 = va_arg(args, int);
+
+    const float* input_tensor2 = va_arg(args, const float*);
+    int input_tensor2_dim0 = va_arg(args, int);
+    int input_tensor2_dim1 = va_arg(args, int);
+
+    // Extract target tensor
+    const float* target = va_arg(args, const float*);
+    int target_dim0 = va_arg(args, int);
+
+    // Extract margin parameter
+    float margin = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor1_dim0;
+
+    // Allocate device memory
+    float *d_input1, *d_input2, *d_target, *d_output;
+    cudaMalloc(&d_input1, batch_size * sizeof(float));
+    cudaMalloc(&d_input2, batch_size * sizeof(float));
+    cudaMalloc(&d_target, target_dim0 * sizeof(float));
+    cudaMalloc(&d_output, sizeof(float)); // Output is a scalar
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input_tensor1, batch_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input_tensor2, batch_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target, target_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, sizeof(float)); // Initialize output to 0
+
+    // Launch kernel
+    dim3 threadsPerBlock(256); // Adjust block size as needed
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    my_complex_function_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input1, d_input2, d_target, margin, d_output, batch_size, 1
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_target);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+__global__ void my_complex_function_kernel(const float* input_tensor1, const float* input_tensor2, 
+                                           const float* target, float margin, float* output,
+                                           int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < m) {
+        __nv_bfloat16 diff = float_to_bfloat16(input_tensor1[idx] - input_tensor2[idx]);
+        diff = fmaxf(bfloat16_to_float(diff), 0.1f * bfloat16_to_float(diff)); // Leaky ReLU
+        output[0] += fmaxf(margin + target[idx] - bfloat16_to_float(diff), 0.0f); // Margin Ranking Loss
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor1 = va_arg(args, const float*);
+    int input_tensor1_dim0 = va_arg(args, int);
+    int input_tensor1_dim1 = va_arg(args, int);
+
+    const float* input_tensor2 = va_arg(args, const float*);
+    int input_tensor2_dim0 = va_arg(args, int);
+    int input_tensor2_dim1 = va_arg(args, int);
+
+    // Extract target tensor
+    const float* target = va_arg(args, const float*);
+    int target_dim0 = va_arg(args, int);
+
+    // Extract margin parameter
+    float margin = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor1_dim0;
+
+    // Allocate device memory
+    float *d_input1, *d_input2, *d_target, *d_output;
+    cudaMalloc(&d_input1, batch_size * sizeof(float));
+    cudaMalloc(&d_input2, batch_size * sizeof(float));
+    cudaMalloc(&d_target, target_dim0 * sizeof(float));
+    cudaMalloc(&d_output, sizeof(float)); // Output is a scalar
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input_tensor1, batch_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input_tensor2, batch_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target, target_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_output, 0, sizeof(float)); // Initialize output to 0
+
+    // Launch kernel
+    dim3 threadsPerBlock(256); // Adjust block size as needed
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    my_complex_function_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input1, d_input2, d_target, margin, d_output, batch_size, 1
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_target);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```

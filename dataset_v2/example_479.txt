@@ -1,0 +1,256 @@
+```python
+import torch
+import torch.fft
+
+def my_complex_function(input_tensor: torch.Tensor, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+    """
+    This function performs a series of operations on an input tensor:
+
+    1. Applies a 1D convolution using FFT (for efficiency)
+    2. Calculates the element-wise maximum between the convolution result and a weight tensor
+    3. Scatter-adds the maximum result into a new tensor based on a comparison with another weight tensor
+    4. Returns the result tensor and the scattered tensor
+
+    Args:
+        input_tensor: A 1D tensor of shape (batch_size, sequence_length)
+        weights: A list of three 1D tensors, each with shape (sequence_length,)
+
+    Returns:
+        A list of two tensors:
+            - The result tensor after the element-wise maximum
+            - The scattered tensor
+    """
+
+    # 1. Convolution using FFT
+    conv_result = torch.fft.irfft(
+        torch.fft.rfft(input_tensor, dim=1) * torch.fft.rfft(weights[0], dim=0),
+        n=input_tensor.size(1), dim=1
+    )
+
+    # 2. Element-wise maximum
+    max_result = torch.max(conv_result, weights[1].unsqueeze(0))
+
+    # 3. Scatter-add
+    scatter_result = torch.zeros_like(weights[2])
+    scatter_result.scatter_add_(
+        0, torch.where(max_result.values >= weights[2].unsqueeze(0),
+                       torch.arange(max_result.size(0)).unsqueeze(1),
+                       torch.zeros_like(max_result.values)).long(),
+        max_result.values
+    )
+
+    # 4. Return results
+    return [max_result.values, scatter_result]
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((16, 32), torch.float32),
+        [((32,), torch.float32), ((32,), torch.float32), ((32,), torch.float32)]
+    ],
+    "outputs": [
+        ((16, 32), torch.float32),
+        ((32,), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cufft.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+#define THREADS_PER_BLOCK 256
+
+__global__ void conv1d_fft_kernel(const float* input, const float* weight, float* output, int batch_size, int seq_len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * seq_len) {
+        float sum = 0.0f;
+        for (int j = 0; j < seq_len; j++) {
+            sum += input[i - j + (i / seq_len) * seq_len] * weight[j]; 
+        }
+        output[i] = sum;
+    }
+}
+
+__global__ void max_kernel(const float* conv_result, const float* weight, float* output, int batch_size, int seq_len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * seq_len) {
+        output[i] = fmaxf(conv_result[i], weight[i % seq_len]);
+    }
+}
+
+__global__ void scatter_add_kernel(const float* max_result, const float* weight, float* scatter_result, int batch_size, int seq_len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * seq_len) {
+        if (max_result[i] >= weight[i % seq_len]) {
+            atomicAdd(&scatter_result[i % seq_len], max_result[i]);
+        }
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int seq_len = va_arg(args, int);
+
+    // Extract weights
+    const float* weight0 = va_arg(args, const float*);
+    const float* weight1 = va_arg(args, const float*);
+    const float* weight2 = va_arg(args, const float*);
+
+    // Extract output tensors (assuming they're preallocated)
+    float* max_result = va_arg(args, float*);
+    float* scatter_result = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weight0, *d_weight1, *d_weight2, *d_conv_result;
+    cudaMalloc(&d_input, batch_size * seq_len * sizeof(float));
+    cudaMalloc(&d_weight0, seq_len * sizeof(float));
+    cudaMalloc(&d_weight1, seq_len * sizeof(float));
+    cudaMalloc(&d_weight2, seq_len * sizeof(float));
+    cudaMalloc(&d_conv_result, batch_size * seq_len * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * seq_len * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight0, weight0, seq_len * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight1, weight1, seq_len * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight2, weight2, seq_len * sizeof(float), cudaMemcpyHostToDevice);
+
+    // 1. Convolution using FFT
+    conv1d_fft_kernel<<<(batch_size * seq_len + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+        d_input, d_weight0, d_conv_result, batch_size, seq_len
+    );
+
+    // 2. Element-wise maximum
+    max_kernel<<<(batch_size * seq_len + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+        d_conv_result, d_weight1, d_conv_result, batch_size, seq_len
+    );
+
+    // 3. Scatter-add
+    scatter_add_kernel<<<(batch_size * seq_len + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+        d_conv_result, d_weight2, scatter_result, batch_size, seq_len
+    );
+
+    // Copy results back to host
+    cudaMemcpy(max_result, d_conv_result, batch_size * seq_len * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight0);
+    cudaFree(d_weight1);
+    cudaFree(d_weight2);
+    cudaFree(d_conv_result);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cufft.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+#define THREADS_PER_BLOCK 256
+
+__global__ void conv1d_fft_kernel(const float* input, const float* weight, float* output, int batch_size, int seq_len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * seq_len) {
+        float sum = 0.0f;
+        for (int j = 0; j < seq_len; j++) {
+            sum += input[i - j + (i / seq_len) * seq_len] * weight[j]; 
+        }
+        output[i] = sum;
+    }
+}
+
+__global__ void max_kernel(const float* conv_result, const float* weight, float* output, int batch_size, int seq_len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * seq_len) {
+        output[i] = fmaxf(conv_result[i], weight[i % seq_len]);
+    }
+}
+
+__global__ void scatter_add_kernel(const float* max_result, const float* weight, float* scatter_result, int batch_size, int seq_len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * seq_len) {
+        if (max_result[i] >= weight[i % seq_len]) {
+            atomicAdd(&scatter_result[i % seq_len], max_result[i]);
+        }
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int seq_len = va_arg(args, int);
+
+    // Extract weights
+    const float* weight0 = va_arg(args, const float*);
+    const float* weight1 = va_arg(args, const float*);
+    const float* weight2 = va_arg(args, const float*);
+
+    // Extract output tensors (assuming they're preallocated)
+    float* max_result = va_arg(args, float*);
+    float* scatter_result = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weight0, *d_weight1, *d_weight2, *d_conv_result;
+    cudaMalloc(&d_input, batch_size * seq_len * sizeof(float));
+    cudaMalloc(&d_weight0, seq_len * sizeof(float));
+    cudaMalloc(&d_weight1, seq_len * sizeof(float));
+    cudaMalloc(&d_weight2, seq_len * sizeof(float));
+    cudaMalloc(&d_conv_result, batch_size * seq_len * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * seq_len * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight0, weight0, seq_len * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight1, weight1, seq_len * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight2, weight2, seq_len * sizeof(float), cudaMemcpyHostToDevice);
+
+    // 1. Convolution using FFT
+    conv1d_fft_kernel<<<(batch_size * seq_len + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+        d_input, d_weight0, d_conv_result, batch_size, seq_len
+    );
+
+    // 2. Element-wise maximum
+    max_kernel<<<(batch_size * seq_len + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+        d_conv_result, d_weight1, d_conv_result, batch_size, seq_len
+    );
+
+    // 3. Scatter-add
+    scatter_add_kernel<<<(batch_size * seq_len + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(
+        d_conv_result, d_weight2, scatter_result, batch_size, seq_len
+    );
+
+    // Copy results back to host
+    cudaMemcpy(max_result, d_conv_result, batch_size * seq_len * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight0);
+    cudaFree(d_weight1);
+    cudaFree(d_weight2);
+    cudaFree(d_conv_result);
+}
+
+}  // extern "C"
+```

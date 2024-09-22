@@ -1,0 +1,94 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+// CUDA kernel for regularized einsum-based pooling with adaptive max pooling
+__global__ void regularized_einsum_pooling_kernel(const float* input, const float* weight, 
+                                                  float* output, int batch_size, int channels,
+                                                  int input_height, int input_width, int pool_size,
+                                                  float reg_lambda, float* reg_loss) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.z * blockDim.z + threadIdx.z;
+    int w = threadIdx.x;
+
+    if (b < batch_size && c < channels && h < pool_size && w < pool_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < channels; ++i) {
+            for (int j = h * input_height / pool_size; j < (h + 1) * input_height / pool_size; ++j) {
+                for (int k = w * input_width / pool_size; k < (w + 1) * input_width / pool_size; ++k) {
+                    sum = fmaxf(sum, input[b * channels * input_height * input_width + i * input_height * input_width + j * input_width + k] * weight[c * channels + i]);
+                }
+            }
+        }
+        output[b * channels * pool_size * pool_size + c * pool_size * pool_size + h * pool_size + w] = sum;
+    }
+
+    // Calculate regularization loss
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+        *reg_loss = 0.0f;
+        for (int i = 0; i < channels * channels; ++i) {
+            *reg_loss += weight[i] * weight[i];
+        }
+        *reg_loss *= reg_lambda;
+    }
+}
+
+extern "C" {
+
+void regularized_einsum_pooling(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract inputs
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int channels = va_arg(args, int);
+    int input_height = va_arg(args, int);
+    int input_width = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+
+    int pool_size = va_arg(args, int);
+
+    float reg_lambda = va_arg(args, float);
+
+    // Extract output tensors (assuming preallocated)
+    float* output = va_arg(args, float*);
+    float* reg_loss = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output, *d_reg_loss;
+    cudaMalloc(&d_input, batch_size * channels * input_height * input_width * sizeof(float));
+    cudaMalloc(&d_weight, channels * channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * channels * pool_size * pool_size * sizeof(float));
+    cudaMalloc(&d_reg_loss, sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * channels * input_height * input_width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, channels * channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32, 1);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (pool_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    regularized_einsum_pooling_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, batch_size, channels,
+        input_height, input_width, pool_size, reg_lambda, d_reg_loss
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * channels * pool_size * pool_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(reg_loss, d_reg_loss, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+    cudaFree(d_reg_loss);
+}
+
+}  // extern "C"

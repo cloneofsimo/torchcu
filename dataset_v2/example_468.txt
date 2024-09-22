@@ -1,0 +1,114 @@
+```python
+import torch
+
+def my_complex_function(input_tensor: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of matrix multiplications, element-wise multiplication, and a final reduction.
+    """
+    output = torch.matmul(input_tensor, weight1.t())
+    output = torch.matmul(output, weight2)
+    output = output * torch.full(output.shape, 2.0)  # Element-wise multiplication
+    output = torch.sum(output, dim=1, keepdim=True)  # Reduction along dimension 1
+    return output
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32)
+    ],
+    "outputs": [
+        ((4, 1), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+__global__ void complex_kernel(const float* input_tensor, const float* weight1, const float* weight2, float* output,
+                                int m, int n, int k, int p) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < p) {
+        float sum1 = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            sum1 += input_tensor[row * n + i] * weight1[i * k + col];
+        }
+        float sum2 = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum2 += sum1 * weight2[col * k + i];
+        }
+        output[row * p + col] = sum2 * 2.0f;
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight1 tensor
+    const float* weight1 = va_arg(args, const float*);
+    int weight1_dim0 = va_arg(args, int);
+    int weight1_dim1 = va_arg(args, int);
+
+    // Extract weight2 tensor
+    const float* weight2 = va_arg(args, const float*);
+    int weight2_dim0 = va_arg(args, int);
+    int weight2_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int m = input_tensor_dim0;
+    int n = input_tensor_dim1;
+    int k = weight1_dim0;
+    int p = weight2_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weight1, *d_weight2, *d_output;
+    cudaMalloc(&d_input, m * n * sizeof(float));
+    cudaMalloc(&d_weight1, k * n * sizeof(float));
+    cudaMalloc(&d_weight2, p * k * sizeof(float));
+    cudaMalloc(&d_output, m * p * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, m * n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight1, weight1, k * n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight2, weight2, p * k * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((p + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (m + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    complex_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight1, d_weight2, d_output, m, n, k, p
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, m * p * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight1);
+    cudaFree(d_weight2);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```
+

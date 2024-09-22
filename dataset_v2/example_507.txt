@@ -1,0 +1,540 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MyModule(nn.Module):
+    def __init__(self, dim, drop_prob=0.1):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, kernel_size=3, padding=1)
+        self.drop_path = DropPath(drop_prob)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.drop_path(x)
+        x = F.log_softmax(x, dim=-1)
+        return x
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    """
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = (x / keep_prob) * random_tensor
+        return output
+
+def my_function(input_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations, including:
+    1. Convolution with a 1D kernel
+    2. DropPath (stochastic depth)
+    3. LogSoftmax
+    4. Diagonal extraction
+    """
+    module = MyModule(dim=input_tensor.size(1))
+    output = module(input_tensor)
+    output = torch.diag(output)
+    return output
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((1, 4, 10), torch.float32),
+    ],
+    "outputs": [
+        ((4,), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for 1D convolution
+__global__ void conv1d_kernel(const float* input, const float* weight, float* output,
+                              int batch_size, int input_channels, int output_channels, int kernel_size, int input_length) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < input_length) {
+        float sum = 0.0f;
+        for (int k = 0; k < kernel_size; ++k) {
+            int idx = (i + k - kernel_size / 2) % input_length;
+            if (idx >= 0 && idx < input_length) {
+                for (int c = 0; c < input_channels; ++c) {
+                    sum += input[b * input_channels * input_length + c * input_length + idx] * weight[c * output_channels * kernel_size + k * output_channels];
+                }
+            }
+        }
+        output[b * output_channels * input_length + i * output_channels] = sum;
+    }
+}
+
+// CUDA kernel for log_softmax
+__global__ void log_softmax_kernel(float* input, float* output, int batch_size, int input_channels, int input_length) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < input_length) {
+        float max_val = -FLT_MAX;
+        for (int c = 0; c < input_channels; ++c) {
+            max_val = fmaxf(max_val, input[b * input_channels * input_length + c * input_length + i]);
+        }
+
+        float sum = 0.0f;
+        for (int c = 0; c < input_channels; ++c) {
+            float exp_val = expf(input[b * input_channels * input_length + c * input_length + i] - max_val);
+            sum += exp_val;
+        }
+
+        output[b * input_channels * input_length + i * input_channels] = logf(sum) - max_val;
+    }
+}
+
+// CUDA kernel for diagonal extraction
+__global__ void diagonal_kernel(const float* input, float* output, int batch_size, int input_channels, int input_length) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < input_channels) {
+        output[b * input_channels + i] = input[b * input_channels * input_length + i * input_length + i];
+    }
+}
+
+// CUDA kernel for DropPath
+__global__ void drop_path_kernel(float* input, float* output, int batch_size, int channels, int length, float drop_prob) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = threadIdx.z;
+
+    if (b < batch_size && c < channels && i < length) {
+        float keep_prob = 1.0f - drop_prob;
+        float rand_val = (float)rand() / (float)RAND_MAX;
+        if (rand_val < keep_prob) {
+            output[b * channels * length + c * length + i] = input[b * channels * length + c * length + i] / keep_prob;
+        } else {
+            output[b * channels * length + c * length + i] = 0.0f;
+        }
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_channels = input_tensor_dim1;
+    int input_length = input_tensor_dim2;
+
+    // Kernel parameters
+    int kernel_size = 3;
+    int output_channels = input_channels;
+    float drop_prob = 0.1f;
+
+    // Allocate device memory
+    float* d_input, *d_output, *d_conv_output, *d_drop_output, *d_log_softmax_output;
+    cudaMalloc(&d_input, batch_size * input_channels * input_length * sizeof(float));
+    cudaMalloc(&d_output, batch_size * input_channels * sizeof(float));
+    cudaMalloc(&d_conv_output, batch_size * output_channels * input_length * sizeof(float));
+    cudaMalloc(&d_drop_output, batch_size * output_channels * input_length * sizeof(float));
+    cudaMalloc(&d_log_softmax_output, batch_size * output_channels * input_length * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_channels * input_length * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Allocate and initialize weights on device
+    float* d_weight;
+    cudaMalloc(&d_weight, input_channels * output_channels * kernel_size * sizeof(float));
+    float* weight_host = new float[input_channels * output_channels * kernel_size];
+    // Initialize with random weights (replace with actual weight initialization logic)
+    for (int i = 0; i < input_channels * output_channels * kernel_size; ++i) {
+        weight_host[i] = (float)rand() / (float)RAND_MAX;
+    }
+    cudaMemcpy(d_weight, weight_host, input_channels * output_channels * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+    delete[] weight_host;
+
+    // Launch convolution kernel
+    dim3 threadsPerBlock(32, 16);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (input_length + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    conv1d_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_conv_output,
+                                               batch_size, input_channels, output_channels, kernel_size, input_length);
+
+    // Launch drop path kernel
+    dim3 threadsPerBlockDrop(32, 16, 8);
+    dim3 numBlocksDrop((batch_size + threadsPerBlockDrop.x - 1) / threadsPerBlockDrop.x,
+                     (output_channels + threadsPerBlockDrop.y - 1) / threadsPerBlockDrop.y);
+    drop_path_kernel<<<numBlocksDrop, threadsPerBlockDrop>>>(d_conv_output, d_drop_output,
+                                                  batch_size, output_channels, input_length, drop_prob);
+
+    // Launch log_softmax kernel
+    log_softmax_kernel<<<numBlocks, threadsPerBlock>>>(d_drop_output, d_log_softmax_output,
+                                               batch_size, output_channels, input_length);
+
+    // Launch diagonal kernel
+    dim3 threadsPerBlockDiag(32, 16);
+    dim3 numBlocksDiag((batch_size + threadsPerBlockDiag.x - 1) / threadsPerBlockDiag.x,
+                     (input_channels + threadsPerBlockDiag.y - 1) / threadsPerBlockDiag.y);
+    diagonal_kernel<<<numBlocksDiag, threadsPerBlockDiag>>>(d_log_softmax_output, d_output,
+                                                  batch_size, input_channels, input_length);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_channels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_conv_output);
+    cudaFree(d_drop_output);
+    cudaFree(d_log_softmax_output);
+    cudaFree(d_weight);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for 1D convolution
+__global__ void conv1d_kernel(const float* input, const float* weight, float* output,
+                              int batch_size, int input_channels, int output_channels, int kernel_size, int input_length) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < input_length) {
+        float sum = 0.0f;
+        for (int k = 0; k < kernel_size; ++k) {
+            int idx = (i + k - kernel_size / 2) % input_length;
+            if (idx >= 0 && idx < input_length) {
+                for (int c = 0; c < input_channels; ++c) {
+                    sum += input[b * input_channels * input_length + c * input_length + idx] * weight[c * output_channels * kernel_size + k * output_channels];
+                }
+            }
+        }
+        output[b * output_channels * input_length + i * output_channels] = sum;
+    }
+}
+
+// CUDA kernel for log_softmax
+__global__ void log_softmax_kernel(float* input, float* output, int batch_size, int input_channels, int input_length) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < input_length) {
+        float max_val = -FLT_MAX;
+        for (int c = 0; c < input_channels; ++c) {
+            max_val = fmaxf(max_val, input[b * input_channels * input_length + c * input_length + i]);
+        }
+
+        float sum = 0.0f;
+        for (int c = 0; c < input_channels; ++c) {
+            float exp_val = expf(input[b * input_channels * input_length + c * input_length + i] - max_val);
+            sum += exp_val;
+        }
+
+        output[b * input_channels * input_length + i * input_channels] = logf(sum) - max_val;
+    }
+}
+
+// CUDA kernel for diagonal extraction
+__global__ void diagonal_kernel(const float* input, float* output, int batch_size, int input_channels, int input_length) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < input_channels) {
+        output[b * input_channels + i] = input[b * input_channels * input_length + i * input_length + i];
+    }
+}
+
+// CUDA kernel for DropPath
+__global__ void drop_path_kernel(float* input, float* output, int batch_size, int channels, int length, float drop_prob) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = threadIdx.z;
+
+    if (b < batch_size && c < channels && i < length) {
+        float keep_prob = 1.0f - drop_prob;
+        float rand_val = (float)rand() / (float)RAND_MAX;
+        if (rand_val < keep_prob) {
+            output[b * channels * length + c * length + i] = input[b * channels * length + c * length + i] / keep_prob;
+        } else {
+            output[b * channels * length + c * length + i] = 0.0f;
+        }
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_channels = input_tensor_dim1;
+    int input_length = input_tensor_dim2;
+
+    // Kernel parameters
+    int kernel_size = 3;
+    int output_channels = input_channels;
+    float drop_prob = 0.1f;
+
+    // Allocate device memory
+    float* d_input, *d_output, *d_conv_output, *d_drop_output, *d_log_softmax_output;
+    cudaMalloc(&d_input, batch_size * input_channels * input_length * sizeof(float));
+    cudaMalloc(&d_output, batch_size * input_channels * sizeof(float));
+    cudaMalloc(&d_conv_output, batch_size * output_channels * input_length * sizeof(float));
+    cudaMalloc(&d_drop_output, batch_size * output_channels * input_length * sizeof(float));
+    cudaMalloc(&d_log_softmax_output, batch_size * output_channels * input_length * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_channels * input_length * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Allocate and initialize weights on device
+    float* d_weight;
+    cudaMalloc(&d_weight, input_channels * output_channels * kernel_size * sizeof(float));
+    float* weight_host = new float[input_channels * output_channels * kernel_size];
+    // Initialize with random weights (replace with actual weight initialization logic)
+    for (int i = 0; i < input_channels * output_channels * kernel_size; ++i) {
+        weight_host[i] = (float)rand() / (float)RAND_MAX;
+    }
+    cudaMemcpy(d_weight, weight_host, input_channels * output_channels * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+    delete[] weight_host;
+
+    // Launch convolution kernel
+    dim3 threadsPerBlock(32, 16);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (input_length + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    conv1d_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_conv_output,
+                                               batch_size, input_channels, output_channels, kernel_size, input_length);
+
+    // Launch drop path kernel
+    dim3 threadsPerBlockDrop(32, 16, 8);
+    dim3 numBlocksDrop((batch_size + threadsPerBlockDrop.x - 1) / threadsPerBlockDrop.x,
+                     (output_channels + threadsPerBlockDrop.y - 1) / threadsPerBlockDrop.y);
+    drop_path_kernel<<<numBlocksDrop, threadsPerBlockDrop>>>(d_conv_output, d_drop_output,
+                                                  batch_size, output_channels, input_length, drop_prob);
+
+    // Launch log_softmax kernel
+    log_softmax_kernel<<<numBlocks, threadsPerBlock>>>(d_drop_output, d_log_softmax_output,
+                                               batch_size, output_channels, input_length);
+
+    // Launch diagonal kernel
+    dim3 threadsPerBlockDiag(32, 16);
+    dim3 numBlocksDiag((batch_size + threadsPerBlockDiag.x - 1) / threadsPerBlockDiag.x,
+                     (input_channels + threadsPerBlockDiag.y - 1) / threadsPerBlockDiag.y);
+    diagonal_kernel<<<numBlocksDiag, threadsPerBlockDiag>>>(d_log_softmax_output, d_output,
+                                                  batch_size, input_channels, input_length);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_channels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_conv_output);
+    cudaFree(d_drop_output);
+    cudaFree(d_log_softmax_output);
+    cudaFree(d_weight);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for 1D convolution
+__global__ void conv1d_kernel(const float* input, const float* weight, float* output,
+                              int batch_size, int input_channels, int output_channels, int kernel_size, int input_length) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < input_length) {
+        float sum = 0.0f;
+        for (int k = 0; k < kernel_size; ++k) {
+            int idx = (i + k - kernel_size / 2) % input_length;
+            if (idx >= 0 && idx < input_length) {
+                for (int c = 0; c < input_channels; ++c) {
+                    sum += input[b * input_channels * input_length + c * input_length + idx] * weight[c * output_channels * kernel_size + k * output_channels];
+                }
+            }
+        }
+        output[b * output_channels * input_length + i * output_channels] = sum;
+    }
+}
+
+// CUDA kernel for log_softmax
+__global__ void log_softmax_kernel(float* input, float* output, int batch_size, int input_channels, int input_length) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < input_length) {
+        float max_val = -FLT_MAX;
+        for (int c = 0; c < input_channels; ++c) {
+            max_val = fmaxf(max_val, input[b * input_channels * input_length + c * input_length + i]);
+        }
+
+        float sum = 0.0f;
+        for (int c = 0; c < input_channels; ++c) {
+            float exp_val = expf(input[b * input_channels * input_length + c * input_length + i] - max_val);
+            sum += exp_val;
+        }
+
+        output[b * input_channels * input_length + i * input_channels] = logf(sum) - max_val;
+    }
+}
+
+// CUDA kernel for diagonal extraction
+__global__ void diagonal_kernel(const float* input, float* output, int batch_size, int input_channels, int input_length) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < input_channels) {
+        output[b * input_channels + i] = input[b * input_channels * input_length + i * input_length + i];
+    }
+}
+
+// CUDA kernel for DropPath
+__global__ void drop_path_kernel(float* input, float* output, int batch_size, int channels, int length, float drop_prob) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = threadIdx.z;
+
+    if (b < batch_size && c < channels && i < length) {
+        float keep_prob = 1.0f - drop_prob;
+        float rand_val = (float)rand() / (float)RAND_MAX;
+        if (rand_val < keep_prob) {
+            output[b * channels * length + c * length + i] = input[b * channels * length + c * length + i] / keep_prob;
+        } else {
+            output[b * channels * length + c * length + i] = 0.0f;
+        }
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_channels = input_tensor_dim1;
+    int input_length = input_tensor_dim2;
+
+    // Kernel parameters
+    int kernel_size = 3;
+    int output_channels = input_channels;
+    float drop_prob = 0.1f;
+
+    // Allocate device memory
+    float* d_input, *d_output, *d_conv_output, *d_drop_output, *d_log_softmax_output;
+    cudaMalloc(&d_input, batch_size * input_channels * input_length * sizeof(float));
+    cudaMalloc(&d_output, batch_size * input_channels * sizeof(float));
+    cudaMalloc(&d_conv_output, batch_size * output_channels * input_length * sizeof(float));
+    cudaMalloc(&d_drop_output, batch_size * output_channels * input_length * sizeof(float));
+    cudaMalloc(&d_log_softmax_output, batch_size * output_channels * input_length * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_channels * input_length * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Allocate and initialize weights on device
+    float* d_weight;
+    cudaMalloc(&d_weight, input_channels * output_channels * kernel_size * sizeof(float));
+    float* weight_host = new float[input_channels * output_channels * kernel_size];
+    // Initialize with random weights (replace with actual weight initialization logic)
+    for (int i = 0; i < input_channels * output_channels * kernel_size; ++i) {
+        weight_host[i] = (float)rand() / (float)RAND_MAX;
+    }
+    cudaMemcpy(d_weight, weight_host, input_channels * output_channels * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+    delete[] weight_host;
+
+    // Launch convolution kernel
+    dim3 threadsPerBlock(32, 16);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (input_length + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    conv1d_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_conv_output,
+                                               batch_size, input_channels, output_channels, kernel_size, input_length);
+
+    // Launch drop path kernel
+    dim3 threadsPerBlockDrop(32, 16, 8);
+    dim3 numBlocksDrop((batch_size + threadsPerBlockDrop.x - 1) / threadsPerBlockDrop.x,
+                     (output_channels + threadsPerBlockDrop.y - 1) / threadsPerBlockDrop.y);
+    drop_path_kernel<<<numBlocksDrop, threadsPerBlockDrop>>>(d_conv_output, d_drop_output,
+                                                  batch_size, output_channels, input_length, drop_prob);
+
+    // Launch log_softmax kernel
+    log_softmax_kernel<<<numBlocks, threadsPerBlock>>>(d_drop_output, d_log_softmax_output,
+                                               batch_size, output_channels, input_length);
+
+    // Launch diagonal kernel
+    dim3 threadsPerBlockDiag(32, 16);
+    dim3 numBlocksDiag((batch_size + threadsPerBlockDiag.x - 1) / threadsPerBlockDiag.x,
+                     (input_channels + threadsPerBlockDiag.y - 1) / threadsPerBlockDiag.y);
+    diagonal_kernel<<<numBlocksDiag, threadsPerBlockDiag>>>(d_log_softmax_output, d_output,
+                                                  batch_size, input_channels, input_length);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_channels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_conv_output);
+    cudaFree(d_drop_output);
+    cudaFree(d_log_softmax_output);
+    cudaFree(d_weight);
+}
+
+}  // extern "C"
+```

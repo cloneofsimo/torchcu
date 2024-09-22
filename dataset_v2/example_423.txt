@@ -1,0 +1,243 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+
+def masked_attention_transposed_conv(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                                      mask: torch.Tensor,
+                                      weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Performs masked attention followed by a transposed convolution with bias.
+
+    Args:
+        query (torch.Tensor): Query tensor of shape (batch_size, query_len, hidden_dim).
+        key (torch.Tensor): Key tensor of shape (batch_size, key_len, hidden_dim).
+        value (torch.Tensor): Value tensor of shape (batch_size, key_len, hidden_dim).
+        mask (torch.Tensor): Mask tensor of shape (batch_size, query_len, key_len).
+        weight (torch.Tensor): Weight tensor for transposed convolution of shape (out_channels, in_channels, kernel_size).
+        bias (torch.Tensor): Bias tensor for transposed convolution of shape (out_channels).
+
+    Returns:
+        torch.Tensor: Output tensor of shape (batch_size, out_channels, output_len).
+    """
+    # Masked attention
+    attention_scores = torch.matmul(query, key.transpose(-2, -1))
+    attention_scores = attention_scores / (query.size(-1) ** 0.5)
+    attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
+    attention_weights = F.softmax(attention_scores, dim=-1)
+    context = torch.matmul(attention_weights, value)
+
+    # Transposed convolution
+    output = F.conv_transpose1d(context, weight, bias=bias)
+
+    return output
+
+function_signature = {
+    "name": "masked_attention_transposed_conv",
+    "inputs": [
+        ((1, 10, 512), torch.float32),
+        ((1, 20, 512), torch.float32),
+        ((1, 20, 512), torch.float32),
+        ((1, 10, 20), torch.bool),
+        ((256, 512, 3), torch.float32),
+        ((256,), torch.float32)
+    ],
+    "outputs": [
+        ((1, 256, 12), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+__global__ void masked_attention_kernel(const float* query, const float* key, const float* value, const bool* mask,
+                                        float* attention_scores, int batch_size, int query_len, int key_len, int hidden_dim) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < query_len) {
+        for (int j = 0; j < key_len; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k < hidden_dim; ++k) {
+                sum += query[b * query_len * hidden_dim + i * hidden_dim + k] *
+                       key[b * key_len * hidden_dim + j * hidden_dim + k];
+            }
+            attention_scores[b * query_len * key_len + i * key_len + j] = sum / sqrtf(hidden_dim);
+            if (mask[b * query_len * key_len + i * key_len + j] == 0) {
+                attention_scores[b * query_len * key_len + i * key_len + j] = -INFINITY;
+            }
+        }
+    }
+}
+
+__global__ void softmax_kernel(const float* attention_scores, float* attention_weights, 
+                                int batch_size, int query_len, int key_len) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < query_len) {
+        float max_score = attention_scores[b * query_len * key_len + i * key_len];
+        for (int j = 1; j < key_len; ++j) {
+            max_score = fmaxf(max_score, attention_scores[b * query_len * key_len + i * key_len + j]);
+        }
+        float sum = 0.0f;
+        for (int j = 0; j < key_len; ++j) {
+            sum += expf(attention_scores[b * query_len * key_len + i * key_len + j] - max_score);
+        }
+        for (int j = 0; j < key_len; ++j) {
+            attention_weights[b * query_len * key_len + i * key_len + j] =
+                expf(attention_scores[b * query_len * key_len + i * key_len + j] - max_score) / sum;
+        }
+    }
+}
+
+__global__ void context_kernel(const float* attention_weights, const float* value, float* context, 
+                               int batch_size, int query_len, int key_len, int hidden_dim) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && i < query_len) {
+        for (int k = 0; k < hidden_dim; ++k) {
+            float sum = 0.0f;
+            for (int j = 0; j < key_len; ++j) {
+                sum += attention_weights[b * query_len * key_len + i * key_len + j] *
+                       value[b * key_len * hidden_dim + j * hidden_dim + k];
+            }
+            context[b * query_len * hidden_dim + i * hidden_dim + k] = sum;
+        }
+    }
+}
+
+__global__ void transposed_conv_kernel(const float* context, const float* weight, const float* bias, float* output,
+                                      int batch_size, int in_channels, int out_channels, int query_len, int kernel_size) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = threadIdx.z;
+
+    if (b < batch_size && o < out_channels && i < query_len) {
+        float sum = bias[o];
+        for (int k = 0; k < kernel_size; ++k) {
+            int j = i + k - (kernel_size - 1);
+            if (j >= 0 && j < query_len) {
+                for (int c = 0; c < in_channels; ++c) {
+                    sum += context[b * query_len * in_channels + j * in_channels + c] * 
+                           weight[o * in_channels * kernel_size + c * kernel_size + k];
+                }
+            }
+        }
+        output[b * out_channels * query_len + o * query_len + i] = sum;
+    }
+}
+
+
+extern "C" {
+
+void masked_attention_transposed_conv(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+    int query_dim2 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+    int key_dim2 = va_arg(args, int);
+
+    const float* value = va_arg(args, const float*);
+    int value_dim0 = va_arg(args, int);
+    int value_dim1 = va_arg(args, int);
+    int value_dim2 = va_arg(args, int);
+
+    const bool* mask = va_arg(args, const bool*);
+    int mask_dim0 = va_arg(args, int);
+    int mask_dim1 = va_arg(args, int);
+    int mask_dim2 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = query_dim0;
+    int query_len = query_dim1;
+    int key_len = key_dim1;
+    int hidden_dim = query_dim2;
+    int out_channels = weight_dim0;
+    int kernel_size = weight_dim2;
+
+    float* d_query, *d_key, *d_value, *d_mask, *d_attention_scores, *d_attention_weights, *d_context, *d_weight, *d_bias, *d_output;
+
+    cudaMalloc(&d_query, batch_size * query_len * hidden_dim * sizeof(float));
+    cudaMalloc(&d_key, batch_size * key_len * hidden_dim * sizeof(float));
+    cudaMalloc(&d_value, batch_size * key_len * hidden_dim * sizeof(float));
+    cudaMalloc(&d_mask, batch_size * query_len * key_len * sizeof(bool));
+    cudaMalloc(&d_attention_scores, batch_size * query_len * key_len * sizeof(float));
+    cudaMalloc(&d_attention_weights, batch_size * query_len * key_len * sizeof(float));
+    cudaMalloc(&d_context, batch_size * query_len * hidden_dim * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * hidden_dim * kernel_size * sizeof(float));
+    cudaMalloc(&d_bias, out_channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * query_len * sizeof(float));
+
+    cudaMemcpy(d_query, query, batch_size * query_len * hidden_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_key, key, batch_size * key_len * hidden_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_value, value, batch_size * key_len * hidden_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mask, mask, batch_size * query_len * key_len * sizeof(bool), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, out_channels * hidden_dim * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, out_channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 threadsPerBlock(32, 32, 1);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (query_len + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    masked_attention_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_query, d_key, d_value, d_mask, d_attention_scores, batch_size, query_len, key_len, hidden_dim
+    );
+
+    softmax_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_attention_scores, d_attention_weights, batch_size, query_len, key_len
+    );
+
+    context_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_attention_weights, d_value, d_context, batch_size, query_len, key_len, hidden_dim
+    );
+
+    numBlocks = ((out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                 (batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    transposed_conv_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_context, d_weight, d_bias, d_output, batch_size, hidden_dim, out_channels, query_len, kernel_size
+    );
+
+    cudaMemcpy(output, d_output, batch_size * out_channels * query_len * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_query);
+    cudaFree(d_key);
+    cudaFree(d_value);
+    cudaFree(d_mask);
+    cudaFree(d_attention_scores);
+    cudaFree(d_attention_weights);
+    cudaFree(d_context);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

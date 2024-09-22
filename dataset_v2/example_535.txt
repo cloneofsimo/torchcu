@@ -1,0 +1,290 @@
+```python
+import torch
+
+def my_function(input_tensor: torch.Tensor, buckets: list[float]) -> list[torch.Tensor]:
+    """
+    Performs the following operations:
+    1. Bucketizes the input tensor based on the provided buckets.
+    2. Calculates the standard deviation of each bucket.
+    3. Returns the bucketized tensor and the standard deviation values.
+    """
+    
+    bucketized_tensor = torch.bucketize(input_tensor, torch.tensor(buckets))
+    std_values = []
+    for i in range(len(buckets) + 1):
+        mask = bucketized_tensor == i
+        if mask.any():
+            std_values.append(input_tensor[mask].std())
+        else:
+            std_values.append(torch.tensor(0.0))
+
+    return [bucketized_tensor.to(torch.bfloat16), torch.tensor(std_values).to(torch.bfloat16)]
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((10,), torch.float32),
+        ([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], None),
+    ],
+    "outputs": [
+        ((10,), torch.bfloat16),
+        ((7,), torch.bfloat16)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for bucketizing and calculating standard deviation
+__global__ void bucketize_std_kernel(const float* input_tensor, const float* buckets,
+                                    int* bucketized_tensor, float* std_values,
+                                    int input_size, int num_buckets) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < input_size) {
+        int bucket_index = 0;
+        for (int i = 0; i < num_buckets; ++i) {
+            if (input_tensor[idx] < buckets[i]) {
+                break;
+            }
+            bucket_index++;
+        }
+        bucketized_tensor[idx] = bucket_index;
+    }
+
+    // Calculate standard deviations (reduction operation)
+    __shared__ float shared_data[1024]; // Adjust size based on block size
+    
+    // Each thread calculates the sum of squares and count for its bucket
+    float sum_squares = 0.0f;
+    int count = 0;
+    for (int i = idx; i < input_size; i += blockDim.x * gridDim.x) {
+        if (bucketized_tensor[i] == blockIdx.x) {
+            sum_squares += input_tensor[i] * input_tensor[i];
+            count++;
+        }
+    }
+
+    shared_data[threadIdx.x] = sum_squares;
+    shared_data[threadIdx.x + blockDim.x] = count;
+
+    __syncthreads();
+
+    // Reduce within the block
+    if (threadIdx.x == 0) {
+        float block_sum_squares = 0.0f;
+        int block_count = 0;
+        for (int i = 0; i < blockDim.x * 2; ++i) {
+            block_sum_squares += shared_data[i];
+            block_count += shared_data[i + blockDim.x];
+        }
+
+        if (block_count > 0) {
+            float mean = block_sum_squares / block_count;
+            float std = sqrtf(block_sum_squares / block_count - mean * mean);
+            std_values[blockIdx.x] = std;
+        } else {
+            std_values[blockIdx.x] = 0.0f;
+        }
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+
+    // Extract buckets
+    const float* buckets = va_arg(args, const float*);
+    int num_buckets = va_arg(args, int);
+
+    // Extract output tensors
+    int* bucketized_tensor = va_arg(args, int*);
+    float* std_values = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    int *d_bucketized_tensor;
+    float *d_std_values, *d_input, *d_buckets;
+    cudaMalloc(&d_bucketized_tensor, input_tensor_dim0 * sizeof(int));
+    cudaMalloc(&d_std_values, (num_buckets + 1) * sizeof(float));
+    cudaMalloc(&d_input, input_tensor_dim0 * sizeof(float));
+    cudaMalloc(&d_buckets, num_buckets * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_buckets, buckets, num_buckets * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(128);
+    dim3 numBlocks((input_tensor_dim0 + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    bucketize_std_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_buckets, d_bucketized_tensor, d_std_values, 
+        input_tensor_dim0, num_buckets
+    );
+
+    // Copy results back to host
+    cudaMemcpy(bucketized_tensor, d_bucketized_tensor, input_tensor_dim0 * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(std_values, d_std_values, (num_buckets + 1) * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Convert int output to bfloat16
+    for (int i = 0; i < input_tensor_dim0; i++) {
+        bucketized_tensor[i] = float_to_bfloat16(bucketized_tensor[i]);
+    }
+
+    // Free device memory
+    cudaFree(d_bucketized_tensor);
+    cudaFree(d_std_values);
+    cudaFree(d_input);
+    cudaFree(d_buckets);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for bucketizing and calculating standard deviation
+__global__ void bucketize_std_kernel(const float* input_tensor, const float* buckets,
+                                    int* bucketized_tensor, float* std_values,
+                                    int input_size, int num_buckets) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < input_size) {
+        int bucket_index = 0;
+        for (int i = 0; i < num_buckets; ++i) {
+            if (input_tensor[idx] < buckets[i]) {
+                break;
+            }
+            bucket_index++;
+        }
+        bucketized_tensor[idx] = bucket_index;
+    }
+
+    // Calculate standard deviations (reduction operation)
+    __shared__ float shared_data[1024]; // Adjust size based on block size
+    
+    // Each thread calculates the sum of squares and count for its bucket
+    float sum_squares = 0.0f;
+    int count = 0;
+    for (int i = idx; i < input_size; i += blockDim.x * gridDim.x) {
+        if (bucketized_tensor[i] == blockIdx.x) {
+            sum_squares += input_tensor[i] * input_tensor[i];
+            count++;
+        }
+    }
+
+    shared_data[threadIdx.x] = sum_squares;
+    shared_data[threadIdx.x + blockDim.x] = count;
+
+    __syncthreads();
+
+    // Reduce within the block
+    if (threadIdx.x == 0) {
+        float block_sum_squares = 0.0f;
+        int block_count = 0;
+        for (int i = 0; i < blockDim.x * 2; ++i) {
+            block_sum_squares += shared_data[i];
+            block_count += shared_data[i + blockDim.x];
+        }
+
+        if (block_count > 0) {
+            float mean = block_sum_squares / block_count;
+            float std = sqrtf(block_sum_squares / block_count - mean * mean);
+            std_values[blockIdx.x] = std;
+        } else {
+            std_values[blockIdx.x] = 0.0f;
+        }
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+
+    // Extract buckets
+    const float* buckets = va_arg(args, const float*);
+    int num_buckets = va_arg(args, int);
+
+    // Extract output tensors
+    int* bucketized_tensor = va_arg(args, int*);
+    float* std_values = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    int *d_bucketized_tensor;
+    float *d_std_values, *d_input, *d_buckets;
+    cudaMalloc(&d_bucketized_tensor, input_tensor_dim0 * sizeof(int));
+    cudaMalloc(&d_std_values, (num_buckets + 1) * sizeof(float));
+    cudaMalloc(&d_input, input_tensor_dim0 * sizeof(float));
+    cudaMalloc(&d_buckets, num_buckets * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_buckets, buckets, num_buckets * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(128);
+    dim3 numBlocks((input_tensor_dim0 + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    bucketize_std_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_buckets, d_bucketized_tensor, d_std_values, 
+        input_tensor_dim0, num_buckets
+    );
+
+    // Copy results back to host
+    cudaMemcpy(bucketized_tensor, d_bucketized_tensor, input_tensor_dim0 * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(std_values, d_std_values, (num_buckets + 1) * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Convert int output to bfloat16
+    for (int i = 0; i < input_tensor_dim0; i++) {
+        bucketized_tensor[i] = float_to_bfloat16(bucketized_tensor[i]);
+    }
+
+    // Free device memory
+    cudaFree(d_bucketized_tensor);
+    cudaFree(d_std_values);
+    cudaFree(d_input);
+    cudaFree(d_buckets);
+}
+
+}  // extern "C"
+```

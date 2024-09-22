@@ -1,0 +1,159 @@
+## func.py
+
+```python
+import torch
+
+def window_attention_fp32(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+                         window_size: int, head_size: int) -> torch.Tensor:
+    """
+    Performs windowed self-attention with FP32 precision.
+    
+    Args:
+        q: Query tensor of shape (B, N, H, head_size).
+        k: Key tensor of shape (B, N, H, head_size).
+        v: Value tensor of shape (B, N, H, head_size).
+        window_size: Size of the attention window.
+        head_size: Size of each attention head.
+    
+    Returns:
+        Output tensor of shape (B, N, H, head_size) after windowed self-attention.
+    """
+    B, N, H, _ = q.shape
+    
+    # Reshape for windowed attention
+    q = q.view(B, N // window_size, window_size, H, head_size)
+    k = k.view(B, N // window_size, window_size, H, head_size)
+    v = v.view(B, N // window_size, window_size, H, head_size)
+    
+    # Calculate attention weights
+    attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (head_size ** 0.5)
+    attn_weights = torch.softmax(attn_weights, dim=-1)
+    
+    # Apply attention weights
+    output = torch.matmul(attn_weights, v)
+    output = output.view(B, N, H, head_size)
+    
+    return output
+
+function_signature = {
+    "name": "window_attention_fp32",
+    "inputs": [
+        ((1, 1024, 12, 64), torch.float32),
+        ((1, 1024, 12, 64), torch.float32),
+        ((1, 1024, 12, 64), torch.float32),
+        (16, torch.int32),
+        (64, torch.int32),
+    ],
+    "outputs": [
+        ((1, 1024, 12, 64), torch.float32)
+    ]
+}
+
+```
+
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for windowed self-attention
+__global__ void window_attention_kernel(const float* q, const float* k, const float* v,
+                                        float* output, int B, int N, int H, int head_size, int window_size) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    int j;
+
+    if (b < B && i < N && h < H) {
+        int window_idx = i / window_size;
+        int window_offset = i % window_size;
+        float sum = 0.0f;
+
+        for (j = 0; j < window_size; ++j) {
+            int q_idx = (b * N * H + i * H + h) * head_size + j;
+            int k_idx = (b * N * H + window_idx * window_size * H + j * H + h) * head_size + window_offset;
+            int v_idx = (b * N * H + window_idx * window_size * H + j * H + h) * head_size + window_offset;
+
+            float attn_weight = expf(q[q_idx] * k[k_idx] / sqrtf((float)head_size));
+            sum += attn_weight * v[v_idx];
+        }
+
+        output[(b * N * H + i * H + h) * head_size + window_offset] = sum;
+    }
+}
+
+extern "C" {
+
+void window_attention_fp32(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* q = va_arg(args, const float*);
+    int q_dim0 = va_arg(args, int);
+    int q_dim1 = va_arg(args, int);
+    int q_dim2 = va_arg(args, int);
+    int q_dim3 = va_arg(args, int);
+
+    const float* k = va_arg(args, const float*);
+    int k_dim0 = va_arg(args, int);
+    int k_dim1 = va_arg(args, int);
+    int k_dim2 = va_arg(args, int);
+    int k_dim3 = va_arg(args, int);
+
+    const float* v = va_arg(args, const float*);
+    int v_dim0 = va_arg(args, int);
+    int v_dim1 = va_arg(args, int);
+    int v_dim2 = va_arg(args, int);
+    int v_dim3 = va_arg(args, int);
+
+    // Extract window size and head size
+    int window_size = va_arg(args, int);
+    int head_size = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int B = q_dim0;
+    int N = q_dim1;
+    int H = q_dim2;
+
+    // Allocate device memory
+    float* d_q, *d_k, *d_v, *d_output;
+    cudaMalloc(&d_q, B * N * H * head_size * sizeof(float));
+    cudaMalloc(&d_k, B * N * H * head_size * sizeof(float));
+    cudaMalloc(&d_v, B * N * H * head_size * sizeof(float));
+    cudaMalloc(&d_output, B * N * H * head_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_q, q, B * N * H * head_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k, B * N * H * head_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v, B * N * H * head_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((H + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (N + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (B + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    window_attention_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_q, d_k, d_v, d_output, B, N, H, head_size, window_size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, B * N * H * head_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

@@ -1,0 +1,251 @@
+```python
+import torch
+
+def complex_function(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on the input tensor:
+    1. Matrix multiplication with weight
+    2. Addition of bias
+    3. Exponential activation
+    4. Element-wise multiplication by a scalar (2.0)
+    5. Conversion to int8
+    """
+    output = torch.matmul(input_tensor.to(torch.bfloat16), weight.to(torch.bfloat16).t())
+    output = output.to(torch.float32) + bias 
+    output = torch.exp(output) * 2.0
+    return output.to(torch.int8)
+
+function_signature = {
+    "name": "complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4,), torch.float32),
+    ],
+    "outputs": [
+        ((4, 4), torch.int8),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for matrix multiplication, bias addition, exponential activation,
+// scalar multiplication, and conversion to int8
+__global__ void complex_kernel_bf16(const float* input_tensor, const float* weight, const float* bias, 
+                                       int8_t* output, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            __nv_bfloat16 a = float_to_bfloat16(input_tensor[row * k + i]);
+            __nv_bfloat16 b = float_to_bfloat16(weight[col * k + i]);  // Transposed access
+            sum += bfloat16_to_float(__hmul(a, b));
+        }
+        sum += bias[col]; // Add bias
+        sum = expf(sum) * 2.0f; // Exponential and scalar multiplication
+        output[row * n + col] = __int_as_int8(static_cast<int>(sum)); // Convert to int8
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim = va_arg(args, int); 
+
+    // Extract output tensor (assuming it's preallocated)
+    int8_t* output = va_arg(args, int8_t*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weight_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias;
+    int8_t *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_bias, bias_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(int8_t));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, bias_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    complex_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output, batch_size, output_dim, input_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(int8_t), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for matrix multiplication, bias addition, exponential activation,
+// scalar multiplication, and conversion to int8
+__global__ void complex_kernel_bf16(const float* input_tensor, const float* weight, const float* bias, 
+                                       int8_t* output, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            __nv_bfloat16 a = float_to_bfloat16(input_tensor[row * k + i]);
+            __nv_bfloat16 b = float_to_bfloat16(weight[col * k + i]);  // Transposed access
+            sum += bfloat16_to_float(__hmul(a, b));
+        }
+        sum += bias[col]; // Add bias
+        sum = expf(sum) * 2.0f; // Exponential and scalar multiplication
+        output[row * n + col] = __int_as_int8(static_cast<int>(sum)); // Convert to int8
+    }
+}
+
+extern "C" {
+
+void complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim = va_arg(args, int); 
+
+    // Extract output tensor (assuming it's preallocated)
+    int8_t* output = va_arg(args, int8_t*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weight_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias;
+    int8_t *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_bias, bias_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(int8_t));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, bias_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    complex_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output, batch_size, output_dim, input_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(int8_t), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```
+
+**Explanation:**
+
+1. **Python Function:**
+    - `complex_function` takes an input tensor, a weight tensor, and a bias tensor as inputs.
+    - It performs matrix multiplication, bias addition, exponential activation, and scales the result by 2.0.
+    - Finally, it converts the output to int8.
+2. **Cuda Kernel:**
+    - `complex_kernel_bf16` implements the same logic as the Python function in CUDA.
+    - It uses bfloat16 for the matrix multiplication to save memory bandwidth and uses fast intrinsics like `__hmul`.
+    - It handles the conversion to int8 using `__int_as_int8`.
+3. **C++ Wrapper:**
+    - The `complex_function` C++ function takes arguments using `va_arg` and handles memory management.
+    - It launches the CUDA kernel with a block size of 16x16 and adjusts the number of blocks to fit the data size.
+
+**Key Points:**
+
+- **Bfloat16:** The use of bfloat16 in the matrix multiplication helps reduce memory bandwidth requirements, leading to potential performance improvements.
+- **Int8 Conversion:** Converting to int8 at the end allows for further memory savings, but it introduces a potential loss of precision.
+- **Kernel Optimization:** The kernel utilizes the fast `__hmul` intrinsic for bfloat16 multiplication and the `__int_as_int8` intrinsic for the conversion to int8.
+
+This example demonstrates how to implement a complex function in CUDA using bfloat16 and int8 with optimized kernel performance. 

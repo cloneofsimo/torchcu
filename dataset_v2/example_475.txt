@@ -1,0 +1,123 @@
+## func.py
+
+```python
+import torch
+
+def bucketize_and_relu(input_tensor: torch.Tensor, boundaries: torch.Tensor) -> torch.Tensor:
+    """
+    Bucketizes the input tensor based on the provided boundaries and applies ReLU activation.
+
+    Args:
+        input_tensor: Input tensor of any shape.
+        boundaries: Tensor of boundaries for bucketing. Must be 1-dimensional.
+
+    Returns:
+        Tensor with the same shape as the input tensor, but with values bucketized and activated.
+    """
+    output = torch.bucketize(input_tensor.to(torch.bfloat16), boundaries.to(torch.bfloat16))
+    return torch.relu(output).to(torch.float32)
+
+
+function_signature = {
+    "name": "bucketize_and_relu",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4,), torch.float32)
+    ],
+    "outputs": [
+        ((4, 4), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for bucketing and ReLU using bfloat16
+__global__ void bucketize_relu_kernel_bf16(const float* input_tensor, const float* boundaries, float* output, 
+                                        int num_elements, int num_boundaries) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < num_elements) {
+        __nv_bfloat16 value = float_to_bfloat16(input_tensor[idx]);
+
+        // Find the bucket index for the value
+        int bucket_index = 0;
+        for (int i = 0; i < num_boundaries; ++i) {
+            __nv_bfloat16 boundary = float_to_bfloat16(boundaries[i]);
+            if (value < boundary) {
+                break;
+            }
+            bucket_index++;
+        }
+
+        output[idx] = bfloat16_to_float(__hmaxf(float_to_bfloat16(bucket_index), float_to_bfloat16(0.0f))); 
+    }
+}
+
+extern "C" {
+
+void bucketize_and_relu(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract boundaries tensor
+    const float* boundaries = va_arg(args, const float*);
+    int num_boundaries = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int num_elements = input_tensor_dim0 * input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_boundaries, *d_output;
+    cudaMalloc(&d_input, num_elements * sizeof(float));
+    cudaMalloc(&d_boundaries, num_boundaries * sizeof(float));
+    cudaMalloc(&d_output, num_elements * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_boundaries, boundaries, num_boundaries * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((num_elements + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    bucketize_relu_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_boundaries, d_output, num_elements, num_boundaries
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_boundaries);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

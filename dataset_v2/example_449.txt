@@ -1,0 +1,189 @@
+## func.py
+
+```python
+import torch
+
+def masked_attention_bf16(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Performs masked attention with bfloat16 precision.
+
+    Args:
+        query: Query tensor of shape (batch_size, seq_len_q, hidden_dim).
+        key: Key tensor of shape (batch_size, seq_len_k, hidden_dim).
+        value: Value tensor of shape (batch_size, seq_len_v, hidden_dim).
+        mask: Attention mask tensor of shape (batch_size, seq_len_q, seq_len_k).
+
+    Returns:
+        Output tensor of shape (batch_size, seq_len_q, hidden_dim).
+    """
+
+    # Convert to bfloat16
+    query_bf16 = query.to(torch.bfloat16)
+    key_bf16 = key.to(torch.bfloat16)
+    value_bf16 = value.to(torch.bfloat16)
+
+    # Calculate attention scores
+    scores = torch.matmul(query_bf16, key_bf16.transpose(-2, -1)) / (query_bf16.shape[-1] ** 0.5)
+
+    # Apply mask
+    scores = torch.where(mask == 0, -float('inf'), scores)
+
+    # Softmax normalization
+    attention_weights = torch.softmax(scores, dim=-1)
+
+    # Weighted sum of values
+    output_bf16 = torch.matmul(attention_weights, value_bf16)
+
+    # Return output in float32
+    return output_bf16.to(torch.float32)
+
+function_signature = {
+    "name": "masked_attention_bf16",
+    "inputs": [
+        ((2, 4, 8), torch.float32),
+        ((2, 6, 8), torch.float32),
+        ((2, 6, 8), torch.float32),
+        ((2, 4, 6), torch.bool)
+    ],
+    "outputs": [
+        ((2, 4, 8), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for masked attention with bfloat16
+__global__ void masked_attention_bf16_kernel(const float* query, const float* key, const float* value,
+                                            const bool* mask, float* output, int batch_size,
+                                            int seq_len_q, int seq_len_k, int hidden_dim) {
+    int b = blockIdx.x;
+    int i = threadIdx.x;
+
+    if (b < batch_size && i < seq_len_q) {
+        float sum = 0.0f;
+        __nv_bfloat16 query_val, key_val, weight, sum_bf16;
+        for (int j = 0; j < seq_len_k; ++j) {
+            query_val = float_to_bfloat16(query[(b * seq_len_q + i) * hidden_dim + j]);
+            key_val = float_to_bfloat16(key[(b * seq_len_k + j) * hidden_dim + i]);
+            
+            // Calculate attention score using bfloat16
+            weight = __hmul(query_val, key_val) / __int2bfloat16(hidden_dim);
+            
+            // Apply mask
+            if (!mask[b * seq_len_q * seq_len_k + i * seq_len_k + j]) {
+                weight = __int2bfloat16(-1e37);
+            }
+
+            sum_bf16 = __hadd(sum_bf16, weight);
+        }
+
+        // Softmax normalization with bfloat16
+        sum_bf16 = __hexp(sum_bf16);
+        float sum_exp = bfloat16_to_float(sum_bf16);
+        for (int j = 0; j < seq_len_k; ++j) {
+            query_val = float_to_bfloat16(query[(b * seq_len_q + i) * hidden_dim + j]);
+            key_val = float_to_bfloat16(key[(b * seq_len_k + j) * hidden_dim + i]);
+
+            // Calculate attention score using bfloat16
+            weight = __hmul(query_val, key_val) / __int2bfloat16(hidden_dim);
+            
+            // Apply mask
+            if (!mask[b * seq_len_q * seq_len_k + i * seq_len_k + j]) {
+                weight = __int2bfloat16(-1e37);
+            }
+
+            weight = __hexp(weight);
+            weight = __hdiv(weight, sum_bf16);
+            value_bf16 = float_to_bfloat16(value[(b * seq_len_k + j) * hidden_dim + i]);
+
+            // Weighted sum of values with bfloat16
+            sum_bf16 = __hmul(weight, value_bf16);
+            sum += bfloat16_to_float(sum_bf16);
+        }
+        
+        output[(b * seq_len_q + i) * hidden_dim + i] = sum;
+    }
+}
+
+extern "C" {
+void masked_attention_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+    int query_dim2 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+    int key_dim2 = va_arg(args, int);
+
+    const float* value = va_arg(args, const float*);
+    int value_dim0 = va_arg(args, int);
+    int value_dim1 = va_arg(args, int);
+    int value_dim2 = va_arg(args, int);
+
+    const bool* mask = va_arg(args, const bool*);
+    int mask_dim0 = va_arg(args, int);
+    int mask_dim1 = va_arg(args, int);
+    int mask_dim2 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_query, *d_key, *d_value, *d_output;
+    bool* d_mask;
+    cudaMalloc(&d_query, query_dim0 * query_dim1 * query_dim2 * sizeof(float));
+    cudaMalloc(&d_key, key_dim0 * key_dim1 * key_dim2 * sizeof(float));
+    cudaMalloc(&d_value, value_dim0 * value_dim1 * value_dim2 * sizeof(float));
+    cudaMalloc(&d_mask, mask_dim0 * mask_dim1 * mask_dim2 * sizeof(bool));
+    cudaMalloc(&d_output, query_dim0 * query_dim1 * query_dim2 * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_query, query, query_dim0 * query_dim1 * query_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_key, key, key_dim0 * key_dim1 * key_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_value, value, value_dim0 * value_dim1 * value_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mask, mask, mask_dim0 * mask_dim1 * mask_dim2 * sizeof(bool), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    masked_attention_bf16_kernel<<<query_dim0, query_dim1>>>(
+        d_query, d_key, d_value, d_mask, d_output,
+        query_dim0, query_dim1, key_dim1, query_dim2
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, query_dim0 * query_dim1 * query_dim2 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_query);
+    cudaFree(d_key);
+    cudaFree(d_value);
+    cudaFree(d_mask);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

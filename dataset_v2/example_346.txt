@@ -1,0 +1,139 @@
+```python
+import torch
+
+def diagflat_relu_function(input_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Applies ReLU to the diagonal of a tensor.
+    """
+    diag = torch.diagflat(input_tensor)
+    return torch.relu(diag)
+
+function_signature = {
+    "name": "diagflat_relu_function",
+    "inputs": [
+        ((4, 4), torch.float32)
+    ],
+    "outputs": [
+        ((4, 4), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+__global__ void diagflat_relu_kernel(const float* input_tensor, float* output, int size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    output[i * size + i] = fmaxf(input_tensor[i], 0.0f);
+  }
+}
+
+extern "C" {
+void diagflat_relu_function(int num_args, ...) {
+  va_list args;
+  va_start(args, num_args);
+
+  const float* input_tensor = va_arg(args, const float*);
+  int size = va_arg(args, int); // Assuming a square input tensor
+
+  float* output = va_arg(args, float*);
+
+  va_end(args);
+
+  // Allocate device memory
+  float *d_input, *d_output;
+  cudaMalloc(&d_input, size * size * sizeof(float));
+  cudaMalloc(&d_output, size * size * sizeof(float));
+
+  // Copy input data to device
+  cudaMemcpy(d_input, input_tensor, size * size * sizeof(float), cudaMemcpyHostToDevice);
+
+  // Launch kernel
+  dim3 threadsPerBlock(256);
+  dim3 numBlocks((size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+  diagflat_relu_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, size);
+
+  // Copy result back to host
+  cudaMemcpy(output, d_output, size * size * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Free device memory
+  cudaFree(d_input);
+  cudaFree(d_output);
+}
+}
+```
+
+**func.py**
+
+```python
+import torch
+
+def diagflat_relu_function(input_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Applies ReLU to the diagonal of a tensor.
+    """
+    diag = torch.diagflat(input_tensor)
+    return torch.relu(diag)
+
+function_signature = {
+    "name": "diagflat_relu_function",
+    "inputs": [
+        ((4, 4), torch.float32)
+    ],
+    "outputs": [
+        ((4, 4), torch.float32)
+    ]
+}
+```
+
+**func.cu**
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+__global__ void diagflat_relu_kernel(const float* input_tensor, float* output, int size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    output[i * size + i] = fmaxf(input_tensor[i], 0.0f);
+  }
+}
+
+extern "C" {
+void diagflat_relu_function(int num_args, ...) {
+  va_list args;
+  va_start(args, num_args);
+
+  const float* input_tensor = va_arg(args, const float*);
+  int size = va_arg(args, int); // Assuming a square input tensor
+
+  float* output = va_arg(args, float*);
+
+  va_end(args);
+
+  // Allocate device memory
+  float *d_input, *d_output;
+  cudaMalloc(&d_input, size * size * sizeof(float));
+  cudaMalloc(&d_output, size * size * sizeof(float));
+
+  // Copy input data to device
+  cudaMemcpy(d_input, input_tensor, size * size * sizeof(float), cudaMemcpyHostToDevice);
+
+  // Launch kernel
+  dim3 threadsPerBlock(256);
+  dim3 numBlocks((size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+  diagflat_relu_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, size);
+
+  // Copy result back to host
+  cudaMemcpy(output, d_output, size * size * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Free device memory
+  cudaFree(d_input);
+  cudaFree(d_output);
+}
+}
+```

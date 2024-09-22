@@ -1,0 +1,156 @@
+```python
+import torch
+
+def my_function(input_tensor: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on input tensor, weights and indices
+    """
+    input_tensor = input_tensor.to(torch.float16)
+    weights = weights.to(torch.float16)
+    indices = indices.to(torch.int8)
+    
+    output = torch.scatter_add(torch.zeros_like(weights, dtype=torch.float16), 0, indices, input_tensor * weights)
+    output = output.abs()
+    output = output.var(dim=0)
+    output = torch.einsum("ij,jk->ik", output, weights)
+    return output.to(torch.float32)
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((10,), torch.float32),
+        ((10, 10), torch.float32),
+        ((10,), torch.int32)
+    ],
+    "outputs": [
+        ((10, 10), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for scatter_add, abs, var, einsum_inner, forward, fp16, int8, fp32
+__global__ void my_function_kernel(const float* input_tensor, const float* weights, const int* indices, float* output,
+                                    int input_size, int weights_rows, int weights_cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < weights_rows) {
+        float sum = 0.0f;
+        for (int j = 0; j < input_size; ++j) {
+            int index = indices[j];
+            if (index == i) {
+                half input_val = float_to_half(input_tensor[j]);
+                half weight_val = float_to_half(weights[j * weights_cols + i]);
+                sum += half_to_float(__hmul(input_val, weight_val));
+            }
+        }
+        
+        // Compute abs, var, einsum_inner, forward
+        sum = fabsf(sum);
+        output[i * weights_cols] = sum;
+    }
+}
+
+__global__ void reduce_var_kernel(const float* input, float* output, int N, int M) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < M) {
+        float sum = 0.0f;
+        for (int j = 0; j < N; ++j) {
+            sum += input[j * M + i];
+        }
+        output[i] = sum / N;
+    }
+}
+
+__global__ void einsum_kernel(const float* input1, const float* input2, float* output,
+                             int N, int M, int K) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < N && j < K) {
+        float sum = 0.0f;
+        for (int k = 0; k < M; ++k) {
+            sum += input1[i * M + k] * input2[k * K + j];
+        }
+        output[i * K + j] = sum;
+    }
+}
+
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+    int weights_dim1 = va_arg(args, int);
+
+    // Extract indices tensor
+    const int* indices = va_arg(args, const int*);
+    int indices_dim0 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int input_size = input_tensor_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_indices, *d_output, *d_intermediate;
+    cudaMalloc(&d_input, input_size * sizeof(float));
+    cudaMalloc(&d_weights, weights_dim0 * weights_dim1 * sizeof(float));
+    cudaMalloc(&d_indices, input_size * sizeof(int));
+    cudaMalloc(&d_output, weights_dim0 * weights_dim1 * sizeof(float));
+    cudaMalloc(&d_intermediate, weights_dim0 * sizeof(float)); 
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, weights_dim0 * weights_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_indices, indices, input_size * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Launch scatter_add kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((weights_dim0 + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    my_function_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weights, d_indices, d_output, input_size, weights_dim0, weights_dim1);
+
+    // Launch reduce_var kernel
+    reduce_var_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_intermediate, weights_dim0, weights_dim1);
+
+    // Launch einsum kernel
+    einsum_kernel<<<dim3((weights_dim0 + 15) / 16, (weights_dim1 + 15) / 16), dim3(16, 16)>>>(d_intermediate, d_weights, d_output, weights_dim0, weights_dim1, weights_dim1);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, weights_dim0 * weights_dim1 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_indices);
+    cudaFree(d_output);
+    cudaFree(d_intermediate);
+}
+
+}  // extern "C"
+```

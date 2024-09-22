@@ -1,0 +1,167 @@
+```python
+import torch
+
+def cross_attention_bf16(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    """
+    Performs cross-attention with bfloat16 precision.
+    
+    Args:
+        query: (batch_size, seq_len_q, hidden_dim)
+        key: (batch_size, seq_len_k, hidden_dim)
+        value: (batch_size, seq_len_k, hidden_dim)
+    
+    Returns:
+        output: (batch_size, seq_len_q, hidden_dim)
+    """
+    query_bf16 = query.to(torch.bfloat16)
+    key_bf16 = key.to(torch.bfloat16)
+    value_bf16 = value.to(torch.bfloat16)
+    
+    attention_scores = torch.matmul(query_bf16, key_bf16.transpose(-1, -2)) / (query_bf16.shape[-1] ** 0.5)
+    attention_weights = torch.softmax(attention_scores, dim=-1)
+    output = torch.matmul(attention_weights, value_bf16)
+    return output.to(torch.float32)
+
+function_signature = {
+    "name": "cross_attention_bf16",
+    "inputs": [
+        ((1, 10, 512), torch.float32),
+        ((1, 20, 512), torch.float32),
+        ((1, 20, 512), torch.float32),
+    ],
+    "outputs": [
+        ((1, 10, 512), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversion
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for cross-attention with bfloat16
+__global__ void cross_attention_kernel_bf16(const float* query, const float* key, const float* value, 
+                                            float* output, int batch_size, int seq_len_q, int seq_len_k, int hidden_dim) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch_size && i < seq_len_q && j < seq_len_k) {
+        float sum = 0.0f;
+        for (int k = 0; k < hidden_dim; ++k) {
+            __nv_bfloat16 q = float_to_bfloat16(query[b * seq_len_q * hidden_dim + i * hidden_dim + k]);
+            __nv_bfloat16 k_t = float_to_bfloat16(key[b * seq_len_k * hidden_dim + j * hidden_dim + k]);
+            sum += bfloat16_to_float(__hmul(q, k_t));
+        }
+        sum /= sqrtf((float)hidden_dim);  // Scale attention scores
+
+        // Softmax over key dimension (j)
+        __nv_bfloat16 max_val = float_to_bfloat16(-INFINITY);
+        for (int j_prime = 0; j_prime < seq_len_k; ++j_prime) {
+            float sum_prime = 0.0f;
+            for (int k = 0; k < hidden_dim; ++k) {
+                __nv_bfloat16 q = float_to_bfloat16(query[b * seq_len_q * hidden_dim + i * hidden_dim + k]);
+                __nv_bfloat16 k_t = float_to_bfloat16(key[b * seq_len_k * hidden_dim + j_prime * hidden_dim + k]);
+                sum_prime += bfloat16_to_float(__hmul(q, k_t));
+            }
+            sum_prime /= sqrtf((float)hidden_dim);
+            max_val = __hmax(max_val, float_to_bfloat16(sum_prime));
+        }
+        __nv_bfloat16 exp_sum = 0.0f;
+        for (int j_prime = 0; j_prime < seq_len_k; ++j_prime) {
+            float sum_prime = 0.0f;
+            for (int k = 0; k < hidden_dim; ++k) {
+                __nv_bfloat16 q = float_to_bfloat16(query[b * seq_len_q * hidden_dim + i * hidden_dim + k]);
+                __nv_bfloat16 k_t = float_to_bfloat16(key[b * seq_len_k * hidden_dim + j_prime * hidden_dim + k]);
+                sum_prime += bfloat16_to_float(__hmul(q, k_t));
+            }
+            sum_prime /= sqrtf((float)hidden_dim);
+            exp_sum += __hextf(float_to_bfloat16(sum_prime - bfloat16_to_float(max_val)));
+        }
+        __nv_bfloat16 attention_weight = __hextf(float_to_bfloat16(sum - bfloat16_to_float(max_val))) / exp_sum;
+        
+        // Weighted sum over value
+        for (int k = 0; k < hidden_dim; ++k) {
+            __nv_bfloat16 v = float_to_bfloat16(value[b * seq_len_k * hidden_dim + j * hidden_dim + k]);
+            output[b * seq_len_q * hidden_dim + i * hidden_dim + k] += bfloat16_to_float(__hmul(attention_weight, v));
+        }
+    }
+}
+
+extern "C" {
+
+void cross_attention_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+    int query_dim2 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+    int key_dim2 = va_arg(args, int);
+
+    const float* value = va_arg(args, const float*);
+    int value_dim0 = va_arg(args, int);
+    int value_dim1 = va_arg(args, int);
+    int value_dim2 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = query_dim0;
+    int seq_len_q = query_dim1;
+    int seq_len_k = key_dim1;
+    int hidden_dim = query_dim2;
+
+    // Allocate device memory
+    float *d_query, *d_key, *d_value, *d_output;
+    cudaMalloc(&d_query, batch_size * seq_len_q * hidden_dim * sizeof(float));
+    cudaMalloc(&d_key, batch_size * seq_len_k * hidden_dim * sizeof(float));
+    cudaMalloc(&d_value, batch_size * seq_len_k * hidden_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * seq_len_q * hidden_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_query, query, batch_size * seq_len_q * hidden_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_key, key, batch_size * seq_len_k * hidden_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_value, value, batch_size * seq_len_k * hidden_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16, 4);
+    dim3 numBlocks((seq_len_k + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (seq_len_q + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    cross_attention_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_query, d_key, d_value, d_output, batch_size, seq_len_q, seq_len_k, hidden_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * seq_len_q * hidden_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_query);
+    cudaFree(d_key);
+    cudaFree(d_value);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

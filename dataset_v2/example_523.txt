@@ -1,0 +1,151 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def my_complex_function(input_tensor: torch.Tensor, target_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a complex series of operations including:
+    - LogSigmoid on input tensor
+    - Poisson loss calculation with weight
+    - Multi-label margin loss calculation
+    - Returns a single tensor representing the sum of the three losses
+    """
+
+    logsigmoid_output = F.logsigmoid(input_tensor)
+    poisson_loss = F.poisson_nll_loss(logsigmoid_output, target_tensor, log_input=True, full=True, reduction='mean', weight=weight)
+    multi_label_margin_loss = F.multilabel_margin_loss(input_tensor, target_tensor, reduction='mean')
+    return poisson_loss + multi_label_margin_loss
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((10, 10), torch.float32),
+        ((10, 10), torch.float32),
+        ((10, 10), torch.float32)
+    ],
+    "outputs": [
+        ((1,), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Define constants for loss calculations
+#define LOG2E 1.4426950408889634
+#define EPSILON 1e-12
+
+// CUDA kernel for logsigmoid calculation
+__global__ void logsigmoid_kernel(const float* input, float* output, int size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    output[i] = -logf(1.0f + expf(-input[i]));
+  }
+}
+
+// CUDA kernel for Poisson loss calculation
+__global__ void poisson_loss_kernel(const float* logsigmoid_output, const float* target, const float* weight,
+                                      float* loss, int size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    float log_target = (target[i] > 0.0f) ? logf(target[i]) : -INFINITY;
+    loss[i] = weight[i] * (expf(logsigmoid_output[i]) - log_target - logsigmoid_output[i]);
+  }
+}
+
+// CUDA kernel for multi-label margin loss calculation
+__global__ void multilabel_margin_loss_kernel(const float* input, const float* target, float* loss, int size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    float sum = 0.0f;
+    for (int j = 0; j < size; ++j) {
+      if (j != i && target[j] == 1.0f) {
+        sum += fmaxf(0.0f, input[j] - input[i] + 1.0f);
+      }
+    }
+    loss[i] = sum;
+  }
+}
+
+// CUDA kernel for sum reduction
+__global__ void sum_reduction_kernel(const float* input, float* output, int size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    atomicAdd(output, input[i]);
+  }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+  va_list args;
+  va_start(args, num_args);
+
+  // Extract input tensors
+  const float* input_tensor = va_arg(args, const float*);
+  int input_tensor_dim0 = va_arg(args, int);
+  int input_tensor_dim1 = va_arg(args, int);
+
+  const float* target_tensor = va_arg(args, const float*);
+  int target_tensor_dim0 = va_arg(args, int);
+  int target_tensor_dim1 = va_arg(args, int);
+
+  const float* weight = va_arg(args, const float*);
+  int weight_dim0 = va_arg(args, int);
+  int weight_dim1 = va_arg(args, int);
+
+  // Extract output tensor (assuming it's preallocated)
+  float* output = va_arg(args, float*);
+
+  va_end(args);
+
+  int size = input_tensor_dim0 * input_tensor_dim1;
+
+  // Allocate device memory
+  float *d_input, *d_target, *d_weight, *d_logsigmoid_output, *d_poisson_loss, *d_multilabel_margin_loss;
+  cudaMalloc(&d_input, size * sizeof(float));
+  cudaMalloc(&d_target, size * sizeof(float));
+  cudaMalloc(&d_weight, size * sizeof(float));
+  cudaMalloc(&d_logsigmoid_output, size * sizeof(float));
+  cudaMalloc(&d_poisson_loss, size * sizeof(float));
+  cudaMalloc(&d_multilabel_margin_loss, size * sizeof(float));
+
+  // Copy input data to device
+  cudaMemcpy(d_input, input_tensor, size * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_target, target_tensor, size * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_weight, weight, size * sizeof(float), cudaMemcpyHostToDevice);
+
+  // Calculate logsigmoid
+  logsigmoid_kernel<<<(size + 255) / 256, 256>>>(d_input, d_logsigmoid_output, size);
+
+  // Calculate Poisson loss
+  poisson_loss_kernel<<<(size + 255) / 256, 256>>>(d_logsigmoid_output, d_target, d_weight, d_poisson_loss, size);
+
+  // Calculate multi-label margin loss
+  multilabel_margin_loss_kernel<<<(size + 255) / 256, 256>>>(d_input, d_target, d_multilabel_margin_loss, size);
+
+  // Sum the three losses
+  sum_reduction_kernel<<<1, 1>>>(d_poisson_loss, d_multilabel_margin_loss, size);
+  sum_reduction_kernel<<<1, 1>>>(d_multilabel_margin_loss, d_poisson_loss, 1);
+
+  // Copy result back to host
+  cudaMemcpy(output, d_poisson_loss, sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Free device memory
+  cudaFree(d_input);
+  cudaFree(d_target);
+  cudaFree(d_weight);
+  cudaFree(d_logsigmoid_output);
+  cudaFree(d_poisson_loss);
+  cudaFree(d_multilabel_margin_loss);
+}
+
+}
+```

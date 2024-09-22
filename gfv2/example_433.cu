@@ -1,0 +1,143 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Define a helper macro for CUDA error checking
+#define CUDA_CHECK(x)                                              \
+  do                                                              \
+  {                                                                \
+    cudaError_t err = (x);                                         \
+    if (err != cudaSuccess)                                         \
+    {                                                                \
+      fprintf(stderr, "CUDA error: %s in file %s at line %d\n",    \
+              cudaGetErrorString(err), __FILE__, __LINE__);         \
+      exit(EXIT_FAILURE);                                        \
+    }                                                                \
+  } while (0)
+
+__global__ void pixel_shuffle_kernel(const half* input, half* output,
+                                    int batch_size, int in_channels,
+                                    int in_height, int in_width,
+                                    int out_height, int out_width) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && out_y < out_height && out_x < out_width) {
+        int in_y = out_y / 2;
+        int in_x = out_x / 2;
+        int offset = batch_idx * in_channels * in_height * in_width +
+                    in_y * in_width * in_channels +
+                    in_x * in_channels;
+
+        int shuffle_offset = (out_y % 2) * in_width + (out_x % 2);
+        int out_channel = shuffle_offset * 4 + (out_y / 2) * 2 * in_width + (out_x / 2) * 2;
+        output[batch_idx * in_channels * out_height * out_width + out_channel] = input[offset];
+    }
+}
+
+__global__ void geglu_kernel(const half* input, half* output,
+                           int batch_size, int channels,
+                           int height, int width) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && y < height && x < width) {
+        int index = batch_idx * channels * height * width + y * width * channels + x * channels;
+        output[index] = input[index] * __expf(input[index]);
+    }
+}
+
+__global__ void matmul_kernel(const half* input, const half* weight, half* output,
+                            int batch_size, int in_channels, int out_channels,
+                            int height, int width) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && out_y < height && out_x < width) {
+        float sum = 0.0f;
+        for (int i = 0; i < in_channels; ++i) {
+            sum += __fmaf_rn(input[batch_idx * in_channels * height * width + out_y * width * in_channels + out_x * in_channels + i],
+                              weight[i * out_channels + out_y * width * out_channels + out_x * out_channels], sum);
+        }
+        output[batch_idx * out_channels * height * width + out_y * width * out_channels + out_x * out_channels] = __int2half_rn(sum);
+    }
+}
+
+extern "C" {
+void pixel_shuffle_geglu_fp16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const half* input = va_arg(args, const half*);
+    int batch_size = va_arg(args, int);
+    int in_channels = va_arg(args, int);
+    int in_height = va_arg(args, int);
+    int in_width = va_arg(args, int);
+
+    // Extract weight tensor
+    const half* weight = va_arg(args, const half*);
+    int out_channels = va_arg(args, int);
+    int weight_height = va_arg(args, int);
+    int weight_width = va_arg(args, int);
+
+    // Extract output tensor
+    half* output = va_arg(args, half*);
+
+    va_end(args);
+
+    // Calculate output dimensions
+    int out_height = in_height * 2;
+    int out_width = in_width * 2;
+
+    // Allocate device memory
+    half *d_input, *d_weight, *d_output, *d_intermediate;
+    CUDA_CHECK(cudaMalloc(&d_input, batch_size * in_channels * in_height * in_width * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_weight, out_channels * weight_height * weight_width * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_output, batch_size * out_channels * out_height * out_width * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_intermediate, batch_size * in_channels * out_height * out_width * sizeof(half)));
+
+    // Copy input and weight to device
+    CUDA_CHECK(cudaMemcpy(d_input, input, batch_size * in_channels * in_height * in_width * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_weight, weight, out_channels * weight_height * weight_width * sizeof(half), cudaMemcpyHostToDevice));
+
+    // Pixel shuffle
+    dim3 pixel_shuffle_threads(8, 8, 1);
+    dim3 pixel_shuffle_blocks((out_width + pixel_shuffle_threads.x - 1) / pixel_shuffle_threads.x,
+                             (out_height + pixel_shuffle_threads.y - 1) / pixel_shuffle_threads.y,
+                             (batch_size + pixel_shuffle_threads.z - 1) / pixel_shuffle_threads.z);
+    pixel_shuffle_kernel<<<pixel_shuffle_blocks, pixel_shuffle_threads>>>(d_input, d_intermediate,
+                                                                         batch_size, in_channels, in_height, in_width,
+                                                                         out_height, out_width);
+
+    // GEGLU
+    dim3 geglu_threads(8, 8, 1);
+    dim3 geglu_blocks((out_width + geglu_threads.x - 1) / geglu_threads.x,
+                       (out_height + geglu_threads.y - 1) / geglu_threads.y,
+                       (batch_size + geglu_threads.z - 1) / geglu_threads.z);
+    geglu_kernel<<<geglu_blocks, geglu_threads>>>(d_intermediate, d_intermediate,
+                                                  batch_size, in_channels, out_height, out_width);
+
+    // Matmul
+    dim3 matmul_threads(8, 8, 1);
+    dim3 matmul_blocks((out_width + matmul_threads.x - 1) / matmul_threads.x,
+                        (out_height + matmul_threads.y - 1) / matmul_threads.y,
+                        (batch_size + matmul_threads.z - 1) / matmul_threads.z);
+    matmul_kernel<<<matmul_blocks, matmul_threads>>>(d_intermediate, d_weight, d_output,
+                                                    batch_size, in_channels, out_channels,
+                                                    out_height, out_width);
+
+    // Copy result back to host
+    CUDA_CHECK(cudaMemcpy(output, d_output, batch_size * out_channels * out_height * out_width * sizeof(half), cudaMemcpyDeviceToHost));
+
+    // Free device memory
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_weight));
+    CUDA_CHECK(cudaFree(d_output));
+    CUDA_CHECK(cudaFree(d_intermediate));
+}
+}  // extern "C"

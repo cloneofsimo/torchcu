@@ -1,0 +1,170 @@
+## func.py
+
+```python
+import torch
+
+def my_complex_function(input_tensor: torch.Tensor, weights: torch.Tensor, biases: torch.Tensor, temperature: float) -> torch.Tensor:
+    """
+    Performs a complex series of operations on the input tensor.
+    """
+    # 1. Multinomial Sampling
+    probs = torch.softmax(torch.matmul(input_tensor, weights) + biases, dim=-1)
+    sampled_indices = torch.multinomial(probs, num_samples=1)
+
+    # 2. Tensor Slicing
+    sliced_input = torch.gather(input_tensor, dim=-1, index=sampled_indices)
+
+    # 3. Gumbel-Softmax
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(probs)))
+    gumbel_probs = torch.softmax((torch.log(probs) + gumbel_noise) / temperature, dim=-1)
+
+    # 4. ReLU6 Activation
+    output = torch.relu6(torch.matmul(gumbel_probs, weights) + biases)
+    
+    return output
+
+function_signature = {
+    "name": "my_complex_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4,), torch.float32),
+        (torch.float32),
+    ],
+    "outputs": [
+        ((4, 4), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <curand_kernel.h>
+#include <stdarg.h>
+
+// Helper function for log-sum-exp
+__device__ __forceinline__ float log_sum_exp(float a, float b) {
+    float max = fmaxf(a, b);
+    return max + logf(expf(a - max) + expf(b - max));
+}
+
+// CUDA kernel for the complex function
+__global__ void my_complex_function_kernel(const float* input_tensor, const float* weights, const float* biases, 
+                                            float temperature, float* output, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        // 1. Multinomial Sampling (using Gumbel-Softmax)
+        float logits = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            logits += input_tensor[row * k + i] * weights[col * k + i];
+        }
+        logits += biases[col];
+
+        curandState_t state;
+        curand_init(row * n + col, 0, 0, &state); // Initialize state for each thread
+
+        // Generate Gumbel noise
+        float gumbel_noise = -logf(-logf(curand_uniform(&state)));
+        float prob = expf((logits + gumbel_noise) / temperature);
+
+        float sum_probs = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            float prob_i = expf((input_tensor[row * k + i] * weights[col * k + i] + biases[col] + gumbel_noise) / temperature);
+            sum_probs = log_sum_exp(sum_probs, prob_i);
+        }
+        prob /= expf(sum_probs); // Normalize probs
+
+        // 2. Tensor Slicing (using gather operation)
+        int sampled_index = 0;
+        for (int i = 0; i < k; ++i) {
+            if (prob > 0.5f) {
+                sampled_index = i;
+                break;
+            }
+            prob -= expf((input_tensor[row * k + i] * weights[col * k + i] + biases[col] + gumbel_noise) / temperature) / expf(sum_probs);
+        }
+
+        float sliced_value = input_tensor[row * k + sampled_index];
+
+        // 3. ReLU6 Activation (using gumbel_probs)
+        float gumbel_prob = prob;
+        float output_value = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            output_value += gumbel_prob * (weights[col * k + i] * sliced_value + biases[col]);
+        }
+
+        output[row * n + col] = fminf(fmaxf(output_value, 0.0f), 6.0f); // ReLU6
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+    int weights_dim1 = va_arg(args, int);
+
+    // Extract biases tensor
+    const float* biases = va_arg(args, const float*);
+    int biases_dim = va_arg(args, int);
+
+    // Extract temperature
+    float temperature = va_arg(args, double);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weights_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_biases, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weights, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_biases, output_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_biases, biases, output_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    my_complex_function_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weights, d_biases, temperature, d_output, batch_size, output_dim, input_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_biases);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+``` 

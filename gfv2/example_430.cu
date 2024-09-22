@@ -1,0 +1,101 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for sorting and selecting top k elements
+__global__ void sort_topk_kernel(const float* input_tensor, float* output, int m, int n, int k, int mode) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        // Calculate the index for the current element
+        int index = row * n + col;
+
+        // Initialize the temporary array for sorting
+        float temp[n];
+        for (int i = 0; i < n; ++i) {
+            temp[i] = input_tensor[i * n + col];
+        }
+
+        // Sort the temporary array
+        if (mode == 0) { // Max
+            for (int i = 0; i < n - 1; ++i) {
+                for (int j = i + 1; j < n; ++j) {
+                    if (temp[i] < temp[j]) {
+                        float t = temp[i];
+                        temp[i] = temp[j];
+                        temp[j] = t;
+                    }
+                }
+            }
+        } else { // Min
+            for (int i = 0; i < n - 1; ++i) {
+                for (int j = i + 1; j < n; ++j) {
+                    if (temp[i] > temp[j]) {
+                        float t = temp[i];
+                        temp[i] = temp[j];
+                        temp[j] = t;
+                    }
+                }
+            }
+        }
+
+        // Store the top k elements in the output array
+        if (col < k) {
+            output[index] = temp[col];
+        }
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract mode (0 for max, 1 for min)
+    int mode = va_arg(args, int);
+
+    // Extract k (number of top elements)
+    int k = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * k * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 1);
+    dim3 numBlocks((input_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    sort_topk_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_output, batch_size, input_dim, k, mode
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

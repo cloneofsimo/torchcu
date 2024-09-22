@@ -1,0 +1,93 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// CUDA kernel for int8 ridge regression
+__global__ void ridge_regression_int8_kernel(const int8_t* input_tensor, const int8_t* weight, const int8_t* bias,
+                                          float lambda_value, int8_t* output, int input_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < 1 && col < 1) {  // Only one output element
+        int8_t sum = 0;
+        for (int i = 0; i < input_dim; ++i) {
+            sum += input_tensor[row * input_dim + i] * weight[col * input_dim + i];
+        }
+        sum += bias[0];
+
+        // Ridge regularization
+        float weight_sum = 0.0f;
+        for (int i = 0; i < input_dim; ++i) {
+            weight_sum += weight[i]; // Assuming weight is a vector (1 x input_dim)
+        }
+        sum -= __int2float_rn(lambda_value * weight_sum);
+
+        output[0] = sum;
+    }
+}
+
+extern "C" {
+
+void ridge_regression_int8(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract lambda value
+    float lambda_value = va_arg(args, double); // va_arg should take double
+
+    // Extract output tensor (assuming it's preallocated)
+    int8_t* output = va_arg(args, int8_t*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = 1; // Output dimension for ridge regression
+
+    // Allocate device memory
+    int8_t *d_input, *d_weight, *d_bias, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(int8_t));
+    cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * sizeof(int8_t));
+    cudaMalloc(&d_bias, bias_dim0 * sizeof(int8_t));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(int8_t));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, bias_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(1, 1); // 1 thread for single output element
+    dim3 numBlocks(1, 1); // 1 block for single output element
+
+    ridge_regression_int8_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, lambda_value, d_output, input_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(int8_t), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

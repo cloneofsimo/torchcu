@@ -1,0 +1,159 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+#define BLOCK_SIZE 16
+
+// CUDA kernel for lightweight convolution
+__global__ void lightweight_conv_kernel(const int8_t* input, const int8_t* weight, const int8_t* bias, 
+                                         int8_t* output, int batch_size, int in_channels, int out_channels, 
+                                         int height, int width, int kernel_size) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_x = x - kernel_size / 2;
+    int out_y = y - kernel_size / 2;
+
+    if (out_x >= 0 && out_x < width - kernel_size + 1 && 
+        out_y >= 0 && out_y < height - kernel_size + 1) {
+        int out_index = out_y * (width - kernel_size + 1) + out_x;
+        int in_index = y * width + x;
+        int weight_index = 0;
+
+        int8_t sum = 0;
+        for (int i = 0; i < kernel_size; ++i) {
+            for (int j = 0; j < kernel_size; ++j) {
+                for (int c = 0; c < in_channels; ++c) {
+                    sum += input[(in_index + i * width + j) * in_channels + c] * weight[weight_index];
+                    ++weight_index;
+                }
+            }
+        }
+
+        output[out_index * out_channels + blockIdx.z] = sum + bias[blockIdx.z];
+    }
+}
+
+// CUDA kernel for average pooling
+__global__ void avg_pool_kernel(const int8_t* input, float* output, int batch_size, int in_channels, 
+                                 int height, int width, int pool_size) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_x = x * pool_size;
+    int out_y = y * pool_size;
+
+    if (out_x < width && out_y < height) {
+        int out_index = out_y * width + out_x;
+        int sum = 0;
+
+        for (int i = 0; i < pool_size; ++i) {
+            for (int j = 0; j < pool_size; ++j) {
+                sum += input[(out_y + i) * width + (out_x + j)];
+            }
+        }
+
+        output[out_index * in_channels + blockIdx.z] = (float)sum / (pool_size * pool_size);
+    }
+}
+
+// CUDA kernel for binary cross-entropy loss calculation
+__global__ void bce_loss_kernel(const float* output, const int8_t* input, float* loss, int batch_size, 
+                                int in_channels, int height, int width) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width && y < height) {
+        int index = y * width + x;
+        loss[0] += - (input[index] * logf(output[index]) + (1 - input[index]) * logf(1 - output[index]));
+    }
+}
+
+extern "C" {
+
+void lightweight_conv_pool_bce(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const int8_t* input = va_arg(args, const int8_t*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+    int input_dim2 = va_arg(args, int);
+    int input_dim3 = va_arg(args, int);
+
+    // Extract weight tensor
+    const int8_t* weight = va_arg(args, const int8_t*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+    int weight_dim3 = va_arg(args, int);
+
+    // Extract bias tensor
+    const int8_t* bias = va_arg(args, const int8_t*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int in_channels = input_dim1;
+    int height = input_dim2;
+    int width = input_dim3;
+    int out_channels = weight_dim0;
+    int kernel_size = weight_dim2;
+    int pool_size = 2;
+
+    // Allocate device memory
+    int8_t *d_input, *d_weight, *d_bias, *d_conv_output;
+    float *d_avg_output;
+    cudaMalloc(&d_input, batch_size * in_channels * height * width * sizeof(int8_t));
+    cudaMalloc(&d_weight, out_channels * in_channels * kernel_size * kernel_size * sizeof(int8_t));
+    cudaMalloc(&d_bias, out_channels * sizeof(int8_t));
+    cudaMalloc(&d_conv_output, batch_size * out_channels * (height - kernel_size + 1) * (width - kernel_size + 1) * sizeof(int8_t));
+    cudaMalloc(&d_avg_output, batch_size * out_channels * (height - kernel_size + 1) / pool_size * (width - kernel_size + 1) / pool_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * in_channels * height * width * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, out_channels * in_channels * kernel_size * kernel_size * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, out_channels * sizeof(int8_t), cudaMemcpyHostToDevice);
+
+    // Launch convolution kernel
+    dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 numBlocks((width - kernel_size + 1 + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (height - kernel_size + 1 + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                   out_channels);
+    lightweight_conv_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_bias, d_conv_output, 
+                                                       batch_size, in_channels, out_channels, height, width, kernel_size);
+
+    // Launch average pooling kernel
+    threadsPerBlock = dim3(BLOCK_SIZE, BLOCK_SIZE);
+    numBlocks = dim3(((width - kernel_size + 1) / pool_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   ((height - kernel_size + 1) / pool_size + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   out_channels);
+    avg_pool_kernel<<<numBlocks, threadsPerBlock>>>(d_conv_output, d_avg_output, batch_size, out_channels, 
+                                                  (height - kernel_size + 1), (width - kernel_size + 1), pool_size);
+
+    // Launch binary cross-entropy loss kernel
+    threadsPerBlock = dim3(BLOCK_SIZE, BLOCK_SIZE);
+    numBlocks = dim3((width - kernel_size + 1) / pool_size / threadsPerBlock.x,
+                   (height - kernel_size + 1) / pool_size / threadsPerBlock.y,
+                   1);
+    bce_loss_kernel<<<numBlocks, threadsPerBlock>>>(d_avg_output, d_input, d_avg_output, batch_size, in_channels,
+                                                      (height - kernel_size + 1) / pool_size, 
+                                                      (width - kernel_size + 1) / pool_size);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_avg_output, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_conv_output);
+    cudaFree(d_avg_output);
+}
+
+} // extern "C"

@@ -1,0 +1,79 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// CUDA kernel for matrix multiplication using int8
+__global__ void matmul_int8_kernel(const int8_t* input_tensor, const int8_t* weight, float* output,
+                                   int m, int n, int k, float scale_factor) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        int sum = 0;
+        for (int i = 0; i < k; ++i) {
+            sum += input_tensor[row * k + i] * weight[col * k + i];  // Transposed access
+        }
+        output[row * n + col] = sum * scale_factor;
+    }
+}
+
+extern "C" {
+
+void int8_gradient_checkpointing(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weight_dim0;
+
+    // Allocate device memory
+    int8_t *d_input, *d_weight;
+    float *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(int8_t));
+    cudaMalloc(&d_weight, output_dim * input_dim * sizeof(int8_t));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(float));
+
+    // Calculate scale factor (assuming input and weight are in int8 range)
+    float scale_factor = 1.0f / (float)(INT8_MAX - INT8_MIN);  // Adjust if needed
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    matmul_int8_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, batch_size, output_dim, input_dim, scale_factor
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

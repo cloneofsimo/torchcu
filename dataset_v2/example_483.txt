@@ -1,0 +1,138 @@
+## func.py
+
+```python
+import torch
+
+def my_function(input_tensor: torch.Tensor, weight1: torch.Tensor, weight2: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a sequence of operations on input tensor:
+    1. Matrix multiplication with weight1
+    2. GELU activation
+    3. Matrix multiplication with weight2
+    4. tanh activation
+    5. Element-wise comparison (less than) with a constant value (0.5)
+    6. Returns the result as a bfloat16 tensor
+    """
+    output = torch.matmul(input_tensor, weight1.t())
+    output = torch.nn.functional.gelu(output)
+    output = torch.matmul(output, weight2.t())
+    output = torch.tanh(output)
+    output = torch.lt(output, 0.5)
+    return output.to(torch.bfloat16)
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32)
+    ],
+    "outputs": [
+        ((4, 4), torch.bfloat16),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for matrix multiplication, GELU, tanh, and lt
+__global__ void matmul_gelu_tanh_lt_kernel(const float* input_tensor, const float* weight1, const float* weight2, __nv_bfloat16* output,
+                                         int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        float sum1 = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum1 += input_tensor[row * k + i] * weight1[col * k + i];  // Transposed access
+        }
+        float sum2 = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum2 += sum1 * weight2[col * k + i];
+        }
+        float gelu_result = sum2 * 0.5f * (1.0f + tanhf(0.7978845608028654 * sum2 + 0.03567727859611833));
+        float tanh_result = tanhf(gelu_result);
+        output[row * n + col] = float_to_bfloat16(tanh_result < 0.5f);  
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract weight1 tensor
+    const float* weight1 = va_arg(args, const float*);
+    int weight1_dim0 = va_arg(args, int);
+    int weight1_dim1 = va_arg(args, int);
+
+    // Extract weight2 tensor
+    const float* weight2 = va_arg(args, const float*);
+    int weight2_dim0 = va_arg(args, int);
+    int weight2_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int output_dim = weight1_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weight1, *d_weight2;
+    __nv_bfloat16 *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight1, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_weight2, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(__nv_bfloat16));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight1, weight1, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight2, weight2, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    matmul_gelu_tanh_lt_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight1, d_weight2, d_output, batch_size, output_dim, input_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight1);
+    cudaFree(d_weight2);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

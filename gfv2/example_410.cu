@@ -1,0 +1,176 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for linear transformation
+__global__ void linear_kernel(const float* input_tensor, const float* weight, const float* bias, float* output,
+                             int batch_size, int input_size, int output_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        for (int i = 0; i < output_size; ++i) {
+            float sum = 0.0f;
+            for (int j = 0; j < input_size; ++j) {
+                sum += input_tensor[idx * input_size + j] * weight[i * input_size + j];
+            }
+            output[idx * output_size + i] = sum + bias[i];
+        }
+    }
+}
+
+// CUDA kernel for PReLU activation
+__global__ void prelu_kernel(float* output, int batch_size, int output_size, float slope) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * output_size) {
+        if (output[idx] < 0.0f) {
+            output[idx] *= slope;
+        }
+    }
+}
+
+// CUDA kernel for transposed 3D convolution
+__global__ void conv_transpose3d_kernel(const float* input_tensor, const float* weight, float* output,
+                                       int batch_size, int input_channels, int output_channels,
+                                       int input_depth, int input_height, int input_width,
+                                       int output_depth, int output_height, int output_width,
+                                       int kernel_size, int stride) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    int idz = blockIdx.z * blockDim.z + threadIdx.z;
+    if (idx < batch_size && idy < output_height && idz < output_depth) {
+        for (int oc = 0; oc < output_channels; ++oc) {
+            for (int ic = 0; ic < input_channels; ++ic) {
+                for (int kd = 0; kd < kernel_size; ++kd) {
+                    for (int kh = 0; kh < kernel_size; ++kh) {
+                        for (int kw = 0; kw < kernel_size; ++kw) {
+                            int id = idz * stride - kd + kernel_size - 1;
+                            int ih = idy * stride - kh + kernel_size - 1;
+                            int iw = idx * stride - kw + kernel_size - 1;
+                            if (id >= 0 && id < input_depth && ih >= 0 && ih < input_height && iw >= 0 && iw < input_width) {
+                                output[idx * output_depth * output_height * output_channels +
+                                       idz * output_height * output_channels +
+                                       idy * output_channels + oc] += 
+                                        input_tensor[idx * input_depth * input_height * input_channels +
+                                                    id * input_height * input_channels +
+                                                    ih * input_channels + ic] *
+                                        weight[oc * input_channels * kernel_size * kernel_size * kernel_size +
+                                               ic * kernel_size * kernel_size * kernel_size +
+                                               kd * kernel_size * kernel_size +
+                                               kh * kernel_size + kw];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// CUDA kernel for layer scaling and decay
+__global__ void layer_scale_decay_kernel(float* output, int batch_size, int output_size, float scale, float decay) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * output_size) {
+        output[idx] *= scale * expf(-decay * output[idx]);
+    }
+}
+
+extern "C" {
+
+void my_complex_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+    int weight_dim3 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract scale and decay values
+    float scale = va_arg(args, double);
+    float decay = va_arg(args, double);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Prepare input tensor for linear layer
+    int batch_size = input_tensor_dim0;
+    int input_size = input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3;
+    int output_size = weight_dim0;
+    int input_channels = 1;
+    int output_channels = weight_dim0;
+
+    // Prepare input tensor for transposed convolution
+    int input_depth = input_tensor_dim1;
+    int input_height = input_tensor_dim2;
+    int input_width = input_tensor_dim3;
+    int output_depth = input_depth * 2;
+    int output_height = input_height * 2;
+    int output_width = input_width * 2;
+    int kernel_size = 4;
+    int stride = 2;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output;
+    cudaMalloc(&d_input, batch_size * input_size * sizeof(float));
+    cudaMalloc(&d_weight, output_size * input_size * sizeof(float));
+    cudaMalloc(&d_bias, output_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_size * input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, output_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch linear kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    linear_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_bias, d_output, batch_size, input_size, output_size);
+
+    // Launch PReLU kernel
+    threadsPerBlock = dim3(256);
+    numBlocks = dim3((batch_size * output_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    prelu_kernel<<<numBlocks, threadsPerBlock>>>(d_output, batch_size, output_size, 0.25f);
+
+    // Launch transposed 3D convolution kernel
+    threadsPerBlock = dim3(16, 16, 8);
+    numBlocks = dim3((output_width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (output_height + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (output_depth + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    conv_transpose3d_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, d_weight, d_output, 
+        batch_size, input_channels, output_channels, 
+        input_depth, input_height, input_width, 
+        output_depth, output_height, output_width, 
+        kernel_size, stride);
+
+    // Launch layer scaling and decay kernel
+    threadsPerBlock = dim3(256);
+    numBlocks = dim3((batch_size * output_depth * output_height * output_channels + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    layer_scale_decay_kernel<<<numBlocks, threadsPerBlock>>>(d_output, batch_size, output_depth * output_height * output_channels, scale, decay);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_depth * output_height * output_channels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

@@ -1,0 +1,247 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+def coord_attention_bf16_multinomial_tanh(input_tensor: torch.Tensor, weight: torch.Tensor, 
+                                           probs: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on input tensors:
+    1. Applies coord attention to input_tensor with weight.
+    2. Performs a multinomial sampling based on probs.
+    3. Applies tanh activation to the result.
+    4. Calculates the L1 loss between the sampled tensor and input_tensor.
+
+    Args:
+        input_tensor (torch.Tensor): Input tensor of shape (B, H, W, C).
+        weight (torch.Tensor): Weight tensor for coord attention of shape (C, C).
+        probs (torch.Tensor): Probabilities for multinomial sampling of shape (B, H, W).
+
+    Returns:
+        torch.Tensor: The L1 loss between the sampled tensor and input_tensor.
+    """
+    B, H, W, C = input_tensor.shape
+
+    # Coord attention
+    input_bf16 = input_tensor.to(torch.bfloat16)
+    weight_bf16 = weight.to(torch.bfloat16)
+    output = torch.matmul(input_bf16.permute(0, 3, 1, 2), weight_bf16).permute(0, 2, 3, 1)
+    output = F.softmax(output, dim=1)
+    output = torch.matmul(output, input_bf16).to(torch.float32)
+
+    # Multinomial sampling
+    sampled_indices = torch.multinomial(probs, num_samples=1)
+    sampled_tensor = torch.gather(output, dim=1, index=sampled_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, C))
+
+    # tanh activation
+    sampled_tensor = torch.tanh(sampled_tensor)
+
+    # L1 loss
+    loss = F.l1_loss(sampled_tensor, input_tensor)
+
+    return loss
+
+function_signature = {
+    "name": "coord_attention_bf16_multinomial_tanh",
+    "inputs": [
+        ((1, 8, 8, 32), torch.float32),
+        ((32, 32), torch.float32),
+        ((1, 8, 8), torch.float32)
+    ],
+    "outputs": [
+        ((1,), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for Coord attention with bfloat16
+__global__ void coord_attention_kernel_bf16(const float* input_tensor, const float* weight, float* output, 
+                                        int B, int H, int W, int C) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = threadIdx.x;
+
+    if (b < B && h < H && w < W && c < C) {
+        float sum = 0.0f;
+        for (int i = 0; i < C; ++i) {
+            __nv_bfloat16 a = float_to_bfloat16(input_tensor[b * H * W * C + h * W * C + w * C + i]);
+            __nv_bfloat16 b = float_to_bfloat16(weight[c * C + i]);
+            sum += bfloat16_to_float(__hmul(a, b));
+        }
+        output[b * H * W * C + h * W * C + w * C + c] = sum;
+    }
+}
+
+// CUDA kernel for softmax
+__global__ void softmax_kernel(float* data, int N, int C) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < N) {
+        float max_val = data[i];
+        for (int j = i + 1; j < N; j++) {
+            max_val = fmaxf(max_val, data[j]);
+        }
+
+        float sum = 0.0f;
+        for (int j = i; j < N; j++) {
+            sum += expf(data[j] - max_val);
+        }
+
+        for (int j = i; j < N; j++) {
+            data[j] = expf(data[j] - max_val) / sum;
+        }
+    }
+}
+
+// CUDA kernel for weighted sum
+__global__ void weighted_sum_kernel(const float* attention, const float* input_tensor, float* output,
+                                    int B, int H, int W, int C) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = threadIdx.x;
+
+    if (b < B && h < H && w < W && c < C) {
+        float sum = 0.0f;
+        for (int i = 0; i < C; ++i) {
+            sum += attention[b * H * W * C + h * W * C + w * C + i] * input_tensor[b * H * W * C + h * W * C + w * C + i];
+        }
+        output[b * H * W * C + h * W * C + w * C + c] = sum;
+    }
+}
+
+// CUDA kernel for multinomial sampling
+__global__ void multinomial_kernel(const float* probs, int* sampled_indices, int B, int H, int W) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < B && h < H && w < W) {
+        float sum = 0.0f;
+        float rand_val = rand() / (float) RAND_MAX; // Generate random value
+        int i = 0;
+        for (; i < W; ++i) {
+            sum += probs[b * H * W + h * W + i];
+            if (rand_val < sum) {
+                break;
+            }
+        }
+        sampled_indices[b * H * W + h * W + w] = i;
+    }
+}
+
+// CUDA kernel for tanh activation
+__global__ void tanh_kernel(float* data, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < N) {
+        data[i] = tanhf(data[i]);
+    }
+}
+
+// CUDA kernel for L1 loss
+__global__ void l1_loss_kernel(const float* input_tensor, const float* sampled_tensor, float* loss, int B, int H, int W, int C) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = threadIdx.x;
+
+    if (b < B && h < H && w < W && c < C) {
+        float diff = fabsf(input_tensor[b * H * W * C + h * W * C + w * C + c] - sampled_tensor[b * H * W * C + h * W * C + w * C + c]);
+        atomicAdd(loss, diff);
+    }
+}
+
+extern "C" {
+
+void coord_attention_bf16_multinomial_tanh(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int B = va_arg(args, int);
+    int H = va_arg(args, int);
+    int W = va_arg(args, int);
+    int C = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    const float* probs = va_arg(args, const float*);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* loss = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output, *d_attention;
+    int *d_sampled_indices;
+    cudaMalloc(&d_input, B * H * W * C * sizeof(float));
+    cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * sizeof(float));
+    cudaMalloc(&d_output, B * H * W * C * sizeof(float));
+    cudaMalloc(&d_attention, B * H * W * C * sizeof(float));
+    cudaMalloc(&d_sampled_indices, B * H * W * sizeof(int));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, B * H * W * C * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_probs, probs, B * H * W * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Coord attention
+    dim3 threadsPerBlock(32, 1, 1);
+    dim3 numBlocks((W + threadsPerBlock.x - 1) / threadsPerBlock.x, (H + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                   (B + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    coord_attention_kernel_bf16<<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_output, B, H, W, C);
+
+    // Softmax
+    softmax_kernel<<<(B * H * W * C + 255) / 256, 256>>>(d_output, B * H * W * C, C);
+
+    // Weighted sum
+    weighted_sum_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_input, d_attention, B, H, W, C);
+
+    // Multinomial sampling
+    multinomial_kernel<<<numBlocks, threadsPerBlock>>>(d_probs, d_sampled_indices, B, H, W);
+
+    // Gather sampled tensor
+    cudaMemcpy(d_input, d_attention, B * H * W * C * sizeof(float), cudaMemcpyDeviceToDevice); // Reuse d_input
+    cudaMemcpy(d_output, d_input, B * H * W * C * sizeof(float), cudaMemcpyDeviceToDevice);  // Reuse d_output
+
+    // Tanh activation
+    tanh_kernel<<<(B * H * W * C + 255) / 256, 256>>>(d_output, B * H * W * C);
+
+    // L1 loss
+    l1_loss_kernel<<<numBlocks, threadsPerBlock>>>(d_attention, d_output, loss, B, H, W, C);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+    cudaFree(d_attention);
+    cudaFree(d_sampled_indices);
+}
+
+}  // extern "C"
+```
