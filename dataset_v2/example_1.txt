@@ -1,0 +1,349 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def local_attention_triplet_loss(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
+                                   positive: torch.Tensor, negative: torch.Tensor, 
+                                   window_size: int = 5) -> torch.Tensor:
+    """
+    Computes a triplet loss based on local attention over a sequence.
+
+    Args:
+        query: Tensor of shape (batch_size, seq_len, embedding_dim), query sequence.
+        key: Tensor of shape (batch_size, seq_len, embedding_dim), key sequence.
+        value: Tensor of shape (batch_size, seq_len, embedding_dim), value sequence.
+        positive: Tensor of shape (batch_size, seq_len, embedding_dim), positive sequence.
+        negative: Tensor of shape (batch_size, seq_len, embedding_dim), negative sequence.
+        window_size: Int, size of the attention window.
+
+    Returns:
+        Tensor of shape (batch_size, ), triplet loss for each sequence in the batch.
+    """
+    batch_size, seq_len, embedding_dim = query.shape
+
+    # Local attention
+    attention = F.softmax(torch.bmm(query, key.transpose(1, 2)), dim=2)
+    attention = attention.unfold(1, window_size, 1).unfold(2, window_size, 1)
+    attention = attention.view(batch_size, seq_len, window_size, window_size)
+    attended_value = torch.bmm(attention.view(batch_size, seq_len * window_size, window_size), value.view(batch_size, window_size, embedding_dim))
+    attended_value = attended_value.view(batch_size, seq_len, embedding_dim)
+
+    # Triplet loss
+    distance_positive = torch.norm(attended_value - positive, dim=2)
+    distance_negative = torch.norm(attended_value - negative, dim=2)
+    loss = torch.relu(distance_positive - distance_negative + 1.0)
+    return loss.mean(dim=1)
+
+function_signature = {
+    "name": "local_attention_triplet_loss",
+    "inputs": [
+        ((8, 16, 128), torch.float32),
+        ((8, 16, 128), torch.float32),
+        ((8, 16, 128), torch.float32),
+        ((8, 16, 128), torch.float32),
+        ((8, 16, 128), torch.float32),
+        (5, torch.int32)
+    ],
+    "outputs": [
+        ((8,), torch.float32)
+    ]
+}
+```
+
+```cpp
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/fast_math.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/gemm/device/gemm_multistage.h>
+#include <cutlass/gemm/device/gemm_universal.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/gemm_traits.h>
+#include <cutlass/matrix_traits.h>
+#include <cutlass/transform/threadblock/convolution_interleave.h>
+#include <cutlass/transform/threadblock/matrix_multiply.h>
+#include <cutlass/transform/threadblock/matrix_multiply_complex.h>
+#include <cutlass/transform/threadblock/matrix_multiply_smem.h>
+#include <cutlass/transform/threadblock/vector_multiply.h>
+#include <cutlass/transform/threadblock/vector_transpose.h>
+#include <cutlass/transform/threadblock/vector_unary_op.h>
+#include <cutlass/layout/tensor.h>
+#include <cutlass/layout/pitch_linear.h>
+#include <cutlass/layout/interleaved.h>
+#include <cutlass/layout/column_major.h>
+#include <cutlass/layout/row_major.h>
+#include <cutlass/epilogue/threadblock/linear_combination.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_store.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_relu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_softmax.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sigmoid.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tanh.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_identity.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_activation.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_elementwise.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_activation_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_activation_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_activation_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_eltwise_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_activation_eltwise.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_activation_bias_eltwise.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_activation_eltwise_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_activation_bias_eltwise_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_binary.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_binary_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_binary_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_binary_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_ternary.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_ternary_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_ternary_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_ternary_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quad.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quad_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quad_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quad_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quint.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quint_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quint_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quint_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sext.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sext_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sext_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sext_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sevent.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sevent_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sevent_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sevent_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_nonu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_nonu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_nonu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_nonu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octadecu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octadecu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octadecu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octadecu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novendecu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novendecu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novendecu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novendecu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quinquavigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quinquavigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quinquavigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quinquavigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septemvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septemvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septemvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septemvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octovigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octovigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octovigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octovigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decemvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decemvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decemvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decemvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecemvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecemvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecemvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecemvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octopdecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octopdecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octopdecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octopdecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemdecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemdecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemdecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemdecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quinquavigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quinquavigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quinquavigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quinquavigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septemvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septemvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septemvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septemvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octovigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octovigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octovigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octovigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decemvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decemvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decemvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_decemvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_undecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duodecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_tredecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecemvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecemvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecemvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quatuordecemvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quindecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_sexdecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_septendecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octopdecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octopdecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octopdecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_octopdecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemdecimvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemdecimvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemdecimvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_novemdecimvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_vigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_unvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_duovigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_trivigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu_bias.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quattuorvigenticu_bias_scalar.h>
+#include <cutlass/epilogue/threadblock/accumulator_tile_quinquavigenticu.h>
+#include <cutlass/epilogue/threadblock/accumulator

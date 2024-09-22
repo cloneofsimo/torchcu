@@ -61,7 +61,7 @@ def transpile_to_cuda(file_path: str) -> Path:
 def compile_cuda(cuda_file: Path) -> Path:
     """Compile the CUDA code to a shared library."""
     output_file = cuda_file.with_suffix('.so')
-    subprocess.run(['nvcc', '-Xcompiler', '-fPIC', '--shared', '-o', str(output_file), str(cuda_file), '-lcublas'], check=True)
+    subprocess.run(['nvcc', '-Xcompiler', '-fPIC', '--shared', '-o', str(output_file), str(cuda_file), '-lcublas', '-I/home/ubuntu/cutlass/include'], check=True)
     return output_file
 
 def prepare_inputs(signature: list) -> list:
@@ -72,7 +72,7 @@ def prepare_inputs(signature: list) -> list:
 
     return positional_arguments
 
-def run_pytorch_function(func: Callable, inputs: list) -> torch.Tensor | tuple[torch.Tensor, ...]:
+def run_pytorch_function(func: Callable, inputs: list):
     """Run the PyTorch function with the given inputs."""
     with torch.no_grad():
         return func(*inputs)
