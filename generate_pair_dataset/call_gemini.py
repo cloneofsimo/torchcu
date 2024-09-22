@@ -6,7 +6,7 @@ genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
 # Create the model
 generation_config = {
-    "temperature": 0.6,
+    "temperature": 0.7,
     "top_p": 0.95,
     "top_k": 64,
     "max_output_tokens": 1024,
@@ -29,7 +29,7 @@ For example. here is the example torch code and its transpile cuda code. Notice 
 ```python
 import torch
 
-def torch_linear_bfloat16_function(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def linear_bfloat16_function(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
     Perform a simple linear transformation (matrix multiplication) and activation using bfloat16.
     """
@@ -39,7 +39,7 @@ def torch_linear_bfloat16_function(input_tensor: torch.Tensor, weight: torch.Ten
     return torch.relu(output).to(torch.float32)
 
 function_signature = {
-    "name": "torch_linear_bfloat16_function",
+    "name": "linear_bfloat16_function",
     "inputs": [
         ((4, 4), torch.float32),
         ((4, 4), torch.float32)
@@ -87,7 +87,7 @@ __global__ void matmul_relu_kernel_bf16(const float* input_tensor, const float* 
 
 extern "C" {
 
-void torch_function(int num_args, ...) {
+void linear_bfloat16_function(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
@@ -153,7 +153,7 @@ def make_exmample(use_these_concepts=["flash attention", "sort", "linear"]):
         prompt
         + "\n\n Also, your example should have following concepts: "
         + ", ".join(use_these_concepts)
-        + "Return Only One Example. Use cutlass or cudnn if possible, for cuda code"
+        + "Return Only One Example. For cuda code, cutlass or cudnn if possible to optimize further. DO NOT SKIP SINGLE LINE. IMPLELEMT EVERYTHING."
     )
     response = model.generate_content(prompt_with_concepts)
     return response.text
@@ -583,6 +583,7 @@ def make_set_of_examples(num_examples: int = 4000, output_dir: str = "example_da
     important_concepts = ['fp32', 'bf16', 'fp16', 'int8', 'backward', 'forward', 'inplace', 'cutlass', 'cudnn', 'pure cu']
 
     # append on the existing ones
+    os.makedirs(output_dir, exist_ok=True)
     existing_data = os.listdir(output_dir)
     offset = len(existing_data)
     for i in range(num_examples):

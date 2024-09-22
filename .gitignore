@@ -3,3 +3,6 @@
 __pycache__
 dataset
 .venv
+trainer/test
+trainer/wandb
+trainer/data_files
