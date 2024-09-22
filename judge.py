@@ -1,10 +1,22 @@
+from pathlib import Path
 import runpy
 import subprocess
 import numpy as np
 import torch
 import ctypes
 from typing import Callable
-import os
+
+from rich.table import Table
+from rich.console import Console
+
+
+table = Table(title="Transpilation Results")
+table.add_column("File", style="cyan", no_wrap=True)
+table.add_column("Score", style="magenta")
+
+
+CURR_DIR = Path(__file__).parent
+DATA_DIR = CURR_DIR / "test_data"
 
 def load_pytorch_function(file_path: str, function_name: str) -> Callable:
     """Load the PyTorch function from the given file."""
@@ -40,15 +52,16 @@ def load_function_signature(file_path: str) -> tuple[str, list[tuple[str, tuple,
 
     return name, args
 
-def transpile_to_cuda(file_path: str) -> str:
+def transpile_to_cuda(file_path: str) -> Path:
     """Transpile the PyTorch function to CUDA code."""
-    output_file = file_path.replace('.py', '.cu')
+    output_file = Path(file_path).with_suffix('.cu')
+    print(f"Transpiling to CUDA: {output_file}")
     return output_file
 
-def compile_cuda(cuda_file: str) -> str:
+def compile_cuda(cuda_file: Path) -> Path:
     """Compile the CUDA code to a shared library."""
-    output_file = cuda_file.replace('.cu', '.so')
-    subprocess.run(['nvcc', '-Xcompiler', '-fPIC', '--shared', '-o', output_file, cuda_file], check=True)
+    output_file = cuda_file.with_suffix('.so')
+    subprocess.run(['nvcc', '-Xcompiler', '-fPIC', '--shared', '-o', str(output_file), str(cuda_file)], check=True)
     return output_file
 
 def prepare_inputs(signature: list) -> list:
@@ -67,8 +80,8 @@ def run_pytorch_function(func: Callable, inputs: dict) -> torch.Tensor:
         return func(**inputs)
 
 
-def load_cuda_function(lib_path: str, function_name: str, signature: list) -> Callable:
-    lib_path = os.path.abspath(lib_path)
+def load_cuda_function(lib_path: Path, function_name: str, signature: list) -> Callable:
+    lib_path = lib_path.resolve()
     lib = ctypes.CDLL(lib_path)
     func = getattr(lib, function_name)
     args = [
@@ -113,7 +126,7 @@ def compare_outputs(pytorch_output: torch.Tensor, cuda_output: np.ndarray, rtol:
     allclose = torch.allclose(pytorch_output.cpu(), torch.tensor(cuda_output), rtol=rtol, atol=atol)
     return allclose, max_diff
 
-def judge_transpilation(input_file: str, num_tests: int = 10) -> None:
+def judge_transpilation(input_file: Path, num_tests: int = 10) -> None:
     """Judge the correctness of the transpiled CUDA code."""
     print(f"Testing transpilation of {input_file}")
 
@@ -146,15 +159,18 @@ def judge_transpilation(input_file: str, num_tests: int = 10) -> None:
         passed, max_diff = compare_outputs(pytorch_output, cuda_output)
         total_diff += max_diff
 
-        if passed:
-            passed_tests += 1
-            print(f"Test {i+1}: Passed (Max difference: {max_diff:.6f})")
-        else:
-            print(f"Test {i+1}: Failed (Max difference: {max_diff:.6f})")
+        passed_tests += passed
 
-    print(f"\nPassed {passed_tests} out of {num_tests} tests")
-    print(f"Average max difference: {total_diff / num_tests:.6f}")
+    return passed_tests / num_tests
 
 if __name__ == "__main__":
-    input_file = "example.py"  # Replace with the actual input file path
-    judge_transpilation(input_file)
+    for file in DATA_DIR.glob("*.py"):
+        try:
+            score = judge_transpilation(file)
+            table.add_row(file.name, f"{score * 100:.2f}%")
+        except Exception as e:
+            table.add_row(file.name, "0.0%")
+
+    console = Console()
+    console.print(table)
+
