@@ -21,7 +21,7 @@ Every functions or classes should be defined in the code.
 Do not import any external functions or classes, except torch and numpy.
 
 3. Answer has a specific format.
-The answer format should be like below:
+Each function in the answer should be formatted like below:
 ### <summary of the function>
 ```python
 import torch
@@ -489,10 +489,11 @@ def generate_functions(
     output_md_dir: str,
     output_py_dir: str,
     max_reference_files: int = 3,
+    reuse_existing_md: bool = False,
 ) -> list[str]:
     md = ""
     md_path = f"{output_md_dir}/learn_from_{reference_model}.md"
-    if os.path.exists(md_path):
+    if reuse_existing_md and os.path.exists(md_path):
         md = open(md_path, "r").read()
     else:
         llm = LLM()

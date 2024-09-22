@@ -1,4 +1,5 @@
 import logging
+import random
 import sys
 
 from generator import GeneratorPipeline
@@ -19,8 +20,11 @@ if __name__ == "__main__":
         output_py_dir=output_py_dir,
     )
 
+    model_names = list(models.keys())
+    random.shuffle(model_names)
+
     i = 0
-    for model in models.keys():
+    for model in model_names:
         i += 1
         logger.info(f"--- {i}/{len(models)}: Processing {model}")
 
