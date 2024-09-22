@@ -14,6 +14,7 @@ Constraints:
 1. The function takes torch tensors and returns a torch tensor or tuple of them.
 The function must take torch tensors as parameters,
 and return a torch tensor or tuple of torch tensors as output.
+If you need any other kind of parameters, make it as a constant.
 
 2. The function must be self-contained.
 Make it self-contained and independent of other functions.
@@ -35,7 +36,8 @@ Even if a function may not run as expected, it must be able to run without any e
 If provided model code is not enough to implement the function, you can make assumptions.
 Just make sure the function is executable.
 
-Make sure the function takes and returns torch tensors and is self-contained.
+Make sure.
+Only torch tensors parameters, self-contained, and executable.
 """
 
 
