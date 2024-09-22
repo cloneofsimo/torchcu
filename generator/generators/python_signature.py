@@ -1,6 +1,8 @@
 import logging
 
-from src.llm import LLM, Input
+from generator.llm import LLM, Input
+
+function_signature_divider = "\n# function_signature\n"
 
 prompt_write_signature = """Read a function, and write a function signature for that.
 It should specify the function's name, shapes for the input and output tensors, and data types.
@@ -57,7 +59,7 @@ Again, it should specify the function's name, parameter's names, dimensions for 
 logger = logging.getLogger()
 
 
-def generate_signature(filepath: str, function_signature_divider: str):
+def generate_signature(filepath: str):
     logger.info(f"Generating function signature for {filepath}")
 
     i = Input()

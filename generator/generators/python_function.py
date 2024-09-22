@@ -1,15 +1,16 @@
 import logging
 import os
 
-from src.example_models import models
-from src.llm import LLM, Input
+from generator.example_models import models
+from generator.llm import LLM, Input
 
 prompt_write_functions = """These are example pytorch code.
 Now, write some pytorch functions.
 
 Constraints:
-1. Takes and returns torch tensors.
-It should be a function that takes torch tensors and returns a torch tensor.
+1. Takes torch tensors and returns a torch tensor or tuple of them.
+It should be a function that takes torch tensors as parameters and,
+returns a torch tensor or tuple of torch tensors as output.
 
 2. The function should be self-contained.
 Make it self-contained and independent of other functions.
