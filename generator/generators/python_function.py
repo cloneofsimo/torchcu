@@ -8,7 +8,8 @@ from generator.llm import LLM
 prompt_write_functions = """Here is a pytorch model source code.
 {examples}
 
-Your goal is to make a simular but simpler model with a single function.
+Your goal is to make a random pytorch code with a single function.
+Use the provided code as a reference to write a function.
 
 Constraints:
 1. The function takes torch tensors and returns a torch tensor or tuple of them.
@@ -33,8 +34,12 @@ def <function_name>(<parameter_name>: torch.Tensor, <parameter_name>: torch.Tens
 
 4. It must be executable.
 Even if a function may not run as expected, it must be able to run without any errors.
-If provided model code is not enough to implement the function, you can make assumptions.
 Just make sure the function is executable.
+
+5. Not too simple, not too complex.
+The function must not be too simple or too complex.
+Use the provided code as a reference.
+It should be complex enough to test the candidate's ability to write a function.
 
 Make sure.
 Only torch tensors parameters, self-contained, and executable.
@@ -44,11 +49,10 @@ Only torch tensors parameters, self-contained, and executable.
 logger = logging.getLogger()
 
 
-def generate_functions(
+def generate_markdown(
     reference_model: str,
     output_md_dir: str,
-    output_py_dir: str,
-    max_reference_files: int = None,
+    max_reference_files: int = 3,
     reuse_existing_md: bool = False,
 ) -> tuple[list[str], list[dict[str, str]]]:
     context = []
@@ -88,6 +92,15 @@ def generate_functions(
         context.append({"role": "assistant", "content": md})
 
         logger.info(f"Generated markdown file: {md_path} (token usage: {llm.usage})")
+    return md_path, context
+
+
+def generate_functions(
+    md_filepath: str,
+    output_py_dir: str,
+) -> list[str]:
+    with open(md_filepath, "r") as f:
+        md = f.read()
 
     filepaths = []
     snippets = [s for s in md.split("###") if s != ""]
@@ -100,6 +113,7 @@ def generate_functions(
             logger.warning(f"Failed to parse snippet, model output: {snippet}")
             continue
 
+        reference_model = md_filepath.split("/")[-1].replace(".md", "")
         filepath = f"{output_py_dir}/{reference_model}_{name}.py"
         if os.path.exists(filepath):
             filepath = (
@@ -111,4 +125,4 @@ def generate_functions(
 
         logger.info(f"Saved snippet to {filepath}")
 
-    return filepaths, context
+    return filepaths

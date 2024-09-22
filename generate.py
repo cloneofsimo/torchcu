@@ -9,7 +9,7 @@ output_md_dir = "outputs/md"
 output_py_dir = "outputs/py"
 function_signature_divider = "\n# function_signature\n"
 
-ITERATIONS = 10
+ITERATIONS = None
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,6 +18,7 @@ if __name__ == "__main__":
     pipeline = GeneratorPipeline(
         output_md_dir=output_md_dir,
         output_py_dir=output_py_dir,
+        delete_wrong_files=True,
     )
 
     model_names = list(models.keys())

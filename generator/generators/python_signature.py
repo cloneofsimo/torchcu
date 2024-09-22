@@ -24,6 +24,7 @@ function_signature = {{
 
 2. Each shape should be greater than or equal to 4.
 (4, 4) is the minimum shape for the tensors.
+If there is scalar parameters like int or float, you can ignore them.
 
 For example, consider the following function:
 ```python
