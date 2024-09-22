@@ -3,7 +3,6 @@
 #include <device_launch_parameters.h>
 #include <stdarg.h>  // Add this for va_list, va_start, va_end
 #include <stdio.h>
-#include <cassert>
 
 // Helper function to convert float to __nv_bfloat16
 __device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
@@ -34,7 +33,7 @@ __global__ void matmul_relu_kernel_bf16(const float* input_tensor, const float* 
 
 extern "C" {
 
-void torch_function(int num_args, ...) {
+void complex_task(int num_args, ...) {
     va_list args;
     va_start(args, num_args);
 
@@ -47,11 +46,6 @@ void torch_function(int num_args, ...) {
     const float* weight = va_arg(args, const float*);
     int weight_dim0 = va_arg(args, int);
     int weight_dim1 = va_arg(args, int);
-
-    // Extract extra param 'something'
-    int something = va_arg(args, int);
-    assert(something >= 1);
-    assert(something <= 2);
 
     // Extract output tensor (assuming it's preallocated)
     float* output = va_arg(args, float*);
@@ -107,7 +101,7 @@ int main() {
     float output[2][2];
 
     // Call the CUDA kernel
-    torch_function(6, input_tensor, input_tensor_dim0, input_tensor_dim1,
+    complex_task(6, input_tensor, input_tensor_dim0, input_tensor_dim1,
                         weight, weight_dim0, weight_dim1,
                         output);
 

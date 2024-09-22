@@ -23,7 +23,52 @@ def load_pytorch_function(file_path: str, function_name: str) -> Callable:
     module = runpy.run_path(file_path)
     return module[function_name]
 
-def load_function_signature(file_path: str) -> tuple[str, list[tuple[tuple, torch.dtype], list[tuple[tuple, torch.dtype]]]]:
+class ArgSpec:
+    pass
+
+class TensorSpec(ArgSpec):
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+    def __init__(self, shape, dtype):
+        self.shape = shape
+        self.dtype = dtype
+
+class IntSpec(ArgSpec):
+    min_value: int
+    max_value: int
+
+    def __init__(self, min_value, max_value):
+        self.min_value = min_value
+        self.max_value = max_value
+
+def _read_arg(arg):
+    if not isinstance(arg, tuple):
+        raise ValueError(f"Invalid argument: {arg}")
+
+    if len(arg) != 2:
+        raise ValueError(f"Invalid argument: {arg}")
+
+    if not isinstance(arg[0], tuple):
+        raise ValueError(f"Invalid argument: {arg}")
+    if len(arg[0]) < 1:
+        raise ValueError(f"Invalid argument: {arg}")
+    if not all(isinstance(dim, int) for dim in arg[0]):
+        raise ValueError(f"Invalid argument: {arg}")
+
+    if arg[1] == int:
+        # min/max value for int
+        if len(arg[0]) != 2:
+            raise ValueError(f"Invalid argument: {arg}")
+        return IntSpec(arg[0][0], arg[0][1])
+
+    if not (isinstance(arg[1], torch.dtype) or isinstance(arg[1], type)):
+        raise ValueError(f"Invalid argument: {arg}")
+
+    return TensorSpec(arg[0], arg[1])
+
+
+def load_function_signature(file_path: str) -> tuple[str, list[ArgSpec, list[ArgSpec]]]:
     """Load the function signature from the given file."""
     module = runpy.run_path(file_path)
     signature_dict = module['function_signature']
@@ -33,24 +78,15 @@ def load_function_signature(file_path: str) -> tuple[str, list[tuple[tuple, torc
 
     # validate the args follow the format
     # ((shape,), dtype)
-    for arg in (inputs + outputs):
-        if not isinstance(arg, tuple):
-            raise ValueError(f"Invalid argument: {arg}")
+    res_inputs = [
+        _read_arg(arg) for arg in inputs
+    ]
+    res_outputs = [
+        _read_arg(arg) for arg in outputs
+    ]
 
-        if len(arg) != 2:
-            raise ValueError(f"Invalid argument: {arg}")
-
-        if not isinstance(arg[0], tuple):
-            raise ValueError(f"Invalid argument: {arg}")
-        if len(arg[0]) < 1:
-            raise ValueError(f"Invalid argument: {arg}")
-        if not all(isinstance(dim, int) for dim in arg[0]):
-            raise ValueError(f"Invalid argument: {arg}")
-
-        if not isinstance(arg[1], torch.dtype):
-            raise ValueError(f"Invalid argument: {arg}")
-
-    return name, inputs, outputs
+    print(f"Loaded function signature: {name} with inputs {res_inputs} and outputs {res_outputs}")
+    return name, res_inputs, res_outputs
 
 
 def transpile_to_cuda(file_path: str) -> Path:
@@ -65,18 +101,17 @@ def compile_cuda(cuda_file: Path) -> Path:
     subprocess.run(['nvcc', '-Xcompiler', '-fPIC', '--shared', '-o', str(output_file), str(cuda_file), '-lcublas'], check=True)
     return output_file
 
-def prepare_inputs(signature: list) -> list:
+def prepare_inputs(signature: list[ArgSpec]) -> list:
     """Prepare input tensors based on the function signature."""
     positional_arguments = []
     for arg in signature:
-        shape, dtype = arg
-        rand_arg = None
-        if dtype == torch.long or dtype == torch.int:
-            rand_arg = torch.randint(0, 100, shape, dtype=dtype)
-        else:
-            rand_arg = torch.randn(shape, dtype=dtype)
-
-        positional_arguments.append(rand_arg)
+        if isinstance(arg, IntSpec):
+            # add a random integer between min and max value
+            # TODO: make it random
+            positional_arguments.append(arg.max_value - 1)
+        elif isinstance(arg, TensorSpec):
+            # add a random tensor with the given shape and
+            positional_arguments.append(torch.randn(arg.shape, dtype=arg.dtype))
 
     return positional_arguments
 
@@ -86,7 +121,7 @@ def run_pytorch_function(func: Callable, inputs: list):
         return func(*inputs)
 
 
-def load_cuda_function(lib_path: Path, function_name: str, inputs: list, outputs: list) -> Callable:
+def load_cuda_function(lib_path: Path, function_name: str, inputs: list[ArgSpec], outputs: list[ArgSpec]) -> Callable:
     lib_path = lib_path.resolve()
     lib = ctypes.CDLL(lib_path)
     func = getattr(lib, function_name)
@@ -98,32 +133,40 @@ def load_cuda_function(lib_path: Path, function_name: str, inputs: list, outputs
     # ('weight', (4, 4), torch.float32)
     # ('other', (2, 4, 4), torch.float32)
     for arg in inputs:
-        arg_shape, arg_dtype = arg
-
-        # pointer to the arg_dtype
-        args.append(ctypes.POINTER(ctypes.c_float))
-        for dim in arg_shape:
+        if isinstance(arg, TensorSpec):
+            # pointer to the arg_dtype
+            args.append(ctypes.POINTER(ctypes.c_float))
+            for dim in arg.shape:
+                args.append(ctypes.c_int)
+        elif isinstance(arg, IntSpec):
             args.append(ctypes.c_int)
 
     for output in outputs:
-        output_shape, output_dtype = output
+        args.append(ctypes.POINTER(ctypes.c_float))
         # We do not need to include the shape of the output tensor
         # for dim in output_shape:
         #     args.append(ctypes.c_int)
 
+    print("Loading CUDA function\n", f"func({', '.join(str(arg) for arg in args)})")
     func.argtypes = args
     func.restype = None
     return func
 
 def run_cuda_function(func: Callable, inputs: list[torch.Tensor], outputs: list[torch.Tensor]):
+    # print("Input:", ", ".join(str(arg.shape if isinstance(arg, torch.Tensor) else arg) for arg in inputs))
+    # print("Output:", ", ".join(str(arg.shape if isinstance(arg, torch.Tensor) else arg) for arg in outputs))
+
     args = []
 
     for arg in inputs:
-        arr = arg.cpu().numpy()
-        # Add args as ctypes.POINTER(ctypes.c_float) and then the shape
-        args.append(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
-        for dim in arr.shape:
-            args.append(ctypes.c_int(dim))
+        if isinstance(arg, torch.Tensor):
+            arr = arg.cpu().numpy()
+            # Add args as ctypes.POINTER(ctypes.c_float) and then the shape
+            args.append(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+            for dim in arr.shape:
+                args.append(ctypes.c_int(dim))
+        elif isinstance(arg, int):
+            args.append(ctypes.c_int(arg))
 
     for arg in outputs:
         arr = arg.cpu().numpy()
@@ -131,6 +174,7 @@ def run_cuda_function(func: Callable, inputs: list[torch.Tensor], outputs: list[
 
     args = [ctypes.c_int(len(args))] + args
 
+    # print("Running CUDA function\n", f"func({', '.join(str(arg) for arg in args)})")
     func(*args)
 
 def compare_outputs(pytorch_output: torch.Tensor, cuda_output: torch.Tensor, rtol: float = 1e-2, atol: float = 1e-2) -> bool:
@@ -204,6 +248,11 @@ def judge_it(input_file: Path, num_tests: int = 10) -> float:
     queue = multiprocessing.Queue()
     process = multiprocessing.Process(target=target, args=(queue,))
     process.start()
-    process.join()
+    process.join(timeout=10)
+    if process.is_alive():
+        print("Terminating process")
+        process.terminate()
+        process.join()
+        return 0.0
 
     return queue.get() if not queue.empty() else 0.0
