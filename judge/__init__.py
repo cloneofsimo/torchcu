@@ -111,17 +111,11 @@ def load_cuda_function(lib_path: Path, function_name: str, inputs: list, outputs
         # for dim in output_shape:
         #     args.append(ctypes.c_int)
 
-    # print("Loading CUDA function\n", f"func({', '.join(str(arg) for arg in args)})")
     func.argtypes = args
     func.restype = None
     return func
 
 def run_cuda_function(func: Callable, inputs: list[torch.Tensor], outputs: list[torch.Tensor]):
-    for arg in inputs:
-        print("Input shape:", arg.shape)
-    for arg in outputs:
-        print("Output shape:", arg.shape)
-
     args = []
 
     for arg in inputs:
@@ -137,7 +131,6 @@ def run_cuda_function(func: Callable, inputs: list[torch.Tensor], outputs: list[
 
     args = [ctypes.c_int(len(args))] + args
 
-    print("Running CUDA function\n", f"func({', '.join(str(arg) for arg in args)})")
     func(*args)
 
 def compare_outputs(pytorch_output: torch.Tensor, cuda_output: torch.Tensor, rtol: float = 1e-2, atol: float = 1e-2) -> bool:
@@ -154,7 +147,6 @@ def judge_transpilation(input_file: Path, num_tests: int = 10) -> None:
     function_name, inputs_signature, outputs_signature = load_function_signature(input_file)
     pytorch_func = load_pytorch_function(input_file, function_name)
 
-    # print(f"Loaded PyTorch function: {function_name} with signature {inputs_signature}")
 
     # Transpile and compile CUDA code
     cuda_file = transpile_to_cuda(input_file)
@@ -188,6 +180,9 @@ def judge_transpilation(input_file: Path, num_tests: int = 10) -> None:
             passed, max_diff = compare_outputs(pytorch_output[i], cuda_outputs[i])
             test_passed &= passed
             test_diff += max_diff
+
+            if not passed:
+                print(f"Test {i} failed: {max_diff}")
 
         total_diff += test_diff
         passed_tests += passed
