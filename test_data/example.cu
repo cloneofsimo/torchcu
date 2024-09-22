@@ -2,6 +2,7 @@
 #include <cuda_bf16.h>
 #include <device_launch_parameters.h>
 #include <stdarg.h>  // Add this for va_list, va_start, va_end
+#include <stdio.h>
 
 // Helper function to convert float to __nv_bfloat16
 __device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
@@ -84,3 +85,33 @@ void torch_function(int num_args, ...) {
 }
 
 }  // extern "C"
+
+int main() {
+    // Input tensor
+    const float input_tensor[2][3] = {{1.0f, 2.0f, 3.0f}, {4.0f, 5.0f, 6.0f}};
+    int input_tensor_dim0 = 2;
+    int input_tensor_dim1 = 3;
+
+    // Weight tensor
+    const float weight[2][3] = {{0.1f, 0.2f, 0.3f}, {0.4f, 0.5f, 0.6f}};
+    int weight_dim0 = 2;
+    int weight_dim1 = 3;
+
+    // Output tensor
+    float output[2][2];
+
+    // Call the CUDA kernel
+    torch_function(6, input_tensor, input_tensor_dim0, input_tensor_dim1,
+                        weight, weight_dim0, weight_dim1,
+                        output);
+
+    // Print the output tensor
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            printf("%f ", output[i][j]);
+        }
+        printf("\n");
+    }
+
+    return 0;
+}
