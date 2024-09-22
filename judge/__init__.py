@@ -62,7 +62,7 @@ def transpile_to_cuda(file_path: str) -> Path:
 def compile_cuda(cuda_file: Path) -> Path:
     """Compile the CUDA code to a shared library."""
     output_file = cuda_file.with_suffix('.so')
-    subprocess.run(['nvcc', '-Xcompiler', '-fPIC', '--shared', '-o', str(output_file), str(cuda_file), '-lcublas', '-I/home/ubuntu/cutlass/include'], check=True)
+    subprocess.run(['nvcc', '-Xcompiler', '-fPIC', '--shared', '-o', str(output_file), str(cuda_file), '-lcublas'], check=True)
     return output_file
 
 def prepare_inputs(signature: list) -> list:
