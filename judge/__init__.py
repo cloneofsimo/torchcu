@@ -7,8 +7,7 @@ import ctypes
 from typing import Callable
 
 from rich.table import Table
-from rich.console import Console
-
+import traceback
 
 table = Table(title="Transpilation Results")
 table.add_column("File", style="cyan", no_wrap=True)
@@ -189,7 +188,7 @@ def judge_it(input_file: Path, num_tests: int = 10) -> None:
     try:
         score = judge_transpilation(input_file, num_tests)
     except Exception as e:
-        import traceback
+        print("Error in judge_it", e)
         traceback.print_exc()
         score = 0.0
 
