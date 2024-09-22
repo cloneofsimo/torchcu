@@ -163,13 +163,21 @@ def judge_transpilation(input_file: Path, num_tests: int = 10) -> None:
 
     return passed_tests / num_tests
 
+def judge_it(input_file: Path, num_tests: int = 10) -> None:
+    """Judge the correctness of the transpiled CUDA code."""
+    
+    try:
+        score = judge_transpilation(input_file, num_tests)
+    except Exception as e:
+        score = 0.0
+
+    return score
+
+
 if __name__ == "__main__":
     for file in DATA_DIR.glob("*.py"):
-        try:
-            score = judge_transpilation(file)
-            table.add_row(file.name, f"{score * 100:.2f}%")
-        except Exception as e:
-            table.add_row(file.name, "0.0%")
+        score = judge_it(file)
+        table.add_row(file.name, f"{score * 100:.2f}%")
 
     console = Console()
     console.print(table)
