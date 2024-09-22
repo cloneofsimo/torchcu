@@ -1,4 +1,5 @@
 
+from openai import OpenAI
 import shutil
 from together import Together
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ force_regenerate = args.force_regenerate
 __CURR_DIR__ = Path(__file__).parent
 
 client = Together(api_key=os.environ['TOGETHER_API_KEY'])
+openai_client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
 
 arena_data_dir = __CURR_DIR__ / "test_py_files"
 
@@ -188,22 +190,31 @@ class LLM:
         source_code_prompt = self.source_code_template.format(source_code=source_code)
         prompt = self._chat_template + source_code_prompt
 
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            repetition_penalty=self.repetition_penalty,
-            stop=self.stop,
-        )
+        kwargs = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repetition_penalty": self.repetition_penalty,
+            "stop": self.stop,
+        }
+
+        gen_client = client
+        if "gpt" in self.model:
+            gen_client = openai_client
+            kwargs.pop("top_k")
+            kwargs.pop("repetition_penalty")
+
+        response = gen_client.chat.completions.create(**kwargs)
 
         return response.choices[0].message.content.strip()
 
 
 
 MODELS = [
+    "gpt-4o",
     "codellama/CodeLlama-34b-Instruct-hf",
     "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
     "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
