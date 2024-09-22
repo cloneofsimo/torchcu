@@ -23,34 +23,34 @@ def load_pytorch_function(file_path: str, function_name: str) -> Callable:
     module = runpy.run_path(file_path)
     return module[function_name]
 
-def load_function_signature(file_path: str) -> tuple[str, list[tuple[str, tuple, torch.dtype]]]:
+def load_function_signature(file_path: str) -> tuple[str, list[tuple[tuple, torch.dtype], list[tuple[tuple, torch.dtype]]]]:
     """Load the function signature from the given file."""
     module = runpy.run_path(file_path)
-    name, *args = module['function_signature']
-    # validate the args follow the format
-    # ('name', (shape,), dtype)
+    signature_dict = module['function_signature']
+    name = signature_dict['name']
+    inputs = signature_dict['inputs']
+    outputs = signature_dict['outputs']
 
-    for arg in args:
+    # validate the args follow the format
+    # ((shape,), dtype)
+    for arg in (inputs + outputs):
         if not isinstance(arg, tuple):
             raise ValueError(f"Invalid argument: {arg}")
 
-        if len(arg) != 3:
+        if len(arg) != 2:
             raise ValueError(f"Invalid argument: {arg}")
 
-        if not isinstance(arg[0], str):
+        if not isinstance(arg[0], tuple):
+            raise ValueError(f"Invalid argument: {arg}")
+        if len(arg[0]) < 1:
+            raise ValueError(f"Invalid argument: {arg}")
+        if not all(isinstance(dim, int) for dim in arg[0]):
             raise ValueError(f"Invalid argument: {arg}")
 
-        if not isinstance(arg[1], tuple):
-            raise ValueError(f"Invalid argument: {arg}")
-        if len(arg[1]) < 1:
-            raise ValueError(f"Invalid argument: {arg}")
-        if not all(isinstance(dim, int) for dim in arg[1]):
+        if not isinstance(arg[1], torch.dtype):
             raise ValueError(f"Invalid argument: {arg}")
 
-        if not isinstance(arg[2], torch.dtype):
-            raise ValueError(f"Invalid argument: {arg}")
-
-    return name, args
+    return name, inputs, outputs
 
 
 def transpile_to_cuda(file_path: str) -> Path:
@@ -67,21 +67,19 @@ def compile_cuda(cuda_file: Path) -> Path:
 
 def prepare_inputs(signature: list) -> list:
     """Prepare input tensors based on the function signature."""
-    inputs = {}
+    positional_arguments = []
     for arg in signature:
-        if isinstance(arg, tuple):
-            inputs[arg[0]] = torch.randn(arg[1], dtype=arg[2])
-        else:
-            inputs[arg] = torch.randn(1, dtype=torch.float32)
-    return inputs
+        positional_arguments.append(torch.randn(arg[0], dtype=arg[1]))
 
-def run_pytorch_function(func: Callable, inputs: dict) -> torch.Tensor:
+    return positional_arguments
+
+def run_pytorch_function(func: Callable, inputs: list) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Run the PyTorch function with the given inputs."""
     with torch.no_grad():
-        return func(**inputs)
+        return func(*inputs)
 
 
-def load_cuda_function(lib_path: Path, function_name: str, signature: list) -> Callable:
+def load_cuda_function(lib_path: Path, function_name: str, inputs: list, outputs: list) -> Callable:
     lib_path = lib_path.resolve()
     lib = ctypes.CDLL(lib_path)
     func = getattr(lib, function_name)
@@ -92,39 +90,49 @@ def load_cuda_function(lib_path: Path, function_name: str, signature: list) -> C
     # ('input_tensor', (4, 4), torch.float32)
     # ('weight', (4, 4), torch.float32)
     # ('other', (2, 4, 4), torch.float32)
-    for arg in signature:
-        arg_name, arg_shape, arg_dtype = arg
-        
+    for arg in inputs:
+        arg_shape, arg_dtype = arg
+
+        # pointer to the arg_dtype
         args.append(ctypes.POINTER(ctypes.c_float))
         for dim in arg_shape:
             args.append(ctypes.c_int)
 
+    for output in outputs:
+        output_shape, output_dtype = output
+        # We do not need to include the shape of the output tensor
+        # for dim in output_shape:
+        #     args.append(ctypes.c_int)
+
+    # print("Loading CUDA function\n", f"func({', '.join(str(arg) for arg in args)})")
     func.argtypes = args
     func.restype = None
     return func
 
-def run_cuda_function(func: Callable, inputs: dict, output_shape: tuple) -> np.ndarray:
-    input_tensor = inputs['input_tensor'].cpu().numpy()
-    weight = inputs['weight'].cpu().numpy()
-    output = np.zeros(output_shape, dtype=np.float32)
+def run_cuda_function(func: Callable, inputs: list[torch.Tensor], outputs: list[torch.Tensor]):
+    print(inputs, outputs)
+    args = []
 
-    func(
-        ctypes.c_int(7),  # num_args (excluding this one)
-        input_tensor.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(input_tensor.shape[0]),
-        ctypes.c_int(input_tensor.shape[1]),
-        weight.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        ctypes.c_int(weight.shape[0]),
-        ctypes.c_int(weight.shape[1]),
-        output.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-    )
+    for arg in inputs:
+        arr = arg.cpu().numpy()
+        # Add args as ctypes.POINTER(ctypes.c_float) and then the shape
+        args.append(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        for dim in arr.shape:
+            args.append(ctypes.c_int(dim))
 
-    return output
+    for arg in outputs:
+        arr = arg.cpu().numpy()
+        args.append(arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
 
-def compare_outputs(pytorch_output: torch.Tensor, cuda_output: np.ndarray, rtol: float = 1e-2, atol: float = 1e-2) -> bool:
+    args = [ctypes.c_int(len(args))] + args
+
+    print("Running CUDA function\n", f"func({', '.join(str(arg) for arg in args)})")
+    func(*args)
+
+def compare_outputs(pytorch_output: torch.Tensor, cuda_output: torch.Tensor, rtol: float = 1e-2, atol: float = 1e-2) -> bool:
     """Compare the outputs of PyTorch and CUDA implementations."""
-    max_diff = np.max(np.abs(pytorch_output.cpu().numpy() - cuda_output))
-    allclose = torch.allclose(pytorch_output.cpu(), torch.tensor(cuda_output), rtol=rtol, atol=atol)
+    max_diff = np.max(np.abs(pytorch_output.cpu().numpy() - cuda_output.cpu().numpy()))
+    allclose = torch.allclose(pytorch_output.cpu(), cuda_output.cpu(), rtol=rtol, atol=atol)
     return allclose, max_diff
 
 def judge_transpilation(input_file: Path, num_tests: int = 10) -> None:
@@ -132,33 +140,45 @@ def judge_transpilation(input_file: Path, num_tests: int = 10) -> None:
     print(f"Testing transpilation of {input_file}")
 
     # Load PyTorch function and signature
-    function_name, signature = load_function_signature(input_file)
+    function_name, inputs_signature, outputs_signature = load_function_signature(input_file)
     pytorch_func = load_pytorch_function(input_file, function_name)
 
-    print(f"Loaded PyTorch function: {function_name} with signature {signature}")
+    # print(f"Loaded PyTorch function: {function_name} with signature {inputs_signature}")
 
     # Transpile and compile CUDA code
     cuda_file = transpile_to_cuda(input_file)
     lib_path = compile_cuda(cuda_file)
-    cuda_func = load_cuda_function(lib_path, function_name, signature)
+    cuda_func = load_cuda_function(lib_path, function_name, inputs_signature, outputs_signature)
 
     passed_tests = 0
     total_diff = 0
 
     for i in range(num_tests):
         # Prepare inputs
-        inputs = prepare_inputs(signature)
+        inputs_args = prepare_inputs(inputs_signature)
 
         # Run PyTorch function
-        pytorch_output = run_pytorch_function(pytorch_func, inputs)
+        pytorch_output = run_pytorch_function(pytorch_func, inputs_args)
+        if not isinstance(pytorch_output, tuple):
+            pytorch_output = (pytorch_output,)
+        pytorch_output = list(pytorch_output)
 
         # Run CUDA function
-        cuda_output = run_cuda_function(cuda_func, inputs, pytorch_output.shape)
+        # Prepare outputs for CUDA function
+        cuda_outputs = []
+        for output in pytorch_output:
+            cuda_outputs.append(torch.empty_like(output))
+        run_cuda_function(cuda_func, inputs_args, cuda_outputs)
 
         # Compare outputs
-        passed, max_diff = compare_outputs(pytorch_output, cuda_output)
-        total_diff += max_diff
+        test_passed = True
+        test_diff = 0
+        for i, _ in enumerate(pytorch_output):
+            passed, max_diff = compare_outputs(pytorch_output[i], cuda_outputs[i])
+            test_passed &= passed
+            test_diff += max_diff
 
+        total_diff += test_diff
         passed_tests += passed
 
     return passed_tests / num_tests
@@ -169,6 +189,8 @@ def judge_it(input_file: Path, num_tests: int = 10) -> None:
     try:
         score = judge_transpilation(input_file, num_tests)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         score = 0.0
 
     return score

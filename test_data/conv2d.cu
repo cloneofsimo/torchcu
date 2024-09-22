@@ -2,6 +2,7 @@
 #include <cuda_bf16.h>
 #include <device_launch_parameters.h>
 #include <stdarg.h>  // Add this for va_list, va_start, va_end
+#include <stdio.h>
 
 // Helper function to convert float to __nv_bfloat16
 __device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {

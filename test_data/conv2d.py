@@ -13,9 +13,14 @@ def torch_conv2d_function(input_tensor: torch.Tensor, weight: torch.Tensor, bias
     
     return torch.relu(output).to(torch.float32)
 
-function_signature = [
-    'torch_conv2d_function',
-    ('input_tensor', (1, 3, 32, 32), torch.float32),  # (batch_size, in_channels, height, width)
-    ('weight', (6, 3, 5, 5), torch.float32),         # (out_channels, in_channels, kernel_height, kernel_width)
-    ('bias', (6,), torch.float32)                    # (out_channels)
-]
+function_signature = {
+    'name': 'torch_conv2d_function',
+    'inputs': [
+        ((1, 3, 32, 32), torch.float32),    # (batch_size, in_channels, height, width)
+        ((6, 3, 5, 5), torch.float32),      # (out_channels, in_channels, kernel_height, kernel_width)
+        ((6,), torch.float32)               # (out_channels)
+    ],
+    'outputs': [
+        ((1, 6, 28, 28), torch.float32)     # (batch_size, out_channels, output_height, output_width)
+    ]
+}

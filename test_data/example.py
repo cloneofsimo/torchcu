@@ -9,8 +9,13 @@ def torch_function(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Te
     output = torch.matmul(input_bf16, weight_bf16.t())
     return torch.relu(output).to(torch.float32)
 
-function_signature = [
-    'torch_function',
-    ('input_tensor', (4, 4), torch.float32),
-    ('weight', (4, 4), torch.float32)
-]
+function_signature = {
+    "name": "torch_function",
+    "inputs": [
+        ((4, 4), torch.float32),
+        ((4, 4), torch.float32)
+    ],
+    "outputs": [
+        ((4, 4), torch.float32)
+    ]
+}
