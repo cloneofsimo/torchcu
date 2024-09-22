@@ -15,7 +15,7 @@ table.add_column("File", style="cyan", no_wrap=True)
 table.add_column("Score", style="magenta")
 
 
-CURR_DIR = Path(__file__).parent
+CURR_DIR = Path(__file__).parent.parent
 DATA_DIR = CURR_DIR / "test_data"
 
 def load_pytorch_function(file_path: str, function_name: str) -> Callable:
@@ -172,13 +172,4 @@ def judge_it(input_file: Path, num_tests: int = 10) -> None:
         score = 0.0
 
     return score
-
-
-if __name__ == "__main__":
-    for file in DATA_DIR.glob("*.py"):
-        score = judge_it(file)
-        table.add_row(file.name, f"{score * 100:.2f}%")
-
-    console = Console()
-    console.print(table)
 
