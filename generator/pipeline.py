@@ -20,16 +20,12 @@ logger = logging.getLogger()
 
 
 class GeneratorPipeline:
-    def __init__(self, output_md_dir: str, output_py_dir: str):
+    def __init__(
+        self, output_md_dir: str, output_py_dir: str, delete_wrong_files: bool = True
+    ):
         self.output_md_dir = output_md_dir
         self.output_py_dir = output_py_dir
-
-    def generate_functions(self, reference_model) -> list[str]:
-        return generate_functions(
-            reference_model=reference_model,
-            output_md_dir=self.output_md_dir,
-            output_py_dir=self.output_py_dir,
-        )
+        self.delete_wrong_files = delete_wrong_files
 
     def generate_input_signature(self, filepath: str):
         generate_signature(filepath)
@@ -95,13 +91,20 @@ class GeneratorPipeline:
             f.write(function + function_signature_divider + new_signature)
 
     def run(self, reference_model: str):
-        py_filepaths = self.generate_functions(reference_model)
+        py_filepaths, _context = generate_functions(
+            reference_model=reference_model,
+            output_md_dir=self.output_md_dir,
+            output_py_dir=self.output_py_dir,
+            reuse_existing_md=True,
+        )
+
         for filepath in py_filepaths:
             self.generate_input_signature(filepath)
 
             if not is_valid_python([filepath]):
                 logger.warning(f"Invalid python code: {filepath}")
-                os.remove(filepath)
+                if self.delete_wrong_files:
+                    os.remove(filepath)
                 continue
 
             try:
@@ -111,7 +114,8 @@ class GeneratorPipeline:
                     f"Failed to run PyTorch function: {filepath}\nRemoving file."
                 )
                 logger.exception(e)
-                os.remove(filepath)
+                if self.delete_wrong_files:
+                    os.remove(filepath)
                 continue
 
             try:
@@ -120,7 +124,8 @@ class GeneratorPipeline:
                 logger.warning(
                     f"Invalid output from PyTorch function: {filepath}\nError: {e}\nRemoving file.\n"
                 )
-                os.remove(filepath)
+                if self.delete_wrong_files:
+                    os.remove(filepath)
                 continue
 
             self.write_output_signature(filepath, output)

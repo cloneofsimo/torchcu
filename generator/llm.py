@@ -19,9 +19,8 @@ class LLM:
         logger.debug(
             f'Generating completion for {"\n".join([m["role"] + ": " + m["content"] for m in messages])}'
         )
-        stream = client.chat.completions.create(
-            model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-            messages=messages,
+        args = dict(
+            model="meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
             max_tokens=2048,
             temperature=0.7,
             top_p=0.7,
@@ -29,7 +28,11 @@ class LLM:
             repetition_penalty=1,
             stop=["<|eot_id|>", "<|eom_id|>"],
             stream=True,
-            **kwargs,
+        )
+        args.update(kwargs)
+        stream = client.chat.completions.create(
+            messages=messages,
+            **args,
         )
 
         for chunk in stream:
