@@ -109,7 +109,11 @@ def load_cuda_function(lib_path: Path, function_name: str, inputs: list, outputs
     return func
 
 def run_cuda_function(func: Callable, inputs: list[torch.Tensor], outputs: list[torch.Tensor]):
-    print(inputs, outputs)
+    for arg in inputs:
+        print("Input shape:", arg.shape)
+    for arg in outputs:
+        print("Output shape:", arg.shape)
+
     args = []
 
     for arg in inputs:
