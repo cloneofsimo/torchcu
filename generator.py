@@ -4,14 +4,20 @@ import sys
 
 import torch
 
+from judge import (
+    load_function_signature,
+    load_pytorch_function,
+    prepare_inputs,
+    run_pytorch_function,
+)
 from src.example_models import models
-from src.generators.python_function import write_functions
-from src.generators.python_signature import write_signature
-from src.judge.python_run import run_pytorch_file
+from src.generators.python_function import generate_functions
+from src.generators.python_signature import generate_signature
 from src.linter import is_valid_python
 
 output_md_dir = "outputs/md"
 output_py_dir = "outputs/py"
+function_signature_divider = "\n# function_signature\n"
 
 ITERATIONS = 1
 
@@ -24,15 +30,15 @@ class Pipeline:
         self.output_md_dir = output_md_dir
         self.output_py_dir = output_py_dir
 
-    def write_functions(self, reference_model) -> list[str]:
-        return write_functions(
+    def generate_functions(self, reference_model) -> list[str]:
+        return generate_functions(
             reference_model=reference_model,
             output_md_dir=self.output_md_dir,
             output_py_dir=self.output_py_dir,
         )
 
-    def write_input_signature(self, filepath: str):
-        write_signature(filepath)
+    def generate_input_signature(self, filepath: str, function_signature_divider: str):
+        generate_signature(filepath)
 
     def delete_invalid_files(self, filepath: str):
         if not is_valid_python([filepath]):
@@ -41,21 +47,42 @@ class Pipeline:
 
     def run_pytorch_file(self, filepath: str) -> torch.Tensor:
         try:
-            output = run_pytorch_file(filepath)
-            logger.info(f"Output: {output}")
+            function_name, signature = load_function_signature(filepath)
+            pytorch_func = load_pytorch_function(filepath, function_name)
+
+            inputs = prepare_inputs(signature)
+            output = run_pytorch_function(pytorch_func, inputs)
+
+            logger.info(f"Output: {output.shape}, {output.dtype}")
             return output
         except Exception as e:
             logger.error(f"Failed to run PyTorch function: {e}")
 
+    def get_output_signature(self, output: torch.Tensor):
+        shape = f'({", ".join(output.shape)})'
+        dtype = output.dtype
+        return f"({shape}, {dtype})"
+
     def write_output_signature(self, filepath: str, output: torch.Tensor):
-        pass
+        with open(filepath, "r") as f:
+            code = f.read()
+
+        try:
+            function, signature = code.split(function_signature_divider)
+        except ValueError:
+            logger.warning(f"Failed to read function signature: {filepath}")
+            return
+
+        output_signature = self.get_output_signature(output)
+        signature.split('"outputs": [')[1].split("]")[0].strip()
 
     def run(self, reference_model: str):
-        py_filepaths = self.write_functions(reference_model)
+        py_filepaths = self.generate_functions(reference_model)
         for filepath in py_filepaths:
-            self.write_input_signature(filepath)
+            self.generate_input_signature(filepath, function_signature_divider)
             self.delete_invalid_files(filepath)
             output = self.run_pytorch_file(filepath)
+            self.write_output_signature(filepath, output)
 
 
 if __name__ == "__main__":

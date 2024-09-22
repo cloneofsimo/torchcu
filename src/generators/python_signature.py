@@ -57,7 +57,7 @@ Again, it should specify the function's name, parameter's names, dimensions for 
 logger = logging.getLogger()
 
 
-def write_signature(filepath: str):
+def generate_signature(filepath: str, function_signature_divider: str):
     logger.info(f"Generating function signature for {filepath}")
 
     i = Input()
@@ -78,7 +78,7 @@ def write_signature(filepath: str):
         return
 
     with open(filepath, "a") as f:
-        f.write("\n\n\n" + signature)
+        f.write("\n\n\n" + function_signature_divider + signature)
 
     logger.info(
         f"Generated function signature for {filepath} (token usage: {llm.usage})"

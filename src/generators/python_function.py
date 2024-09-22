@@ -45,7 +45,7 @@ Make sure the function takes and returns torch tensors and is self-contained.
 logger = logging.getLogger()
 
 
-def write_functions(
+def generate_functions(
     reference_model: str, output_md_dir: str, output_py_dir: str
 ) -> list[str]:
     md = ""
