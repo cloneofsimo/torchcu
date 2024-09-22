@@ -1,1 +1,3 @@
 *.so
+.env
+__pycache__
