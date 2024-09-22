@@ -6,11 +6,12 @@ authors = []
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.12"
+python = "^3.10"
 together = "^1.2.12"
 python-dotenv = "^1.0.1"
 flake8 = "^7.1.1"
 torch = "^2.4.1"
+sentencepiece = "^0.2.0"
 
 
 [build-system]
