@@ -1,3 +1,4 @@
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -7,23 +8,20 @@ load_dotenv()
 
 client = Together(api_key=os.environ.get("TOGETHER_API_KEY"))
 
-
-class Input:
-    def __init__(self):
-        self.messages = []
-
-    def add(self, content: str, role: str = "user"):
-        self.messages.append({"role": role, "content": content})
+logger = logging.getLogger()
 
 
 class LLM:
     def __init__(self):
         self.usage = 0
 
-    def generate(self, input: Input, **kwargs):
+    def generate(self, messages: list[dict[str, str]], **kwargs):
+        logger.debug(
+            f'Generating completion for {"\n".join([m["role"] + ": " + m["content"] for m in messages])}'
+        )
         stream = client.chat.completions.create(
             model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-            messages=input.messages,
+            messages=messages,
             max_tokens=2048,
             temperature=0.7,
             top_p=0.7,

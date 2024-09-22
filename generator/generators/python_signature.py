@@ -1,6 +1,6 @@
 import logging
 
-from generator.llm import LLM, Input
+from generator.llm import LLM
 
 function_signature_divider = "\n# function_signature\n"
 
@@ -62,15 +62,16 @@ logger = logging.getLogger()
 def generate_signature(filepath: str):
     logger.info(f"Generating function signature for {filepath}")
 
-    i = Input()
     llm = LLM()
 
     with open(filepath, "r") as f:
         content = f.read()
-        i.add(prompt_write_signature.format(function=content))
+        messages = [
+            {"role": "user", "content": prompt_write_signature.format(function=content)}
+        ]
 
     generated = ""
-    for response in llm.generate(i):
+    for response in llm.generate(messages):
         generated += response
 
     try:

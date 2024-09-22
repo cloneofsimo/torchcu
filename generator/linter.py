@@ -1,4 +1,10 @@
+import logging
+
 from flake8.api import legacy as flake8
+
+logging.getLogger("flake8.main.application").setLevel(logging.ERROR)
+logging.getLogger("flake8.checker").setLevel(logging.ERROR)
+
 
 # https://pycodestyle.pycqa.org/en/latest/intro.html#error-codes
 # https://flake8.pycqa.org/en/latest/user/error-codes.html

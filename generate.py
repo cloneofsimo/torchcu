@@ -8,10 +8,10 @@ output_md_dir = "outputs/md"
 output_py_dir = "outputs/py"
 function_signature_divider = "\n# function_signature\n"
 
-ITERATIONS = 1
+ITERATIONS = 10
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     pipeline = GeneratorPipeline(
