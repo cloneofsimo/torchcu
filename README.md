@@ -14,3 +14,13 @@ To run the judger, use the following command:
 python -m judge
 ```
 
+# Warp
+WARP_CACHE_PATH=.kernel_cache python warp_test.py
+```
+
+
+# Arena
+
+```bash
+python arena.py
+```
