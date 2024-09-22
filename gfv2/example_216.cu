@@ -1,0 +1,87 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+__global__ void reflection_pad_kernel(const float* input, float* output, int batch, int channels, 
+                                        int input_height, int input_width, int padding, int output_height, int output_width) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch && c < channels && h < output_height) {
+        int w = threadIdx.x;
+
+        if (w < output_width) {
+            // Calculate input coordinates for reflection padding
+            int input_h = h - padding;
+            int input_w = w - padding;
+
+            if (input_h < 0) {
+                input_h = -input_h - 1;
+            } else if (input_h >= input_height) {
+                input_h = 2 * input_height - input_h - 2;
+            }
+            
+            if (input_w < 0) {
+                input_w = -input_w - 1;
+            } else if (input_w >= input_width) {
+                input_w = 2 * input_width - input_w - 2;
+            }
+
+            // Write to output
+            output[b * channels * output_height * output_width + c * output_height * output_width + h * output_width + w] 
+                = input[b * channels * input_height * input_width + c * input_height * input_width + input_h * input_width + input_w];
+        }
+    }
+}
+
+extern "C" {
+
+void reflection_pad_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int batch = va_arg(args, int);
+    int channels = va_arg(args, int);
+    int input_height = va_arg(args, int);
+    int input_width = va_arg(args, int);
+
+    // Extract padding value
+    int padding = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int output_height = input_height + 2 * padding;
+    int output_width = input_width + 2 * padding;
+
+    // Allocate device memory
+    float* d_input, *d_output;
+    cudaMalloc(&d_input, batch * channels * input_height * input_width * sizeof(float));
+    cudaMalloc(&d_output, batch * channels * output_height * output_width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch * channels * input_height * input_width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 1, 1); // Adjust as needed
+    dim3 numBlocks((output_height + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    reflection_pad_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_output, batch, channels, input_height, input_width, padding, output_height, output_width
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch * channels * output_height * output_width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+}  // extern "C"

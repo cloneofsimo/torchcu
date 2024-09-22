@@ -1,0 +1,126 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+#include <algorithm> // For std::max, std::min
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for max pooling
+__global__ void max_pool2d_kernel_bf16(const __nv_bfloat16* input, __nv_bfloat16* output, 
+                                        int height, int width, int kernel_size, int padding) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= padding && row < height - padding && col >= padding && col < width - padding) {
+        __nv_bfloat16 max_val = input[row * width + col];
+        for (int i = -padding; i <= padding; ++i) {
+            for (int j = -padding; j <= padding; ++j) {
+                int idx = (row + i) * width + (col + j);
+                max_val = __hmax(max_val, input[idx]);
+            }
+        }
+        output[row * width + col] = max_val;
+    }
+}
+
+// CUDA kernel for min pooling
+__global__ void min_pool2d_kernel_bf16(const __nv_bfloat16* input, __nv_bfloat16* output, 
+                                        int height, int width, int kernel_size, int padding) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= padding && row < height - padding && col >= padding && col < width - padding) {
+        __nv_bfloat16 min_val = input[row * width + col];
+        for (int i = -padding; i <= padding; ++i) {
+            for (int j = -padding; j <= padding; ++j) {
+                int idx = (row + i) * width + (col + j);
+                min_val = __hmin(min_val, input[idx]);
+            }
+        }
+        output[row * width + col] = min_val;
+    }
+}
+
+// CUDA kernel for kth value
+__global__ void kth_value_kernel_bf16(const __nv_bfloat16* input, float* output, 
+                                       int size, int k) {
+    int thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_idx < size) {
+        __nv_bfloat16 val = input[thread_idx];
+        output[thread_idx] = bfloat16_to_float(val);
+    }
+}
+
+extern "C" {
+
+void morphological_closing_bf16_kthvalue(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input arguments
+    const char* image_path = va_arg(args, const char*); // Unused, placeholder
+    int kernel_size = va_arg(args, int);
+    int k = va_arg(args, int);
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Image size is unknown in advance, so we'll use a default 
+    // image size and allocate accordingly. Adjust if needed.
+    const int image_height = 256; // Default image height
+    const int image_width = 256;  // Default image width
+    const int padding = kernel_size / 2;
+
+    // Allocate device memory
+    __nv_bfloat16* d_input; 
+    __nv_bfloat16* d_closed_input; 
+    __nv_bfloat16* d_closed_output;
+    float* d_kth_value;
+    cudaMalloc(&d_input, image_height * image_width * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_closed_input, image_height * image_width * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_closed_output, image_height * image_width * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_kth_value, image_height * image_width * sizeof(float));
+
+    // Launch kernels
+    dim3 threadsPerBlock(16, 16); 
+    dim3 numBlocks((image_width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (image_height + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    
+    // Placeholder for loading data from image path
+    // Replace with your actual loading logic
+    
+    // Launch max pooling kernel
+    max_pool2d_kernel_bf16<<<numBlocks, threadsPerBlock>>>(d_input, d_closed_input, 
+                                                             image_height, image_width, 
+                                                             kernel_size, padding);
+    
+    // Launch min pooling kernel
+    min_pool2d_kernel_bf16<<<numBlocks, threadsPerBlock>>>(d_closed_input, d_closed_output, 
+                                                             image_height, image_width, 
+                                                             kernel_size, padding);
+
+    // Launch kth value kernel
+    kth_value_kernel_bf16<<<1, 1>>>(d_closed_output, d_kth_value, 
+                                      image_height * image_width, k); 
+    
+    // Copy result back to host
+    cudaMemcpy(output, d_kth_value, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_closed_input);
+    cudaFree(d_closed_output);
+    cudaFree(d_kth_value);
+}
+
+}  // extern "C"

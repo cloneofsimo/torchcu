@@ -1,0 +1,86 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for 1D FFT using bfloat16
+__global__ void fft_kernel_bf16(const float* input, __nv_bfloat16* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        // Convert input to bfloat16
+        __nv_bfloat16 in_bf16 = float_to_bfloat16(input[i]);
+
+        // Perform FFT using cuFFT library (assuming cuFFT is available)
+        // ... (cuFFT API calls would go here) ...
+
+        // Example of a naive FFT calculation (for demonstration)
+        // (This example uses a simple DFT, not a fast FFT algorithm)
+        __nv_bfloat16 sum_real = 0.0f;
+        __nv_bfloat16 sum_imag = 0.0f;
+        for (int k = 0; k < n; k++) {
+            float angle = 2.0f * M_PI * i * k / n;
+            __nv_bfloat16 cos_val = float_to_bfloat16(cosf(angle));
+            __nv_bfloat16 sin_val = float_to_bfloat16(sinf(angle));
+            sum_real += __hmul(in_bf16, cos_val);
+            sum_imag += __hmul(in_bf16, sin_val);
+        }
+        output[i] = sum_real; // Assuming complex output is stored as separate real and imag parts
+    }
+}
+
+extern "C" {
+
+void wavelet_transform_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input;
+    __nv_bfloat16 *d_output;
+    cudaMalloc(&d_input, input_dim * sizeof(float));
+    cudaMalloc(&d_output, input_dim * sizeof(__nv_bfloat16));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((input_dim + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    fft_kernel_bf16<<<numBlocks, threadsPerBlock>>>(d_input, d_output, input_dim);
+
+    // Copy result back to host (converting from bfloat16 to float)
+    __nv_bfloat16 *h_output = new __nv_bfloat16[input_dim];
+    cudaMemcpy(h_output, d_output, input_dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < input_dim; i++) {
+        output[i] = bfloat16_to_float(h_output[i]);
+    }
+    delete[] h_output;
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

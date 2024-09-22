@@ -1,0 +1,249 @@
+```python
+import torch
+
+def softshrink_crossfade_fp32(input_tensor: torch.Tensor, threshold: float, weight: torch.Tensor, alpha: float) -> torch.Tensor:
+    """
+    Applies the soft shrink operation to the input tensor, followed by a cross-fade with another tensor.
+    The operation is performed in FP32.
+
+    Args:
+        input_tensor (torch.Tensor): The input tensor.
+        threshold (float): The threshold for the soft shrink operation.
+        weight (torch.Tensor): The tensor to cross-fade with.
+        alpha (float): The cross-fade weight.
+
+    Returns:
+        torch.Tensor: The output tensor.
+    """
+    output = torch.where(input_tensor.abs() > threshold, input_tensor - threshold * torch.sign(input_tensor), torch.zeros_like(input_tensor))
+    output = output * (1 - alpha) + weight * alpha
+    return output
+
+function_signature = {
+    "name": "softshrink_crossfade_fp32",
+    "inputs": [
+        ((4, 4), torch.float32),
+        (torch.float32),
+        ((4, 4), torch.float32),
+        (torch.float32),
+    ],
+    "outputs": [
+        ((4, 4), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for the soft shrink and cross-fade operation
+__global__ void softshrink_crossfade_kernel(const float* input_tensor, float threshold, const float* weight, float alpha, float* output, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        float value = input_tensor[i];
+        if (abs(value) > threshold) {
+            output[i] = (value - threshold * (value > 0.0f ? 1.0f : -1.0f)) * (1 - alpha) + weight[i] * alpha;
+        } else {
+            output[i] = weight[i] * alpha;
+        }
+    }
+}
+
+extern "C" {
+
+void softshrink_crossfade_fp32(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract threshold
+    float threshold = va_arg(args, float);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract alpha
+    float alpha = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int size = input_tensor_dim0 * input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, size * sizeof(float));
+    cudaMalloc(&d_weight, size * sizeof(float));
+    cudaMalloc(&d_output, size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    softshrink_crossfade_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, threshold, d_weight, alpha, d_output, size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```
+
+**func.py**
+
+```python
+import torch
+
+def softshrink_crossfade_fp32(input_tensor: torch.Tensor, threshold: float, weight: torch.Tensor, alpha: float) -> torch.Tensor:
+    """
+    Applies the soft shrink operation to the input tensor, followed by a cross-fade with another tensor.
+    The operation is performed in FP32.
+
+    Args:
+        input_tensor (torch.Tensor): The input tensor.
+        threshold (float): The threshold for the soft shrink operation.
+        weight (torch.Tensor): The tensor to cross-fade with.
+        alpha (float): The cross-fade weight.
+
+    Returns:
+        torch.Tensor: The output tensor.
+    """
+    output = torch.where(input_tensor.abs() > threshold, input_tensor - threshold * torch.sign(input_tensor), torch.zeros_like(input_tensor))
+    output = output * (1 - alpha) + weight * alpha
+    return output
+
+function_signature = {
+    "name": "softshrink_crossfade_fp32",
+    "inputs": [
+        ((4, 4), torch.float32),
+        (torch.float32),
+        ((4, 4), torch.float32),
+        (torch.float32),
+    ],
+    "outputs": [
+        ((4, 4), torch.float32)
+    ]
+}
+```
+
+**func.cu**
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for the soft shrink and cross-fade operation
+__global__ void softshrink_crossfade_kernel(const float* input_tensor, float threshold, const float* weight, float alpha, float* output, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        float value = input_tensor[i];
+        if (abs(value) > threshold) {
+            output[i] = (value - threshold * (value > 0.0f ? 1.0f : -1.0f)) * (1 - alpha) + weight[i] * alpha;
+        } else {
+            output[i] = weight[i] * alpha;
+        }
+    }
+}
+
+extern "C" {
+
+void softshrink_crossfade_fp32(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract threshold
+    float threshold = va_arg(args, float);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract alpha
+    float alpha = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int size = input_tensor_dim0 * input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, size * sizeof(float));
+    cudaMalloc(&d_weight, size * sizeof(float));
+    cudaMalloc(&d_output, size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    softshrink_crossfade_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, threshold, d_weight, alpha, d_output, size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

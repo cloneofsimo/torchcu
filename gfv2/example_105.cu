@@ -1,0 +1,274 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <iostream>
+#include <math.h>
+#include <stdarg.h>
+
+#define BLOCK_SIZE 16
+
+// Helper functions for CUDA kernel
+__device__ float relu(float x) {
+    return x > 0.0f ? x : 0.0f;
+}
+
+__device__ __forceinline__ float max(float a, float b) {
+    return a > b ? a : b;
+}
+
+__device__ __forceinline__ int adaptive_max_pool3d_get_idx(int input_size, int kernel_size, int output_size, int idx) {
+    int output_idx = idx / output_size;
+    int output_offset = idx % output_size;
+    int input_offset = output_offset * kernel_size;
+    return output_idx * input_size + input_offset;
+}
+
+template <typename T>
+__global__ void conv3d_kernel(const T* input, const T* weight, T* output, int batch_size, int in_channels,
+                                  int out_channels, int input_depth, int input_height, int input_width,
+                                  int kernel_depth, int kernel_height, int kernel_width, int padding) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int out_channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_depth_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && out_channel_idx < out_channels &&
+        out_depth_idx < input_depth - 2 * padding) {
+        int out_height_idx = threadIdx.y;
+        int out_width_idx = threadIdx.x;
+
+        T sum = 0;
+        for (int in_channel_idx = 0; in_channel_idx < in_channels; ++in_channel_idx) {
+            for (int kernel_d = 0; kernel_d < kernel_depth; ++kernel_d) {
+                for (int kernel_h = 0; kernel_h < kernel_height; ++kernel_h) {
+                    for (int kernel_w = 0; kernel_w < kernel_width; ++kernel_w) {
+                        int input_d = out_depth_idx + kernel_d - padding;
+                        int input_h = out_height_idx + kernel_h - padding;
+                        int input_w = out_width_idx + kernel_w - padding;
+
+                        if (input_d >= 0 && input_d < input_depth &&
+                            input_h >= 0 && input_h < input_height &&
+                            input_w >= 0 && input_w < input_width) {
+                            int input_idx = (batch_idx * in_channels + in_channel_idx) * input_depth * input_height * input_width +
+                                          input_d * input_height * input_width + input_h * input_width + input_w;
+                            int weight_idx = (out_channel_idx * in_channels + in_channel_idx) * kernel_depth * kernel_height * kernel_width +
+                                          kernel_d * kernel_height * kernel_width + kernel_h * kernel_width + kernel_w;
+                            sum += input[input_idx] * weight[weight_idx];
+                        }
+                    }
+                }
+            }
+        }
+        output[((batch_idx * out_channels + out_channel_idx) * input_depth + out_depth_idx) * input_height * input_width +
+               out_height_idx * input_width + out_width_idx] = sum;
+    }
+}
+
+template <typename T>
+__global__ void adaptive_max_pool3d_kernel(const T* input, T* output, int batch_size, int in_channels,
+                                             int input_depth, int input_height, int input_width) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < in_channels && output_idx < input_depth) {
+        int input_size = input_depth * input_height * input_width;
+        int kernel_size = input_depth;
+        int output_size = 1;
+        int idx = adaptive_max_pool3d_get_idx(input_size, kernel_size, output_size, output_idx);
+
+        T max_val = input[idx];
+        for (int i = 1; i < kernel_size; ++i) {
+            idx = adaptive_max_pool3d_get_idx(input_size, kernel_size, output_size, output_idx + i);
+            max_val = max(max_val, input[idx]);
+        }
+
+        output[(batch_idx * in_channels + channel_idx) * input_depth + output_idx] = max_val;
+    }
+}
+
+template <typename T>
+__global__ void linear_kernel(const T* input, const T* weight, T* output, int batch_size, int in_features, int out_features) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_feature_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx < batch_size && out_feature_idx < out_features) {
+        T sum = 0;
+        for (int in_feature_idx = 0; in_feature_idx < in_features; ++in_feature_idx) {
+            sum += input[batch_idx * in_features + in_feature_idx] * weight[out_feature_idx * in_features + in_feature_idx];
+        }
+        output[batch_idx * out_features + out_feature_idx] = sum;
+    }
+}
+
+// CUDA kernel for Transformer Encoder layer
+template <typename T>
+__global__ void transformer_encoder_layer_kernel(const T* input, const T* query, const T* key, const T* value, 
+                                                  const T* attention_mask, T* output, int batch_size, int seq_len,
+                                                  int d_model, int num_heads, float dropout) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int head_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int seq_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && head_idx < num_heads && seq_idx < seq_len) {
+        int head_dim = d_model / num_heads;
+        int query_idx = (batch_idx * num_heads + head_idx) * seq_len * head_dim + seq_idx * head_dim;
+        int key_idx = (batch_idx * num_heads + head_idx) * seq_len * head_dim + seq_idx * head_dim;
+        int value_idx = (batch_idx * num_heads + head_idx) * seq_len * head_dim + seq_idx * head_dim;
+
+        float sum = 0;
+        for (int i = 0; i < seq_len; ++i) {
+            float attn = __expf(-(query[query_idx + i * head_dim] - key[key_idx + i * head_dim]) * (query[query_idx + i * head_dim] - key[key_idx + i * head_dim]));
+            if (attention_mask[batch_idx * seq_len * seq_len + seq_idx * seq_len + i] == 0) {
+                attn = 0;
+            }
+            sum += attn * value[value_idx + i * head_dim];
+        }
+
+        output[batch_idx * num_heads * seq_len * head_dim + head_idx * seq_len * head_dim + seq_idx * head_dim] = sum;
+        if (dropout > 0.0f && rand() / RAND_MAX < dropout) {
+            output[batch_idx * num_heads * seq_len * head_dim + head_idx * seq_len * head_dim + seq_idx * head_dim] = 0;
+        }
+    }
+}
+
+template <typename T>
+__global__ void transformer_encoder_kernel(const T* input, T* output, int batch_size, int seq_len, int d_model, 
+                                             int num_heads, float dropout) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int seq_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int head_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && seq_idx < seq_len && head_idx < num_heads) {
+        int head_dim = d_model / num_heads;
+        int input_idx = batch_idx * seq_len * d_model + seq_idx * d_model + head_idx * head_dim;
+        output[input_idx] = input[input_idx];
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const int8_t* input_tensor = va_arg(args, const int8_t*);
+    int batch_size = va_arg(args, int);
+    int in_channels = va_arg(args, int);
+    int input_depth = va_arg(args, int);
+    int input_height = va_arg(args, int);
+    int input_width = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Define model parameters
+    int hidden_channels = 64;
+    int num_heads = 4;
+    int num_layers = 2;
+    float dropout = 0.1f;
+
+    // Allocate device memory
+    int8_t *d_input, *d_conv1_weight, *d_conv1_output, *d_conv2_weight, *d_conv2_output;
+    float *d_encoder_output, *d_fc_weight, *d_fc_bias, *d_fc_output, *d_adaptive_output;
+    cudaMalloc(&d_input, batch_size * in_channels * input_depth * input_height * input_width * sizeof(int8_t));
+    cudaMalloc(&d_conv1_weight, hidden_channels * in_channels * 3 * 3 * 3 * sizeof(int8_t));
+    cudaMalloc(&d_conv1_output, batch_size * hidden_channels * input_depth * input_height * input_width * sizeof(int8_t));
+    cudaMalloc(&d_conv2_weight, hidden_channels * hidden_channels * 3 * 3 * 3 * sizeof(int8_t));
+    cudaMalloc(&d_conv2_output, batch_size * hidden_channels * input_depth * input_height * input_width * sizeof(int8_t));
+    cudaMalloc(&d_encoder_output, batch_size * hidden_channels * input_depth * input_height * input_width * sizeof(float));
+    cudaMalloc(&d_fc_weight, 10 * hidden_channels * sizeof(float));
+    cudaMalloc(&d_fc_bias, 10 * sizeof(float));
+    cudaMalloc(&d_fc_output, batch_size * 10 * sizeof(float));
+    cudaMalloc(&d_adaptive_output, batch_size * hidden_channels * sizeof(float));
+
+    // Initialize weights and bias
+    int8_t conv1_weight[hidden_channels * in_channels * 3 * 3 * 3];
+    int8_t conv2_weight[hidden_channels * hidden_channels * 3 * 3 * 3];
+    float fc_weight[10 * hidden_channels];
+    float fc_bias[10];
+    // ... Initialize weights with random values ... 
+
+    // Copy weights to device
+    cudaMemcpy(d_conv1_weight, conv1_weight, hidden_channels * in_channels * 3 * 3 * 3 * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_conv2_weight, conv2_weight, hidden_channels * hidden_channels * 3 * 3 * 3 * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fc_weight, fc_weight, 10 * hidden_channels * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_fc_bias, fc_bias, 10 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_channels * input_depth * input_height * input_width * sizeof(int8_t), cudaMemcpyHostToDevice);
+
+    // Launch conv3d kernel for conv1
+    dim3 conv3d_threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 conv3d_numBlocks((input_depth + conv3d_threadsPerBlock.x - 1) / conv3d_threadsPerBlock.x,
+                          (hidden_channels + conv3d_threadsPerBlock.y - 1) / conv3d_threadsPerBlock.y,
+                          (batch_size + conv3d_threadsPerBlock.z - 1) / conv3d_threadsPerBlock.z);
+    conv3d_kernel<int8_t><<<conv3d_numBlocks, conv3d_threadsPerBlock>>>(
+        d_input, d_conv1_weight, d_conv1_output, batch_size, in_channels, hidden_channels,
+        input_depth, input_height, input_width, 3, 3, 3, 1
+    );
+    cudaDeviceSynchronize();
+
+    // Launch conv3d kernel for conv2
+    conv3d_kernel<int8_t><<<conv3d_numBlocks, conv3d_threadsPerBlock>>>(
+        d_conv1_output, d_conv2_weight, d_conv2_output, batch_size, hidden_channels, hidden_channels,
+        input_depth, input_height, input_width, 3, 3, 3, 1
+    );
+    cudaDeviceSynchronize();
+
+    // Launch adaptive_max_pool3d kernel
+    dim3 adaptive_threadsPerBlock(BLOCK_SIZE);
+    dim3 adaptive_numBlocks((input_depth + adaptive_threadsPerBlock.x - 1) / adaptive_threadsPerBlock.x,
+                            (hidden_channels + adaptive_threadsPerBlock.y - 1) / adaptive_threadsPerBlock.y,
+                            (batch_size + adaptive_threadsPerBlock.z - 1) / adaptive_threadsPerBlock.z);
+    adaptive_max_pool3d_kernel<int8_t><<<adaptive_numBlocks, adaptive_threadsPerBlock>>>(
+        d_conv2_output, d_adaptive_output, batch_size, hidden_channels, input_depth, input_height, input_width
+    );
+    cudaDeviceSynchronize();
+
+    // Launch transformer_encoder_kernel
+    int seq_len = input_depth;
+    int d_model = hidden_channels;
+    dim3 transformer_threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 transformer_numBlocks((num_heads + transformer_threadsPerBlock.x - 1) / transformer_threadsPerBlock.x,
+                                (seq_len + transformer_threadsPerBlock.y - 1) / transformer_threadsPerBlock.y,
+                                (batch_size + transformer_threadsPerBlock.z - 1) / transformer_threadsPerBlock.z);
+    transformer_encoder_kernel<float><<<transformer_numBlocks, transformer_threadsPerBlock>>>(
+        d_adaptive_output, d_encoder_output, batch_size, seq_len, d_model, num_heads, dropout
+    );
+    cudaDeviceSynchronize();
+
+    // Launch linear_kernel for fully connected layer
+    dim3 linear_threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 linear_numBlocks((10 + linear_threadsPerBlock.x - 1) / linear_threadsPerBlock.x,
+                          (batch_size + linear_threadsPerBlock.y - 1) / linear_threadsPerBlock.y);
+    linear_kernel<float><<<linear_numBlocks, linear_threadsPerBlock>>>(
+        d_encoder_output, d_fc_weight, d_fc_output, batch_size, hidden_channels, 10
+    );
+    cudaDeviceSynchronize();
+
+    // Add bias
+    for (int i = 0; i < batch_size * 10; ++i) {
+        d_fc_output[i] += d_fc_bias[i % 10];
+    }
+
+    // Copy result back to host
+    cudaMemcpy(output, d_fc_output, batch_size * 10 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_conv1_weight);
+    cudaFree(d_conv1_output);
+    cudaFree(d_conv2_weight);
+    cudaFree(d_conv2_output);
+    cudaFree(d_encoder_output);
+    cudaFree(d_fc_weight);
+    cudaFree(d_fc_bias);
+    cudaFree(d_fc_output);
+    cudaFree(d_adaptive_output);
+}
+
+}  // extern "C"

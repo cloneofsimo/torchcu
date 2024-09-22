@@ -1,0 +1,241 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math_functions.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for CoordConv layer
+__global__ void coordconv_kernel(const float* input, float* output, int batch_size, int channels, int height, int width) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < batch_size * channels * height * width) {
+        int b = index / (channels * height * width);
+        int c = (index % (channels * height * width)) / (height * width);
+        int y = (index % (height * width)) / width;
+        int x = index % width;
+        
+        float x_coord = (float) x / (width - 1);
+        float y_coord = (float) y / (height - 1);
+
+        output[index] = input[index];
+        output[index + batch_size * channels * height * width] = x_coord;
+        output[index + batch_size * channels * height * width * 2] = y_coord;
+    }
+}
+
+// CUDA kernel for cosine similarity calculation
+__global__ void cosine_similarity_kernel(const float* input1, const float* input2, float* output,
+                                         int batch_size, int feature_size) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < batch_size) {
+        float dot_product = 0.0f;
+        float norm1 = 0.0f;
+        float norm2 = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            dot_product += input1[index * feature_size + i] * input2[index * feature_size + i];
+            norm1 += input1[index * feature_size + i] * input1[index * feature_size + i];
+            norm2 += input2[index * feature_size + i] * input2[index * feature_size + i];
+        }
+        output[index] = dot_product / (sqrtf(norm1) * sqrtf(norm2));
+    }
+}
+
+// CUDA kernel for cosine embedding loss calculation
+__global__ void cosine_embedding_loss_kernel(const float* similarity, const float* target, float* loss, 
+                                            int batch_size, float temperature) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < batch_size) {
+        float scaled_similarity = similarity[index] / temperature;
+        float target_value = target[index];
+        loss[index] = 1.0f - scaled_similarity * target_value;
+    }
+}
+
+extern "C" {
+
+// Function to perform CoordConv operation on device
+void coordconv_forward(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int channels = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_output, batch_size * (channels + 2) * height * width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch CoordConv kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size * channels * height * width + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    coordconv_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, batch_size, channels, height, width);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * (channels + 2) * height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+// Function to calculate cosine similarity on device
+void cosine_similarity_forward(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input1 = va_arg(args, const float*);
+    const float* input2 = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int feature_size = va_arg(args, int);
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_input1, *d_input2, *d_output;
+    cudaMalloc(&d_input1, batch_size * feature_size * sizeof(float));
+    cudaMalloc(&d_input2, batch_size * feature_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input1, input1, batch_size * feature_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input2, input2, batch_size * feature_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch cosine similarity kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    cosine_similarity_kernel<<<numBlocks, threadsPerBlock>>>(d_input1, d_input2, d_output, batch_size, feature_size);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input1);
+    cudaFree(d_input2);
+    cudaFree(d_output);
+}
+
+// Function to calculate cosine embedding loss on device
+void cosine_embedding_loss_forward(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* similarity = va_arg(args, const float*);
+    const float* target = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    float temperature = va_arg(args, float);
+    float* loss = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_similarity, *d_target, *d_loss;
+    cudaMalloc(&d_similarity, batch_size * sizeof(float));
+    cudaMalloc(&d_target, batch_size * sizeof(float));
+    cudaMalloc(&d_loss, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_similarity, similarity, batch_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target, batch_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch cosine embedding loss kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    cosine_embedding_loss_kernel<<<numBlocks, threadsPerBlock>>>(d_similarity, d_target, d_loss, batch_size, temperature);
+
+    // Copy result back to host
+    cudaMemcpy(loss, d_loss, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_similarity);
+    cudaFree(d_target);
+    cudaFree(d_loss);
+}
+
+// Function to calculate the final loss and logits
+void cosine_embedding_loss_with_coordconv(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract inputs
+    const float* input1 = va_arg(args, const float*);
+    int input1_dim0 = va_arg(args, int);
+    int input1_dim1 = va_arg(args, int);
+    int input1_dim2 = va_arg(args, int);
+    int input1_dim3 = va_arg(args, int);
+    const float* input2 = va_arg(args, const float*);
+    int input2_dim0 = va_arg(args, int);
+    int input2_dim1 = va_arg(args, int);
+    int input2_dim2 = va_arg(args, int);
+    int input2_dim3 = va_arg(args, int);
+    const float* target = va_arg(args, const float*);
+    int target_dim0 = va_arg(args, int);
+    float temperature = va_arg(args, float);
+
+    // Allocate memory for intermediate outputs
+    float* coordconv_output1 = new float[input1_dim0 * (input1_dim1 + 2) * input1_dim2 * input1_dim3];
+    float* coordconv_output2 = new float[input2_dim0 * (input2_dim1 + 2) * input2_dim2 * input2_dim3];
+    float* similarity_output = new float[input1_dim0];
+    float* loss_output = new float[input1_dim0];
+
+    // Perform CoordConv forward pass
+    coordconv_forward(5, input1, input1_dim0, input1_dim1, input1_dim2, input1_dim3, coordconv_output1);
+    coordconv_forward(5, input2, input2_dim0, input2_dim1, input2_dim2, input2_dim3, coordconv_output2);
+
+    // Flatten CoordConv outputs
+    float* input1_flat = new float[input1_dim0 * (input1_dim1 + 2) * input1_dim2 * input1_dim3];
+    float* input2_flat = new float[input2_dim0 * (input2_dim1 + 2) * input2_dim2 * input2_dim3];
+    for (int i = 0; i < input1_dim0 * (input1_dim1 + 2) * input1_dim2 * input1_dim3; ++i) {
+        input1_flat[i] = coordconv_output1[i];
+    }
+    for (int i = 0; i < input2_dim0 * (input2_dim1 + 2) * input2_dim2 * input2_dim3; ++i) {
+        input2_flat[i] = coordconv_output2[i];
+    }
+
+    // Calculate cosine similarity
+    cosine_similarity_forward(5, input1_flat, input2_flat, input1_dim0, (input1_dim1 + 2) * input1_dim2 * input1_dim3, similarity_output);
+
+    // Calculate cosine embedding loss
+    cosine_embedding_loss_forward(5, similarity_output, target, input1_dim0, temperature, loss_output);
+
+    // Return loss and logits
+    va_arg(args, float*);  // Get output loss pointer
+    va_arg(args, float*);  // Get output similarity pointer
+    
+    memcpy(va_arg(args, float*), loss_output, input1_dim0 * sizeof(float));
+    memcpy(va_arg(args, float*), similarity_output, input1_dim0 * sizeof(float));
+
+    va_end(args);
+
+    delete[] coordconv_output1;
+    delete[] coordconv_output2;
+    delete[] similarity_output;
+    delete[] loss_output;
+    delete[] input1_flat;
+    delete[] input2_flat;
+}
+
+}  // extern "C"

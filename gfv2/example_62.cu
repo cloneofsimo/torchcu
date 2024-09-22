@@ -1,0 +1,234 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+#define PI 3.14159265358979323846
+
+// Helper function for complex multiplication
+__device__ __forceinline__ float2 complex_mul(float2 a, float2 b) {
+  return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// Helper function for complex conjugate
+__device__ __forceinline__ float2 complex_conj(float2 a) {
+  return make_float2(a.x, -a.y);
+}
+
+// Helper function for complex magnitude squared
+__device__ __forceinline__ float complex_abs2(float2 a) {
+  return a.x * a.x + a.y * a.y;
+}
+
+// Forward DFT kernel
+__global__ void dft_kernel(const half* input, float2* output, int n, int m, int dft_size) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (x < n && y < m) {
+    int idx = y * n + x;
+    float2 sum = make_float2(0.0f, 0.0f);
+    for (int u = 0; u < dft_size; u++) {
+      for (int v = 0; v < dft_size; v++) {
+        float angle = -2.0f * PI * (float(u) * x / dft_size + float(v) * y / dft_size);
+        float2 exp_factor = make_float2(cosf(angle), sinf(angle));
+        sum = complex_mul(sum, make_float2(__int2float_rn(input[idx]), 0.0f)); // input is real
+        sum = complex_mul(sum, exp_factor);
+      }
+    }
+    output[idx] = sum;
+  }
+}
+
+// Inverse DFT kernel
+__global__ void idft_kernel(const float2* input, half* output, int n, int m, int dft_size) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (x < n && y < m) {
+    int idx = y * n + x;
+    float2 sum = make_float2(0.0f, 0.0f);
+    for (int u = 0; u < dft_size; u++) {
+      for (int v = 0; v < dft_size; v++) {
+        float angle = 2.0f * PI * (float(u) * x / dft_size + float(v) * y / dft_size);
+        float2 exp_factor = make_float2(cosf(angle), sinf(angle));
+        sum = complex_mul(sum, input[idx]);
+        sum = complex_mul(sum, exp_factor);
+      }
+    }
+    output[idx] = __float2half_rn(sum.x / (float(dft_size) * float(dft_size))); // Scale for inverse
+  }
+}
+
+// Depthwise convolution kernel
+__global__ void depthwise_conv_kernel(const half* input, const half* weight, half* output, int batch, int in_channels, int h_in, int w_in, int kernel_size, int stride, int padding, int dilation, int groups) {
+  int b = blockIdx.z * blockDim.z + threadIdx.z;
+  int c = blockIdx.y * blockDim.y + threadIdx.y;
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (b < batch && c < in_channels && x < h_in && y < w_in) {
+    int out_c = c % groups;
+    int in_c = out_c;
+    int out_x = x * stride - padding + c / groups * dilation;
+    int out_y = y * stride - padding + c / groups * dilation;
+
+    if (out_x >= 0 && out_x < h_in && out_y >= 0 && out_y < w_in) {
+      half sum = 0.0f;
+      for (int i = 0; i < kernel_size; i++) {
+        for (int j = 0; j < kernel_size; j++) {
+          int in_x = out_x + i * dilation;
+          int in_y = out_y + j * dilation;
+
+          if (in_x >= 0 && in_x < h_in && in_y >= 0 && in_y < w_in) {
+            int in_idx = b * in_channels * h_in * w_in + in_c * h_in * w_in + in_x * w_in + in_y;
+            int weight_idx = out_c * kernel_size * kernel_size + i * kernel_size + j;
+            sum += __hmul(input[in_idx], weight[weight_idx]);
+          }
+        }
+      }
+      output[b * in_channels * h_in * w_in + out_c * h_in * w_in + x * w_in + y] = sum;
+    }
+  }
+}
+
+// Pointwise convolution kernel
+__global__ void pointwise_conv_kernel(const half* input, const half* weight, half* output, int batch, int in_channels, int h_in, int w_in, int out_channels) {
+  int b = blockIdx.z * blockDim.z + threadIdx.z;
+  int c = blockIdx.y * blockDim.y + threadIdx.y;
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (b < batch && c < out_channels && x < h_in && y < w_in) {
+    half sum = 0.0f;
+    for (int i = 0; i < in_channels; i++) {
+      int in_idx = b * in_channels * h_in * w_in + i * h_in * w_in + x * w_in + y;
+      int weight_idx = c * in_channels + i;
+      sum += __hmul(input[in_idx], weight[weight_idx]);
+    }
+    output[b * out_channels * h_in * w_in + c * h_in * w_in + x * w_in + y] = sum;
+  }
+}
+
+// Kronecker product kernel (real input, complex output)
+__global__ void kronecker_kernel(const half* input, float2* output, int batch, int in_channels, int h_in, int w_in, int kronecker_factor) {
+  int b = blockIdx.z * blockDim.z + threadIdx.z;
+  int c = blockIdx.y * blockDim.y + threadIdx.y;
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (b < batch && c < in_channels && x < h_in && y < w_in) {
+    int idx = b * in_channels * h_in * w_in + c * h_in * w_in + x * w_in + y;
+    output[idx] = make_float2(__int2float_rn(input[idx]), 0.0f); // Real input
+  }
+}
+
+extern "C" {
+
+void depthwise_separable_conv_fp16_dft_kronecker_istft(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int batch = va_arg(args, int);
+    int in_channels = va_arg(args, int);
+    int h_in = va_arg(args, int);
+    int w_in = va_arg(args, int);
+
+    // Extract depthwise weight
+    const float* weight_depthwise = va_arg(args, const float*);
+    int depthwise_channels = va_arg(args, int);
+    int kernel_size = va_arg(args, int);
+    int stride = va_arg(args, int);
+    int padding = va_arg(args, int);
+    int dilation = va_arg(args, int);
+    int groups = va_arg(args, int);
+
+    // Extract pointwise weight
+    const float* weight_pointwise = va_arg(args, const float*);
+    int out_channels = va_arg(args, int);
+
+    // Extract DFT size
+    int dft_size = va_arg(args, int);
+
+    // Extract Kronecker factor
+    int kronecker_factor = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int h_out = (h_in + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    int w_out = (w_in + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+    // Allocate device memory for fp16 tensors
+    half* d_input;
+    half* d_weight_depthwise;
+    half* d_weight_pointwise;
+    half* d_output_depthwise;
+    half* d_output_pointwise;
+    half* d_output_istft;
+    cudaMalloc(&d_input, batch * in_channels * h_in * w_in * sizeof(half));
+    cudaMalloc(&d_weight_depthwise, depthwise_channels * kernel_size * kernel_size * sizeof(half));
+    cudaMalloc(&d_weight_pointwise, out_channels * in_channels * sizeof(half));
+    cudaMalloc(&d_output_depthwise, batch * in_channels * h_out * w_out * sizeof(half));
+    cudaMalloc(&d_output_pointwise, batch * out_channels * h_out * w_out * sizeof(half));
+    cudaMalloc(&d_output_istft, batch * out_channels * h_out * w_out * sizeof(half));
+
+    // Allocate device memory for DFT/Kronecker
+    float2* d_output_dft;
+    float2* d_output_kronecker;
+    cudaMalloc(&d_output_dft, batch * out_channels * h_out * w_out * sizeof(float2));
+    cudaMalloc(&d_output_kronecker, batch * out_channels * h_out * w_out * kronecker_factor * kronecker_factor * sizeof(float2));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch * in_channels * h_in * w_in * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight_depthwise, weight_depthwise, depthwise_channels * kernel_size * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight_pointwise, weight_pointwise, out_channels * in_channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch depthwise convolution kernel
+    dim3 threadsPerBlock_conv(8, 8, 1);
+    dim3 numBlocks_conv((h_out + threadsPerBlock_conv.x - 1) / threadsPerBlock_conv.x, (in_channels + threadsPerBlock_conv.y - 1) / threadsPerBlock_conv.y, batch);
+    depthwise_conv_kernel<<<numBlocks_conv, threadsPerBlock_conv>>>(d_input, d_weight_depthwise, d_output_depthwise, batch, in_channels, h_in, w_in, kernel_size, stride, padding, dilation, groups);
+    cudaDeviceSynchronize();
+
+    // Launch pointwise convolution kernel
+    pointwise_conv_kernel<<<numBlocks_conv, threadsPerBlock_conv>>>(d_output_depthwise, d_weight_pointwise, d_output_pointwise, batch, in_channels, h_out, w_out, out_channels);
+    cudaDeviceSynchronize();
+
+    // Launch DFT kernel
+    dim3 threadsPerBlock_dft(16, 16, 1);
+    dim3 numBlocks_dft((w_out + threadsPerBlock_dft.x - 1) / threadsPerBlock_dft.x, (h_out + threadsPerBlock_dft.y - 1) / threadsPerBlock_dft.y, batch * out_channels);
+    dft_kernel<<<numBlocks_dft, threadsPerBlock_dft>>>(d_output_pointwise, d_output_dft, w_out, h_out, dft_size);
+    cudaDeviceSynchronize();
+
+    // Launch Kronecker kernel
+    dim3 threadsPerBlock_kron(16, 16, 1);
+    dim3 numBlocks_kron((w_out * kronecker_factor + threadsPerBlock_kron.x - 1) / threadsPerBlock_kron.x, (h_out * kronecker_factor + threadsPerBlock_kron.y - 1) / threadsPerBlock_kron.y, batch * out_channels);
+    kronecker_kernel<<<numBlocks_kron, threadsPerBlock_kron>>>(d_output_pointwise, d_output_kronecker, batch, out_channels, h_out, w_out, kronecker_factor);
+    cudaDeviceSynchronize();
+
+    // Launch inverse DFT kernel
+    dim3 threadsPerBlock_idft(16, 16, 1);
+    dim3 numBlocks_idft((w_out * kronecker_factor + threadsPerBlock_idft.x - 1) / threadsPerBlock_idft.x, (h_out * kronecker_factor + threadsPerBlock_idft.y - 1) / threadsPerBlock_idft.y, batch * out_channels);
+    idft_kernel<<<numBlocks_idft, threadsPerBlock_idft>>>(d_output_kronecker, d_output_istft, w_out * kronecker_factor, h_out * kronecker_factor, dft_size);
+    cudaDeviceSynchronize();
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output_istft, batch * out_channels * h_out * w_out * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight_depthwise);
+    cudaFree(d_weight_pointwise);
+    cudaFree(d_output_depthwise);
+    cudaFree(d_output_pointwise);
+    cudaFree(d_output_istft);
+    cudaFree(d_output_dft);
+    cudaFree(d_output_kronecker);
+}
+
+}  // extern "C"

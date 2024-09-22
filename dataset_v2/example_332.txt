@@ -1,0 +1,126 @@
+## func.py
+
+```python
+import torch
+
+def softmin_logspace_bf16_function(input_tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Applies the Softmin function to an n-dimensional input tensor along a specified dimension.
+    The input tensor is first converted to bfloat16 for faster computation,
+    then a logspace is applied to create a vector of evenly spaced values between 0 and 1.
+    The output is then converted back to float32.
+
+    Args:
+        input_tensor (torch.Tensor): The input tensor.
+        dim (int, optional): The dimension to apply Softmin along. Defaults to -1.
+
+    Returns:
+        torch.Tensor: The Softmin output tensor.
+    """
+    input_bf16 = input_tensor.to(torch.bfloat16)
+    logspace_values = torch.logspace(0, 1, input_bf16.size(dim), dtype=torch.bfloat16, device=input_bf16.device)
+    logspace_values = logspace_values.unsqueeze(dim).expand_as(input_bf16)
+    input_bf16.mul_(logspace_values)
+    output = torch.softmax(input_bf16, dim=dim)
+    return output.to(torch.float32)
+
+function_signature = {
+    "name": "softmin_logspace_bf16_function",
+    "inputs": [
+        ((1, 10), torch.float32),
+    ],
+    "outputs": [
+        ((1, 10), torch.float32),
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for Softmin function
+__global__ void softmin_kernel_bf16(const float* input_tensor, float* output, int batch_size, int dim, int size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < size) {
+        float sum = 0.0f;
+        __nv_bfloat16 val = float_to_bfloat16(input_tensor[row * size + col]);
+        for (int i = 0; i < size; ++i) {
+            __nv_bfloat16 temp = float_to_bfloat16(input_tensor[row * size + i]);
+            temp = __hmul(temp, expf(logspace_values[col])); // Apply logspace values
+            sum += bfloat16_to_float(__hextf(temp));
+        }
+        output[row * size + col] = bfloat16_to_float(__hmul(val, expf(-sum)));  // Softmin calculation
+    }
+}
+
+// Global variable for logspace values
+__constant__ __nv_bfloat16 logspace_values[10]; // Adjust the size based on your input tensor's size(dim)
+
+extern "C" {
+
+void softmin_logspace_bf16_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int dim = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Initialize logspace values (make sure this matches your input tensor's size(dim))
+    __nv_bfloat16 temp_logspace_values[10];
+    for (int i = 0; i < dim; ++i) {
+        temp_logspace_values[i] = float_to_bfloat16(expf(logf(i + 1) / 10));
+    }
+    cudaMemcpyToSymbol(logspace_values, temp_logspace_values, dim * sizeof(__nv_bfloat16), 0, cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    softmin_kernel_bf16<<<numBlocks, threadsPerBlock>>>(d_input, d_output, batch_size, dim, dim);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

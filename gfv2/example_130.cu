@@ -1,0 +1,54 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+__global__ void fused_dropout_relu_kernel(const float* input, float* output, float p, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float rand_val = __float2half_rn(float(rand()) / RAND_MAX); // Faster than rand() % 10000 / 10000.0f
+
+        if (rand_val < p) {
+            output[i] = 0.0f;
+        } else {
+            output[i] = fmaxf(input[i] * (1.0f / (1.0f - p)), 0.0f); // Fused dropout and ReLU
+        }
+    }
+}
+
+extern "C" {
+    void fused_dropout_relu_function(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        const float* input = va_arg(args, const float*);
+        int input_dim0 = va_arg(args, int);
+        int input_dim1 = va_arg(args, int);
+        float p = va_arg(args, float);
+
+        float* output = va_arg(args, float*);
+
+        va_end(args);
+
+        int n = input_dim0 * input_dim1;
+
+        float *d_input, *d_output;
+        cudaMalloc(&d_input, n * sizeof(float));
+        cudaMalloc(&d_output, n * sizeof(float));
+
+        cudaMemcpy(d_input, input, n * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Launch kernel
+        int threadsPerBlock = 256;
+        int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+
+        fused_dropout_relu_kernel<<<numBlocks, threadsPerBlock>>>(
+            d_input, d_output, p, n
+        );
+
+        cudaMemcpy(output, d_output, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+        cudaFree(d_input);
+        cudaFree(d_output);
+    }
+}

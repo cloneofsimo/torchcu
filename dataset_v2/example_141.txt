@@ -1,0 +1,95 @@
+```python
+import torch
+import torch.fft
+
+def inverse_fourier_transform_bf16(input_tensor: torch.Tensor, signal_length: int) -> torch.Tensor:
+    """
+    Perform an inverse Fourier transform using bfloat16 precision.
+    """
+    input_bf16 = input_tensor.to(torch.bfloat16)
+    output = torch.fft.irfft(input_bf16, n=signal_length)
+    return output.to(torch.float32)
+
+function_signature = {
+    "name": "inverse_fourier_transform_bf16",
+    "inputs": [
+        ((128,), torch.complex64),
+        (128,)
+    ],
+    "outputs": [
+        ((128,), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <complex>
+#include <stdarg.h>
+
+#define THREADS_PER_BLOCK 256
+
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+template <typename T>
+__global__ void inverse_fourier_transform_kernel_bf16(const std::complex<T>* input, T* output, int signal_length) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < signal_length) {
+        std::complex<T> complex_value = input[idx];
+        __nv_bfloat16 real_bf16 = float_to_bfloat16(complex_value.real());
+        __nv_bfloat16 imag_bf16 = float_to_bfloat16(complex_value.imag());
+        output[idx] = bfloat16_to_float(__hmul(real_bf16, 1.0f) + bfloat16_to_float(__hmul(imag_bf16, 1.0f)));
+    }
+}
+
+extern "C" {
+
+void inverse_fourier_transform_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const std::complex<float>* input = va_arg(args, const std::complex<float>*);
+    int input_size = va_arg(args, int);
+
+    // Extract signal length
+    int signal_length = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    std::complex<float>* d_input;
+    float* d_output;
+    cudaMalloc(&d_input, input_size * sizeof(std::complex<float>));
+    cudaMalloc(&d_output, signal_length * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, input_size * sizeof(std::complex<float>), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int num_blocks = (signal_length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    inverse_fourier_transform_kernel_bf16<<<num_blocks, THREADS_PER_BLOCK>>>(
+        d_input, d_output, signal_length
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, signal_length * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```

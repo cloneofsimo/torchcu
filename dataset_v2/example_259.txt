@@ -1,0 +1,152 @@
+```python
+import torch
+
+def gated_linear_units_manhattan_distance(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Applies a gated linear unit (GLU) to the input, followed by pairwise manhattan distance calculation with a weight tensor. 
+    """
+    input_tensor = input_tensor.to(torch.float32)
+    weight = weight.to(torch.float32)
+    bias = bias.to(torch.float32)
+    
+    # GLU activation
+    linear_output = torch.nn.functional.linear(input_tensor, weight, bias)
+    gate = torch.sigmoid(linear_output[:, ::2])
+    output = linear_output[:, 1::2] * gate
+    
+    # Pairwise Manhattan distance calculation
+    distance = torch.cdist(output, weight, p=1)  
+    
+    return distance.to(torch.int8)
+
+function_signature = {
+    "name": "gated_linear_units_manhattan_distance",
+    "inputs": [
+        ((2, 4), torch.float32),
+        ((4, 4), torch.float32),
+        ((4,), torch.float32)
+    ],
+    "outputs": [
+        ((2, 4), torch.int8)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for GLU activation
+__global__ void glu_kernel(const float* input, const float* weight, const float* bias, half* output, 
+                           int batch_size, int input_dim, int output_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < output_dim) {
+        float sum = bias[col];
+        for (int i = 0; i < input_dim; ++i) {
+            sum += input[row * input_dim + i] * weight[col * input_dim + i];
+        }
+        output[row * output_dim + col] = float_to_half(sum);
+    }
+}
+
+// CUDA kernel for pairwise Manhattan distance calculation
+__global__ void manhattan_distance_kernel(const half* output, const float* weight, char* distance,
+                                         int batch_size, int output_dim, int weight_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < weight_dim) {
+        float sum = 0.0f;
+        for (int i = 0; i < output_dim; ++i) {
+            sum += fabsf(half_to_float(output[row * output_dim + i]) - weight[col * output_dim + i]);
+        }
+        distance[row * weight_dim + col] = (char)sum;
+    }
+}
+
+extern "C" {
+
+void gated_linear_units_manhattan_distance(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    char* distance = va_arg(args, char*);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int input_dim = input_dim1;
+    int output_dim = weight_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias;
+    half *d_output;
+    char *d_distance;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_weight, output_dim * input_dim * sizeof(float));
+    cudaMalloc(&d_bias, bias_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_dim * sizeof(half));
+    cudaMalloc(&d_distance, batch_size * weight_dim * sizeof(char));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_dim * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, bias_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch GLU kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((output_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    glu_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output, batch_size, input_dim, output_dim
+    );
+
+    // Launch Manhattan distance kernel
+    numBlocks = ((weight_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                 (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    manhattan_distance_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, d_weight, d_distance, batch_size, output_dim, weight_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(distance, d_distance, batch_size * weight_dim * sizeof(char), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+    cudaFree(d_distance);
+}
+
+}  // extern "C"
+```

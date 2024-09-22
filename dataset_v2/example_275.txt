@@ -1,0 +1,141 @@
+```python
+import torch
+import torch.nn as nn
+
+class Attention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(Attention, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+        self.scale = self.head_dim ** -0.5
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.out_proj(x)
+        return x
+
+def attention_square(x: torch.Tensor) -> torch.Tensor:
+    """
+    Performs attention and squares the result.
+    """
+    x = x.to(torch.float32)
+    x = Attention(embed_dim=x.shape[-1], num_heads=4)(x)
+    x = x * x  # element-wise squaring
+    return x.to(torch.int8)
+
+function_signature = {
+    "name": "attention_square",
+    "inputs": [
+        ((1, 10, 128), torch.float32)
+    ],
+    "outputs": [
+        ((1, 10, 128), torch.int8),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for attention
+__global__ void attention_kernel(const float* input, float* output, int batch_size, int seq_len, int embed_dim, int num_heads) {
+    int head_dim = embed_dim / num_heads;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < seq_len && col < seq_len) {
+        float sum = 0.0f;
+        for (int i = 0; i < seq_len; ++i) {
+            float q = input[row * embed_dim + (col * num_heads + i)];
+            float k = input[col * embed_dim + (i * num_heads + row)];
+
+            half q_h = float_to_half(q);
+            half k_h = float_to_half(k);
+
+            half attn = __hmul(q_h, k_h) / sqrtf(head_dim); // Half-precision dot product and scaling
+
+            sum += half_to_float(attn);
+        }
+        output[row * embed_dim + col] = sum;
+    }
+}
+
+// CUDA kernel for squaring the result
+__global__ void square_kernel(const float* input, int8_t* output, int batch_size, int seq_len, int embed_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < seq_len && col < embed_dim) {
+        float val = input[row * embed_dim + col];
+        output[row * embed_dim + col] = static_cast<int8_t>(val * val);
+    }
+}
+
+extern "C" {
+
+void attention_square(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int seq_len = va_arg(args, int);
+    int embed_dim = va_arg(args, int);
+
+    int8_t* output = va_arg(args, int8_t*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * seq_len * embed_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * seq_len * embed_dim * sizeof(float));
+
+    // Copy input to device
+    cudaMemcpy(d_input, input, batch_size * seq_len * embed_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch attention kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((seq_len + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (seq_len + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    attention_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, batch_size, seq_len, embed_dim, 4);
+
+    // Launch squaring kernel
+    numBlocks = ((seq_len + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                 (embed_dim + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    square_kernel<<<numBlocks, threadsPerBlock>>>(d_output, output, batch_size, seq_len, embed_dim);
+
+    // Copy output to host
+    cudaMemcpy(output, d_output, batch_size * seq_len * embed_dim * sizeof(int8_t), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```

@@ -1,0 +1,116 @@
+```python
+import torch
+
+def kronecker_celu_function(input_tensor: torch.Tensor, weight: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    """
+    Computes the Kronecker product of the input tensor with a weight tensor, 
+    applies the CELU activation function, and then returns the result.
+    """
+    kronecker_product = torch.kron(input_tensor, weight)
+    celu_output = torch.nn.functional.celu(kronecker_product, alpha=alpha)
+    return celu_output
+
+function_signature = {
+    "name": "kronecker_celu_function",
+    "inputs": [
+        ((1,), torch.float32),
+        ((2, 2), torch.float32),
+        (1.0, torch.float32)
+    ],
+    "outputs": [
+        ((2,), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <cuda_fp16.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// CUDA kernel for Kronecker product
+__global__ void kronecker_product_kernel(const float* input_tensor, const float* weight, float* output, 
+                                         int input_size, int weight_rows, int weight_cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i < input_size * weight_rows && j < weight_cols) {
+        int input_index = i / weight_rows;
+        int weight_row = i % weight_rows;
+        int weight_col = j;
+
+        output[i * weight_cols + j] = input_tensor[input_index] * weight[weight_row * weight_cols + weight_col];
+    }
+}
+
+// CUDA kernel for CELU activation
+__global__ void celu_kernel(float* data, int size, float alpha) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < size) {
+        if (data[i] > 0.0f) {
+            data[i] = data[i];
+        } else {
+            data[i] = alpha * (exp(data[i] / alpha) - 1.0f);
+        }
+    }
+}
+
+extern "C" {
+
+void kronecker_celu_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_size = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_rows = va_arg(args, int);
+    int weight_cols = va_arg(args, int);
+
+    // Extract alpha
+    float alpha = va_arg(args, double);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, input_size * sizeof(float));
+    cudaMalloc(&d_weight, weight_rows * weight_cols * sizeof(float));
+    cudaMalloc(&d_output, input_size * weight_rows * weight_cols * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, weight_rows * weight_cols * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch Kronecker product kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((input_size * weight_rows + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (weight_cols + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    kronecker_product_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, input_size, weight_rows, weight_cols
+    );
+
+    // Launch CELU kernel
+    numBlocks = (input_size * weight_rows * weight_cols + threadsPerBlock.x - 1) / threadsPerBlock.x;
+    celu_kernel<<<numBlocks, threadsPerBlock>>>(d_output, input_size * weight_rows * weight_cols, alpha);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, input_size * weight_rows * weight_cols * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

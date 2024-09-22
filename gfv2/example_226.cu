@@ -1,0 +1,97 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+__global__ void softmax_cross_entropy_kernel(const float* input_tensor, const int* target_tensor, float* output, 
+                                        int batch_size, int num_classes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < batch_size) {
+        float max_val = -INFINITY;
+        for (int j = 0; j < num_classes; ++j) {
+            max_val = fmaxf(max_val, input_tensor[idx * num_classes + j]);
+        }
+
+        float sum_exp = 0.0f;
+        for (int j = 0; j < num_classes; ++j) {
+            half exp_val = expf(float_to_half(input_tensor[idx * num_classes + j] - max_val));
+            sum_exp += half_to_float(exp_val);
+        }
+
+        float loss = 0.0f;
+        for (int j = 0; j < num_classes; ++j) {
+            half exp_val = expf(float_to_half(input_tensor[idx * num_classes + j] - max_val));
+            float softmax_val = half_to_float(exp_val) / sum_exp;
+            if (j == target_tensor[idx]) {
+                loss -= logf(softmax_val);
+            }
+        }
+
+        output[idx] = loss;
+    }
+}
+
+extern "C" {
+
+void softmax_cross_entropy_fp16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract target tensor
+    const int* target_tensor = va_arg(args, const int*);
+    int target_tensor_dim0 = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int num_classes = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    int *d_target;
+    cudaMalloc(&d_input, batch_size * num_classes * sizeof(float));
+    cudaMalloc(&d_target, batch_size * sizeof(int));
+    cudaMalloc(&d_output, batch_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * num_classes * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target, target_tensor, batch_size * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(256);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+    softmax_cross_entropy_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_target, d_output, batch_size, num_classes
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_target);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

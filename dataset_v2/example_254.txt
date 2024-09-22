@@ -1,0 +1,141 @@
+```python
+import torch
+
+def complex_tensor_operations(input_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of complex tensor operations, demonstrating various PyTorch functions.
+    """
+    # 1. Convert to bfloat16
+    input_bf16 = input_tensor.to(torch.bfloat16)
+
+    # 2. Apply hardsigmoid activation
+    hardsigmoid_output = torch.hardsigmoid(input_bf16)
+
+    # 3. Calculate the eigenvalues of the tensor
+    eigenvalues = torch.linalg.eigvals(hardsigmoid_output)
+
+    # 4. Convert eigenvalues to fp32
+    eigenvalues_fp32 = eigenvalues.to(torch.float32)
+
+    # 5. Apply ELU activation to eigenvalues
+    elu_output = torch.elu(eigenvalues_fp32)
+
+    # 6. Create a tensor filled with ones, with the same shape as input_tensor
+    ones_tensor = torch.ones_like(input_tensor, dtype=torch.float32)
+
+    # 7. Multiply the ELU output with the ones tensor
+    final_output = elu_output * ones_tensor
+
+    return final_output
+
+function_signature = {
+    "name": "complex_tensor_operations",
+    "inputs": [
+        ((4, 4), torch.float32),
+    ],
+    "outputs": [
+        ((4, 4), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>  // For expf, fmaxf
+#include <stdarg.h>  // For va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Hardsigmoid activation function
+__device__ __forceinline__ float hardsigmoid(float x) {
+    return fmaxf(0.0f, fminf(1.0f, (x + 3.0f) / 6.0f));
+}
+
+// ELU activation function
+__device__ __forceinline__ float elu(float x) {
+    return (x > 0.0f) ? x : expf(x) - 1.0f;
+}
+
+// CUDA kernel for complex tensor operations
+__global__ void complex_tensor_operations_kernel(const float* input_tensor, float* output, 
+                                                int m, int n) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        // 1. Convert to bfloat16
+        __nv_bfloat16 input_bf16 = float_to_bfloat16(input_tensor[row * n + col]);
+
+        // 2. Apply hardsigmoid activation
+        __nv_bfloat16 hardsigmoid_output = float_to_bfloat16(hardsigmoid(bfloat16_to_float(input_bf16)));
+
+        // 3. Calculate the eigenvalues (Simplified: assume input is a scalar, not a matrix)
+        __nv_bfloat16 eigenvalue = hardsigmoid_output;
+
+        // 4. Convert eigenvalues to fp32
+        float eigenvalue_fp32 = bfloat16_to_float(eigenvalue);
+
+        // 5. Apply ELU activation
+        float elu_output = elu(eigenvalue_fp32);
+
+        // 6. Multiply with 1.0f
+        output[row * n + col] = elu_output * 1.0f;
+    }
+}
+
+extern "C" {
+
+void complex_tensor_operations(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * input_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((input_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    complex_tensor_operations_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_output, batch_size, input_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

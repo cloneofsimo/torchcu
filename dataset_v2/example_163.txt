@@ -1,0 +1,320 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def avg_pool3d_standardized_weights(input_tensor: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """
+    Applies 3D average pooling to the input tensor and then multiplies the result by standardized weights.
+    """
+    pooled_output = F.avg_pool3d(input_tensor, kernel_size=3, stride=1, padding=1)
+    weights_mean = weights.mean()
+    weights_std = weights.std()
+    standardized_weights = (weights - weights_mean) / weights_std
+    return pooled_output * standardized_weights
+
+function_signature = {
+    "name": "avg_pool3d_standardized_weights",
+    "inputs": [
+        ((2, 3, 4, 5, 6), torch.float32),  # Input tensor with size (batch, channels, depth, height, width)
+        ((3, 3, 3), torch.float32),  # Weights tensor with size (kernel_depth, kernel_height, kernel_width)
+    ],
+    "outputs": [
+        ((2, 3, 4, 5, 6), torch.float32),  # Output tensor with same size as input
+    ]
+}
+
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function for 3D average pooling
+__global__ void avg_pool3d_kernel(const float* input, float* output, int batch_size, int channels,
+                                 int depth, int height, int width, int kernel_size) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (b < batch_size && c < channels && d < depth) {
+        float sum = 0.0f;
+        int kernel_half = kernel_size / 2;
+
+        for (int k = d - kernel_half; k <= d + kernel_half; k++) {
+            for (int j = c - kernel_half; j <= c + kernel_half; j++) {
+                for (int i = b - kernel_half; i <= b + kernel_half; i++) {
+                    if (i >= 0 && i < batch_size && j >= 0 && j < channels && k >= 0 && k < depth) {
+                        sum += input[(k * height * width + j * width + i) * channels + c];
+                    }
+                }
+            }
+        }
+
+        output[(d * height * width + c * width + b) * channels + c] = sum / (kernel_size * kernel_size * kernel_size);
+    }
+}
+
+// Helper function to standardize weights
+__global__ void standardize_weights_kernel(const float* weights, float* standardized_weights, int kernel_depth,
+                                          int kernel_height, int kernel_width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < kernel_depth * kernel_height * kernel_width) {
+        float sum = 0.0f;
+        for (int i = 0; i < kernel_depth * kernel_height * kernel_width; i++) {
+            sum += weights[i];
+        }
+        float mean = sum / (kernel_depth * kernel_height * kernel_width);
+        
+        float sum_sq = 0.0f;
+        for (int i = 0; i < kernel_depth * kernel_height * kernel_width; i++) {
+            sum_sq += (weights[i] - mean) * (weights[i] - mean);
+        }
+        float std = sqrtf(sum_sq / (kernel_depth * kernel_height * kernel_width));
+        
+        standardized_weights[idx] = (weights[idx] - mean) / std;
+    }
+}
+
+// Helper function to multiply the pooled output by the standardized weights
+__global__ void multiply_kernel(const float* pooled_output, const float* standardized_weights, float* output,
+                                int batch_size, int channels, int depth, int height, int width,
+                                int kernel_depth, int kernel_height, int kernel_width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (b < batch_size && c < channels && d < depth) {
+        for (int k = 0; k < kernel_depth; k++) {
+            for (int j = 0; j < kernel_height; j++) {
+                for (int i = 0; i < kernel_width; i++) {
+                    int weight_idx = k * kernel_height * kernel_width + j * kernel_width + i;
+                    output[(d * height * width + c * width + b) * channels + c] +=
+                        pooled_output[(d * height * width + c * width + b) * channels + c] *
+                        standardized_weights[weight_idx];
+                }
+            }
+        }
+    }
+}
+
+extern "C" {
+
+void avg_pool3d_standardized_weights(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int channels = va_arg(args, int);
+    int depth = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int kernel_depth = va_arg(args, int);
+    int kernel_height = va_arg(args, int);
+    int kernel_width = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_pooled_output, *d_standardized_weights;
+    cudaMalloc(&d_input, batch_size * channels * depth * height * width * sizeof(float));
+    cudaMalloc(&d_weights, kernel_depth * kernel_height * kernel_width * sizeof(float));
+    cudaMalloc(&d_pooled_output, batch_size * channels * depth * height * width * sizeof(float));
+    cudaMalloc(&d_standardized_weights, kernel_depth * kernel_height * kernel_width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * channels * depth * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, kernel_depth * kernel_height * kernel_width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel for 3D average pooling
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (depth + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    avg_pool3d_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_pooled_output, batch_size, channels, depth, height, width, 3  // Kernel size = 3
+    );
+
+    // Launch kernel to standardize weights
+    dim3 threadsPerBlock_weights(256, 1, 1);  // Adjust block size based on your GPU
+    dim3 numBlocks_weights((kernel_depth * kernel_height * kernel_width + threadsPerBlock_weights.x - 1) / threadsPerBlock_weights.x, 1, 1);
+    standardize_weights_kernel<<<numBlocks_weights, threadsPerBlock_weights>>>(
+        d_weights, d_standardized_weights, kernel_depth, kernel_height, kernel_width
+    );
+
+    // Launch kernel to multiply pooled output by standardized weights
+    multiply_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_pooled_output, d_standardized_weights, d_input, batch_size, channels, depth, height, width,
+        kernel_depth, kernel_height, kernel_width
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_input, batch_size * channels * depth * height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_pooled_output);
+    cudaFree(d_standardized_weights);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function for 3D average pooling
+__global__ void avg_pool3d_kernel(const float* input, float* output, int batch_size, int channels,
+                                 int depth, int height, int width, int kernel_size) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (b < batch_size && c < channels && d < depth) {
+        float sum = 0.0f;
+        int kernel_half = kernel_size / 2;
+
+        for (int k = d - kernel_half; k <= d + kernel_half; k++) {
+            for (int j = c - kernel_half; j <= c + kernel_half; j++) {
+                for (int i = b - kernel_half; i <= b + kernel_half; i++) {
+                    if (i >= 0 && i < batch_size && j >= 0 && j < channels && k >= 0 && k < depth) {
+                        sum += input[(k * height * width + j * width + i) * channels + c];
+                    }
+                }
+            }
+        }
+
+        output[(d * height * width + c * width + b) * channels + c] = sum / (kernel_size * kernel_size * kernel_size);
+    }
+}
+
+// Helper function to standardize weights
+__global__ void standardize_weights_kernel(const float* weights, float* standardized_weights, int kernel_depth,
+                                          int kernel_height, int kernel_width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < kernel_depth * kernel_height * kernel_width) {
+        float sum = 0.0f;
+        for (int i = 0; i < kernel_depth * kernel_height * kernel_width; i++) {
+            sum += weights[i];
+        }
+        float mean = sum / (kernel_depth * kernel_height * kernel_width);
+        
+        float sum_sq = 0.0f;
+        for (int i = 0; i < kernel_depth * kernel_height * kernel_width; i++) {
+            sum_sq += (weights[i] - mean) * (weights[i] - mean);
+        }
+        float std = sqrtf(sum_sq / (kernel_depth * kernel_height * kernel_width));
+        
+        standardized_weights[idx] = (weights[idx] - mean) / std;
+    }
+}
+
+// Helper function to multiply the pooled output by the standardized weights
+__global__ void multiply_kernel(const float* pooled_output, const float* standardized_weights, float* output,
+                                int batch_size, int channels, int depth, int height, int width,
+                                int kernel_depth, int kernel_height, int kernel_width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (b < batch_size && c < channels && d < depth) {
+        for (int k = 0; k < kernel_depth; k++) {
+            for (int j = 0; j < kernel_height; j++) {
+                for (int i = 0; i < kernel_width; i++) {
+                    int weight_idx = k * kernel_height * kernel_width + j * kernel_width + i;
+                    output[(d * height * width + c * width + b) * channels + c] +=
+                        pooled_output[(d * height * width + c * width + b) * channels + c] *
+                        standardized_weights[weight_idx];
+                }
+            }
+        }
+    }
+}
+
+extern "C" {
+
+void avg_pool3d_standardized_weights(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int channels = va_arg(args, int);
+    int depth = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int kernel_depth = va_arg(args, int);
+    int kernel_height = va_arg(args, int);
+    int kernel_width = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weights, *d_pooled_output, *d_standardized_weights;
+    cudaMalloc(&d_input, batch_size * channels * depth * height * width * sizeof(float));
+    cudaMalloc(&d_weights, kernel_depth * kernel_height * kernel_width * sizeof(float));
+    cudaMalloc(&d_pooled_output, batch_size * channels * depth * height * width * sizeof(float));
+    cudaMalloc(&d_standardized_weights, kernel_depth * kernel_height * kernel_width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * channels * depth * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, kernel_depth * kernel_height * kernel_width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel for 3D average pooling
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (depth + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    avg_pool3d_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_pooled_output, batch_size, channels, depth, height, width, 3  // Kernel size = 3
+    );
+
+    // Launch kernel to standardize weights
+    dim3 threadsPerBlock_weights(256, 1, 1);  // Adjust block size based on your GPU
+    dim3 numBlocks_weights((kernel_depth * kernel_height * kernel_width + threadsPerBlock_weights.x - 1) / threadsPerBlock_weights.x, 1, 1);
+    standardize_weights_kernel<<<numBlocks_weights, threadsPerBlock_weights>>>(
+        d_weights, d_standardized_weights, kernel_depth, kernel_height, kernel_width
+    );
+
+    // Launch kernel to multiply pooled output by standardized weights
+    multiply_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_pooled_output, d_standardized_weights, d_input, batch_size, channels, depth, height, width,
+        kernel_depth, kernel_height, kernel_width
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_input, batch_size * channels * depth * height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weights);
+    cudaFree(d_pooled_output);
+    cudaFree(d_standardized_weights);
+}
+
+}  // extern "C"
+```

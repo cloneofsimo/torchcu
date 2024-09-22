@@ -1,0 +1,340 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def lightweight_attention_bf16(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
+                                 num_heads: int, dropout: float = 0.0) -> torch.Tensor:
+    """
+    Performs multi-head attention with bfloat16 precision for lightweight computation.
+
+    Args:
+        query: Query tensor (batch_size, seq_len, embedding_dim).
+        key: Key tensor (batch_size, seq_len, embedding_dim).
+        value: Value tensor (batch_size, seq_len, embedding_dim).
+        num_heads: Number of attention heads.
+        dropout: Dropout probability.
+
+    Returns:
+        Output tensor (batch_size, seq_len, embedding_dim).
+    """
+    batch_size, seq_len, embedding_dim = query.size()
+    head_dim = embedding_dim // num_heads
+
+    # Convert to bfloat16
+    query = query.to(torch.bfloat16)
+    key = key.to(torch.bfloat16)
+    value = value.to(torch.bfloat16)
+
+    # Reshape for multi-head attention
+    query = query.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    key = key.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    value = value.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+
+    # Calculate attention scores
+    attention_scores = torch.matmul(query, key.transpose(-2, -1)) / (head_dim**0.5)
+
+    # Apply softmax and dropout
+    attention_weights = F.softmax(attention_scores, dim=-1)
+    attention_weights = F.dropout(attention_weights, p=dropout, training=self.training)
+
+    # Weighted sum of values
+    context = torch.matmul(attention_weights, value)
+
+    # Concatenate heads and reshape
+    context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, embedding_dim)
+
+    # Convert back to float32
+    context = context.to(torch.float32)
+    return context
+
+function_signature = {
+    "name": "lightweight_attention_bf16",
+    "inputs": [
+        ((10, 20, 512), torch.float32),
+        ((10, 20, 512), torch.float32),
+        ((10, 20, 512), torch.float32),
+        (8, ), torch.int32
+    ],
+    "outputs": [
+        ((10, 20, 512), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for multi-head attention with bfloat16
+__global__ void lightweight_attention_bf16_kernel(const float* query, const float* key, const float* value, 
+                                               float* output, int batch_size, int seq_len, int embedding_dim, int num_heads, float dropout) {
+    int head_dim = embedding_dim / num_heads;
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int s = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && s < seq_len) {
+        float sum = 0.0f;
+
+        // Calculate attention scores
+        for (int h = 0; h < num_heads; ++h) {
+            for (int j = 0; j < seq_len; ++j) {
+                float attention_score = 0.0f;
+                for (int k = 0; k < head_dim; ++k) {
+                    __nv_bfloat16 q = float_to_bfloat16(query[b * seq_len * embedding_dim + s * embedding_dim + h * head_dim + k]);
+                    __nv_bfloat16 k_prime = float_to_bfloat16(key[b * seq_len * embedding_dim + j * embedding_dim + h * head_dim + k]);
+                    attention_score += bfloat16_to_float(__hmul(q, k_prime));
+                }
+                attention_score /= sqrtf(head_dim);
+
+                // Softmax
+                __nv_bfloat16 exp_score = __expf(float_to_bfloat16(attention_score));
+                __nv_bfloat16 sum_exp = 0.0f;
+                for (int j_prime = 0; j_prime < seq_len; ++j_prime) {
+                    float attention_score_prime = 0.0f;
+                    for (int k = 0; k < head_dim; ++k) {
+                        __nv_bfloat16 q = float_to_bfloat16(query[b * seq_len * embedding_dim + s * embedding_dim + h * head_dim + k]);
+                        __nv_bfloat16 k_prime_prime = float_to_bfloat16(key[b * seq_len * embedding_dim + j_prime * embedding_dim + h * head_dim + k]);
+                        attention_score_prime += bfloat16_to_float(__hmul(q, k_prime_prime));
+                    }
+                    attention_score_prime /= sqrtf(head_dim);
+                    sum_exp += __expf(float_to_bfloat16(attention_score_prime));
+                }
+
+                __nv_bfloat16 attention_weight = exp_score / sum_exp;
+
+                // Dropout (simple implementation, may not be the most efficient)
+                if (rand() < dropout) {
+                    attention_weight = 0.0f;
+                }
+
+                // Weighted sum of values
+                for (int k = 0; k < head_dim; ++k) {
+                    __nv_bfloat16 v = float_to_bfloat16(value[b * seq_len * embedding_dim + j * embedding_dim + h * head_dim + k]);
+                    sum += bfloat16_to_float(__hmul(attention_weight, v));
+                }
+            }
+        }
+
+        // Store the result
+        output[b * seq_len * embedding_dim + s * embedding_dim] = sum;
+    }
+}
+
+extern "C" {
+
+void lightweight_attention_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+    int query_dim2 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+    int key_dim2 = va_arg(args, int);
+
+    const float* value = va_arg(args, const float*);
+    int value_dim0 = va_arg(args, int);
+    int value_dim1 = va_arg(args, int);
+    int value_dim2 = va_arg(args, int);
+
+    int num_heads = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = query_dim0;
+    int seq_len = query_dim1;
+    int embedding_dim = query_dim2;
+    float dropout = 0.0f; // TODO: Add dropout to input
+
+    // Allocate device memory
+    float *d_query, *d_key, *d_value, *d_output;
+    cudaMalloc(&d_query, batch_size * seq_len * embedding_dim * sizeof(float));
+    cudaMalloc(&d_key, batch_size * seq_len * embedding_dim * sizeof(float));
+    cudaMalloc(&d_value, batch_size * seq_len * embedding_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * seq_len * embedding_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_query, query, batch_size * seq_len * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_key, key, batch_size * seq_len * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_value, value, batch_size * seq_len * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (seq_len + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    lightweight_attention_bf16_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_query, d_key, d_value, d_output, batch_size, seq_len, embedding_dim, num_heads, dropout
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * seq_len * embedding_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_query);
+    cudaFree(d_key);
+    cudaFree(d_value);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for multi-head attention with bfloat16
+__global__ void lightweight_attention_bf16_kernel(const float* query, const float* key, const float* value, 
+                                               float* output, int batch_size, int seq_len, int embedding_dim, int num_heads, float dropout) {
+    int head_dim = embedding_dim / num_heads;
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int s = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && s < seq_len) {
+        float sum = 0.0f;
+
+        // Calculate attention scores
+        for (int h = 0; h < num_heads; ++h) {
+            for (int j = 0; j < seq_len; ++j) {
+                float attention_score = 0.0f;
+                for (int k = 0; k < head_dim; ++k) {
+                    __nv_bfloat16 q = float_to_bfloat16(query[b * seq_len * embedding_dim + s * embedding_dim + h * head_dim + k]);
+                    __nv_bfloat16 k_prime = float_to_bfloat16(key[b * seq_len * embedding_dim + j * embedding_dim + h * head_dim + k]);
+                    attention_score += bfloat16_to_float(__hmul(q, k_prime));
+                }
+                attention_score /= sqrtf(head_dim);
+
+                // Softmax
+                __nv_bfloat16 exp_score = __expf(float_to_bfloat16(attention_score));
+                __nv_bfloat16 sum_exp = 0.0f;
+                for (int j_prime = 0; j_prime < seq_len; ++j_prime) {
+                    float attention_score_prime = 0.0f;
+                    for (int k = 0; k < head_dim; ++k) {
+                        __nv_bfloat16 q = float_to_bfloat16(query[b * seq_len * embedding_dim + s * embedding_dim + h * head_dim + k]);
+                        __nv_bfloat16 k_prime_prime = float_to_bfloat16(key[b * seq_len * embedding_dim + j_prime * embedding_dim + h * head_dim + k]);
+                        attention_score_prime += bfloat16_to_float(__hmul(q, k_prime_prime));
+                    }
+                    attention_score_prime /= sqrtf(head_dim);
+                    sum_exp += __expf(float_to_bfloat16(attention_score_prime));
+                }
+
+                __nv_bfloat16 attention_weight = exp_score / sum_exp;
+
+                // Dropout (simple implementation, may not be the most efficient)
+                if (rand() < dropout) {
+                    attention_weight = 0.0f;
+                }
+
+                // Weighted sum of values
+                for (int k = 0; k < head_dim; ++k) {
+                    __nv_bfloat16 v = float_to_bfloat16(value[b * seq_len * embedding_dim + j * embedding_dim + h * head_dim + k]);
+                    sum += bfloat16_to_float(__hmul(attention_weight, v));
+                }
+            }
+        }
+
+        // Store the result
+        output[b * seq_len * embedding_dim + s * embedding_dim] = sum;
+    }
+}
+
+extern "C" {
+
+void lightweight_attention_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+    int query_dim2 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+    int key_dim2 = va_arg(args, int);
+
+    const float* value = va_arg(args, const float*);
+    int value_dim0 = va_arg(args, int);
+    int value_dim1 = va_arg(args, int);
+    int value_dim2 = va_arg(args, int);
+
+    int num_heads = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = query_dim0;
+    int seq_len = query_dim1;
+    int embedding_dim = query_dim2;
+    float dropout = 0.0f; // TODO: Add dropout to input
+
+    // Allocate device memory
+    float *d_query, *d_key, *d_value, *d_output;
+    cudaMalloc(&d_query, batch_size * seq_len * embedding_dim * sizeof(float));
+    cudaMalloc(&d_key, batch_size * seq_len * embedding_dim * sizeof(float));
+    cudaMalloc(&d_value, batch_size * seq_len * embedding_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * seq_len * embedding_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_query, query, batch_size * seq_len * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_key, key, batch_size * seq_len * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_value, value, batch_size * seq_len * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (seq_len + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    lightweight_attention_bf16_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_query, d_key, d_value, d_output, batch_size, seq_len, embedding_dim, num_heads, dropout
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * seq_len * embedding_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_query);
+    cudaFree(d_key);
+    cudaFree(d_value);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

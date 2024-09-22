@@ -1,0 +1,79 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for 2D average pooling with int8
+__global__ void avg_pool2d_int8_kernel(const int8_t* input, float* output, int batch_size, int channels, int input_height, int input_width, int output_height, int output_width) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && channel_idx < channels && row < output_height) {
+        int col = threadIdx.x;
+        float sum = 0.0f;
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                int input_row = row * 2 + i;
+                int input_col = col * 2 + j;
+                if (input_row < input_height && input_col < input_width) {
+                    sum += (float)input[(batch_idx * channels * input_height * input_width) + (channel_idx * input_height * input_width) + (input_row * input_width) + input_col];
+                }
+            }
+        }
+        output[(batch_idx * channels * output_height * output_width) + (channel_idx * output_height * output_width) + (row * output_width) + col] = sum / 4.0f;
+    }
+}
+
+extern "C" {
+
+void avg_pool2d_int8_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int channels = input_tensor_dim1;
+    int input_height = input_tensor_dim2;
+    int input_width = input_tensor_dim3;
+    int output_height = input_height / 2;
+    int output_width = input_width / 2;
+
+    // Allocate device memory
+    int8_t *d_input;
+    float *d_output;
+    cudaMalloc(&d_input, batch_size * channels * input_height * input_width * sizeof(int8_t));
+    cudaMalloc(&d_output, batch_size * channels * output_height * output_width * sizeof(float));
+
+    // Copy input data to device (convert to int8)
+    cudaMemcpy(d_input, input_tensor, batch_size * channels * input_height * input_width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 1, 1);
+    dim3 numBlocks((output_width + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    avg_pool2d_int8_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_output, batch_size, channels, input_height, input_width, output_height, output_width
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * channels * output_height * output_width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

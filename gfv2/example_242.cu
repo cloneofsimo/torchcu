@@ -1,0 +1,115 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// Kernel for calculating SVD and multi-margin loss
+__global__ void svd_multi_margin_loss_kernel(const float* input_tensor, const int8_t* labels, float* output, 
+                                           int batch_size, int num_classes, float margin) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        // Extract the input for the current sample
+        half2* input_sample = (half2*) (input_tensor + idx * num_classes);
+
+        // Allocate memory for the input sample on the device
+        half2* d_input_sample;
+        cudaMalloc(&d_input_sample, num_classes * sizeof(half2));
+
+        // Copy the input sample to the device
+        cudaMemcpy(d_input_sample, input_sample, num_classes * sizeof(half2), cudaMemcpyHostToDevice);
+
+        // Allocate memory for the SVD results on the device
+        half2* d_U;
+        half* d_S;
+        half2* d_V;
+        cudaMalloc(&d_U, num_classes * sizeof(half2));
+        cudaMalloc(&d_S, num_classes * sizeof(half));
+        cudaMalloc(&d_V, num_classes * sizeof(half2));
+
+        // Perform SVD on the input sample
+        cublasHandle_t handle;
+        cublasCreate(&handle);
+
+        // Perform SVD using cublas library
+        // Example with cublasSgesvd, adjust for your specific needs
+        cublasStatus_t status = cublasSgesvd(handle, 'A', 'A', num_classes, 1, d_input_sample, num_classes, d_S, d_U, 
+                                             num_classes, d_V, num_classes, NULL, 0, NULL, 0);
+
+        // Check for errors
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("cublasSgesvd failed: %d\n", status);
+            return;
+        }
+
+        // Calculate the scores for each class
+        half* d_scores;
+        cudaMalloc(&d_scores, num_classes * sizeof(half));
+        for (int i = 0; i < num_classes; i++) {
+            d_scores[i] = d_S[i] * d_V[i];
+        }
+
+        // Calculate the multi-margin loss
+        half loss = 0.0f;
+        for (int i = 0; i < num_classes; i++) {
+            half score = d_scores[i];
+            if (i == labels[idx]) {
+                loss += 0.0f;
+            } else {
+                loss += fmaxf(0.0f, margin - (score - d_scores[labels[idx]]));
+            }
+        }
+
+        // Store the loss in the output array
+        output[idx] = half_to_float(loss);
+
+        // Free device memory
+        cudaFree(d_input_sample);
+        cudaFree(d_U);
+        cudaFree(d_S);
+        cudaFree(d_V);
+        cudaFree(d_scores);
+
+        // Destroy cublas handle
+        cublasDestroy(handle);
+    }
+}
+
+extern "C" {
+
+void svd_multi_margin_loss_fp16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    const int8_t* labels = va_arg(args, const int8_t*);
+    int labels_dim0 = va_arg(args, int);
+
+    float* output = va_arg(args, float*);
+    float margin = va_arg(args, float);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int num_classes = input_tensor_dim1;
+
+    svd_multi_margin_loss_kernel<<<(batch_size + 255) / 256, 256>>>(
+        input_tensor, labels, output, batch_size, num_classes, margin
+    );
+}
+
+}

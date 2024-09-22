@@ -1,0 +1,149 @@
+```python
+import torch
+import torch.nn as nn
+
+def coord_attention_fp32(input_tensor: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    Applies Coord Attention to an input tensor.
+
+    Args:
+        input_tensor: The input tensor.
+        k: The kernel size for the convolution operation.
+
+    Returns:
+        The output tensor after applying Coord Attention.
+    """
+
+    # Original Implementation - Not the most efficient but demonstrates the core logic:
+    B, C, H, W = input_tensor.size()
+
+    # Generate coordinate maps
+    x_range = torch.arange(W).float().view(1, 1, 1, W).expand(B, C, H, W).to(input_tensor.device)
+    y_range = torch.arange(H).float().view(1, 1, H, 1).expand(B, C, H, W).to(input_tensor.device)
+    
+    # Normalize coordinates
+    x_range = (x_range - W / 2) / (W / 2)
+    y_range = (y_range - H / 2) / (H / 2)
+
+    # Concatenate coordinates to the input
+    input_with_coords = torch.cat([input_tensor, x_range, y_range], dim=1)  
+
+    # Apply convolution
+    conv_output = nn.Conv2d(C + 2, C, kernel_size=k, padding=k//2, bias=False)(input_with_coords)
+
+    # Calculate attention weights (Original implementation using FC layers)
+    attention_weights = nn.Linear(C, 1)(conv_output.view(B, C, -1)).view(B, 1, H, W) 
+    attention_weights = torch.sigmoid(attention_weights)
+
+    # Apply attention weights
+    output_tensor = input_tensor * attention_weights
+
+    return output_tensor
+
+function_signature = {
+    "name": "coord_attention_fp32",
+    "inputs": [
+        ((16, 64, 32, 32), torch.float32),
+        (3, torch.int32)
+    ],
+    "outputs": [
+        ((16, 64, 32, 32), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// CUDA kernel for Coord Attention
+__global__ void coord_attention_kernel(const float* input_tensor, float* output_tensor, int B, int C, int H, int W, int k) {
+    int b = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (b < B && h < H) {
+        // Calculate coordinates
+        float x = (float(h) / H - 0.5f) * 2.0f;
+        float y = (float(b) / W - 0.5f) * 2.0f;
+
+        // Apply kernel for each channel
+        for (int c = 0; c < C; ++c) {
+            // Calculate convolution output
+            float conv_output = 0.0f;
+            for (int kh = -k / 2; kh <= k / 2; ++kh) {
+                for (int kw = -k / 2; kw <= k / 2; ++kw) {
+                    int h_idx = h + kh;
+                    int w_idx = b + kw;
+                    if (h_idx >= 0 && h_idx < H && w_idx >= 0 && w_idx < W) {
+                        conv_output += input_tensor[b * C * H * W + c * H * W + h_idx * W + w_idx];
+                    }
+                }
+            }
+
+            // Add coordinates to the convolution output
+            conv_output += x + y;
+
+            // Calculate attention weight
+            float attention_weight = 1.0f / (1.0f + exp(-conv_output));
+
+            // Apply attention weight
+            output_tensor[b * C * H * W + c * H * W + h * W + b] = input_tensor[b * C * H * W + c * H * W + h * W + b] * attention_weight;
+        }
+    }
+}
+
+extern "C" {
+
+void coord_attention_fp32(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract kernel size
+    int k = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output_tensor = va_arg(args, float*);
+
+    va_end(args);
+
+    int B = input_tensor_dim0;
+    int C = input_tensor_dim1;
+    int H = input_tensor_dim2;
+    int W = input_tensor_dim3;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, B * C * H * W * sizeof(float));
+    cudaMalloc(&d_output, B * C * H * W * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, B * C * H * W * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((H + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (B + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    coord_attention_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_output, B, C, H, W, k
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output_tensor, d_output, B * C * H * W * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

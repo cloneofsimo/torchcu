@@ -1,0 +1,112 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+#define CUDA_CHECK(x) { \
+    cudaError_t err = x; \
+    if(err != cudaSuccess) { \
+        fprintf(stderr, "Error: %s in %s at line %d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+__global__ void grid_sampler_kernel(const float* input, const float* grid, 
+                                     half* output, int batch, int channels, int height, int width) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    int index = (batch * channels * height + y) * width + x;
+
+    // Calculate grid coordinates for bilinear interpolation
+    float grid_x = grid[index * 2];
+    float grid_y = grid[index * 2 + 1];
+
+    // Normalize grid coordinates to [-1, 1]
+    grid_x = (grid_x + 1) / 2.0f;
+    grid_y = (grid_y + 1) / 2.0f;
+
+    // Check if grid coordinates are within bounds
+    if (grid_x < 0.0f || grid_x > 1.0f || grid_y < 0.0f || grid_y > 1.0f) {
+        output[index] = 0.0f;
+        return;
+    }
+
+    // Calculate interpolation weights
+    float x_frac = grid_x * (float)width - floorf(grid_x * (float)width);
+    float y_frac = grid_y * (float)height - floorf(grid_y * (float)height);
+
+    // Calculate indices of neighboring pixels
+    int x_floor = floorf(grid_x * (float)width);
+    int y_floor = floorf(grid_y * (float)height);
+    int x_ceil = x_floor + 1;
+    int y_ceil = y_floor + 1;
+
+    // Clamp indices to avoid out-of-bounds access
+    x_ceil = min(x_ceil, width - 1);
+    y_ceil = min(y_ceil, height - 1);
+
+    // Calculate bilinear interpolation weights
+    float w00 = (1.0f - x_frac) * (1.0f - y_frac);
+    float w01 = x_frac * (1.0f - y_frac);
+    float w10 = (1.0f - x_frac) * y_frac;
+    float w11 = x_frac * y_frac;
+
+    // Perform bilinear interpolation
+    float value = w00 * input[(batch * channels * height + y_floor) * width + x_floor] +
+                  w01 * input[(batch * channels * height + y_floor) * width + x_ceil] +
+                  w10 * input[(batch * channels * height + y_ceil) * width + x_floor] +
+                  w11 * input[(batch * channels * height + y_ceil) * width + x_ceil];
+
+    // Store the interpolated value in the output tensor
+    output[index] = value;
+}
+
+extern "C" {
+
+void grid_sampler_fp16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input = va_arg(args, const float*);
+    int batch = va_arg(args, int);
+    int channels = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    const float* grid = va_arg(args, const float*);
+
+    half* output = va_arg(args, half*);
+
+    va_end(args);
+
+    // Allocate device memory for input, grid, and output
+    float *d_input;
+    float *d_grid;
+    half *d_output;
+    CUDA_CHECK(cudaMalloc(&d_input, batch * channels * height * width * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grid, batch * channels * height * width * 2 * sizeof(float))); // *2 for x, y coordinates
+    CUDA_CHECK(cudaMalloc(&d_output, batch * channels * height * width * sizeof(half)));
+
+    // Copy input and grid to device
+    CUDA_CHECK(cudaMemcpy(d_input, input, batch * channels * height * width * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_grid, grid, batch * channels * height * width * 2 * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Launch grid sampler kernel
+    dim3 blockDim(16, 16);
+    dim3 gridDim((width + blockDim.x - 1) / blockDim.x, (height + blockDim.y - 1) / blockDim.y);
+    grid_sampler_kernel<<<gridDim, blockDim>>>(d_input, d_grid, d_output, batch, channels, height, width);
+
+    // Copy output from device
+    CUDA_CHECK(cudaMemcpy(output, d_output, batch * channels * height * width * sizeof(half), cudaMemcpyDeviceToHost));
+
+    // Free device memory
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_grid));
+    CUDA_CHECK(cudaFree(d_output));
+}
+
+} // extern "C"

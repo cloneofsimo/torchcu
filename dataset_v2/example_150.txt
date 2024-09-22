@@ -1,0 +1,166 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+from torch.nn import Conv2d, ConvTranspose2d, LayerNorm, Linear
+from torch.fft import fft, ifft
+import torch.cuda.amp as amp
+
+class AudioNormalizer(torch.nn.Module):
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize audio signal by subtracting mean and dividing by standard deviation.
+        """
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True)
+        return (x - mean) / (std + self.eps)
+
+class DeformableConv(torch.nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1):
+        super().__init__()
+        self.conv = Conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation)
+        self.offset_conv = Conv2d(in_channels, 2 * kernel_size * kernel_size, kernel_size, stride, padding, dilation)
+
+    def forward(self, x: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        """
+        Apply deformable convolution with given offset.
+        """
+        offset = self.offset_conv(x)
+        return F.grid_sample(x, offset, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+class CTCLoss(torch.nn.Module):
+    def __init__(self, blank: int = 0):
+        super().__init__()
+        self.blank = blank
+
+    def forward(self, log_probs: torch.Tensor, targets: torch.Tensor, input_lengths: torch.Tensor, target_lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate CTC loss.
+        """
+        return F.ctc_loss(log_probs, targets, input_lengths, target_lengths, blank=self.blank, reduction='mean')
+
+class MyModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = AudioNormalizer()
+        self.conv1 = Conv2d(1, 16, kernel_size=3, padding=1)
+        self.conv2 = Conv2d(16, 32, kernel_size=3, padding=1)
+        self.deform_conv = DeformableConv(32, 64, kernel_size=3, padding=1)
+        self.ln = LayerNorm([64, 10, 10])
+        self.linear = Linear(64 * 10 * 10, 100)
+        self.ctc_loss = CTCLoss()
+
+    def forward(self, x: torch.Tensor, targets: torch.Tensor, input_lengths: torch.Tensor, target_lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the model.
+        """
+        x = self.norm(x)
+        x = F.relu(self.conv1(x.unsqueeze(1)))
+        x = F.relu(self.conv2(x))
+        offset = torch.zeros_like(x)
+        x = self.deform_conv(x, offset)
+        x = self.ln(x)
+        x = F.relu(self.linear(x.flatten(1)))
+        log_probs = F.log_softmax(x, dim=1)
+        loss = self.ctc_loss(log_probs, targets, input_lengths, target_lengths)
+        return log_probs, loss
+
+def dft_bf16_function(input_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Compute DFT of input tensor using bfloat16 precision.
+    """
+    input_bf16 = input_tensor.to(torch.bfloat16)
+    output_bf16 = fft(input_bf16)
+    return output_bf16.to(torch.float32)
+
+function_signature = {
+    "name": "dft_bf16_function",
+    "inputs": [
+        ((1024,), torch.float32)
+    ],
+    "outputs": [
+        ((1024,), torch.float32)
+    ]
+}
+
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <complex>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for DFT using bfloat16
+__global__ void dft_bf16_kernel(const float* input, std::complex<float>* output, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        __nv_bfloat16 sum_real = 0.0f;
+        __nv_bfloat16 sum_imag = 0.0f;
+        for (int k = 0; k < N; ++k) {
+            float angle = 2 * M_PI * i * k / N;
+            __nv_bfloat16 real_part = float_to_bfloat16(cos(angle));
+            __nv_bfloat16 imag_part = float_to_bfloat16(sin(angle));
+            __nv_bfloat16 input_bf16 = float_to_bfloat16(input[k]);
+            sum_real += __hmul(input_bf16, real_part);
+            sum_imag += __hmul(input_bf16, imag_part);
+        }
+        output[i] = std::complex<float>(bfloat16_to_float(sum_real), bfloat16_to_float(sum_imag));
+    }
+}
+
+extern "C" {
+
+void dft_bf16_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+
+    float* output_tensor = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input;
+    std::complex<float> *d_output;
+    cudaMalloc(&d_input, input_tensor_dim0 * sizeof(float));
+    cudaMalloc(&d_output, input_tensor_dim0 * sizeof(std::complex<float>));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int num_blocks = (input_tensor_dim0 + 255) / 256;
+    dft_bf16_kernel<<<num_blocks, 256>>>(d_input, d_output, input_tensor_dim0);
+
+    // Copy result back to host
+    cudaMemcpy(output_tensor, d_output, input_tensor_dim0 * sizeof(std::complex<float>), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```

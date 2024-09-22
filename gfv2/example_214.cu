@@ -1,0 +1,278 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper functions for bfloat16 conversion
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Kernel for channel attention (bfloat16)
+__global__ void channel_attention_kernel_bf16(const float* input, float* output, 
+                                              int batch_size, int channels, int height, int width,
+                                              int reduction_ratio) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch_size && c < channels) {
+        // Average pooling
+        __nv_bfloat16 avg = 0.0f;
+        for (int h = 0; h < height; h++) {
+            for (int w = 0; w < width; w++) {
+                avg += float_to_bfloat16(input[b * channels * height * width + c * height * width + h * width + w]);
+            }
+        }
+        avg /= (height * width);
+
+        // Max pooling
+        __nv_bfloat16 max = float_to_bfloat16(input[b * channels * height * width + c * height * width]);
+        for (int h = 0; h < height; h++) {
+            for (int w = 0; w < width; w++) {
+                max = fmaxf(max, float_to_bfloat16(input[b * channels * height * width + c * height * width + h * width + w]));
+            }
+        }
+
+        // MLP
+        __nv_bfloat16 avg_mlp_out = float_to_bfloat16(avg);
+        __nv_bfloat16 max_mlp_out = float_to_bfloat16(max);
+        for (int i = 0; i < channels / reduction_ratio; i++) {
+            avg_mlp_out = fmaxf(avg_mlp_out, float_to_bfloat16(0.0f));  // ReLU
+            max_mlp_out = fmaxf(max_mlp_out, float_to_bfloat16(0.0f));  // ReLU
+        }
+        for (int i = 0; i < channels; i++) {
+            avg_mlp_out = fmaxf(avg_mlp_out, float_to_bfloat16(0.0f));  // ReLU
+            max_mlp_out = fmaxf(max_mlp_out, float_to_bfloat16(0.0f));  // ReLU
+        }
+
+        // Sigmoid and element-wise multiplication
+        __nv_bfloat16 attn = __expf(-__fdividef(1.0f, __faddf(avg_mlp_out, max_mlp_out)));
+        attn = __fdividef(1.0f, __faddf(1.0f, attn));
+        for (int h = 0; h < height; h++) {
+            for (int w = 0; w < width; w++) {
+                output[b * channels * height * width + c * height * width + h * width + w] =
+                    bfloat16_to_float(float_to_bfloat16(input[b * channels * height * width + c * height * width + h * width + w]) * attn);
+            }
+        }
+    }
+}
+
+// Kernel for local attention (int8)
+__global__ void local_attention_kernel(const int8_t* input, int8_t* output,
+                                       int batch_size, int channels, int height, int width,
+                                       int kernel_size, int stride, int padding) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.z * blockDim.z + threadIdx.z;
+    int w = threadIdx.w;
+
+    if (b < batch_size && c < channels && h < height && w < width) {
+        // Calculate output coordinates
+        int out_h = h * stride - padding;
+        int out_w = w * stride - padding;
+
+        // Handle boundary cases
+        if (out_h < 0 || out_h >= height || out_w < 0 || out_w >= width) {
+            return;
+        }
+
+        // Calculate kernel region
+        int start_h = out_h - kernel_size / 2;
+        int end_h = out_h + kernel_size / 2 + 1;
+        int start_w = out_w - kernel_size / 2;
+        int end_w = out_w + kernel_size / 2 + 1;
+
+        // Clamp kernel region within input bounds
+        start_h = max(start_h, 0);
+        end_h = min(end_h, height);
+        start_w = max(start_w, 0);
+        end_w = min(end_w, width);
+
+        // Calculate attention weights
+        float sum_weights = 0.0f;
+        float* weights = new float[kernel_size * kernel_size];
+        for (int kh = start_h; kh < end_h; kh++) {
+            for (int kw = start_w; kw < end_w; kw++) {
+                int idx = (kh * width + kw) - (start_h * width + start_w);
+                weights[idx] = expf(input[b * channels * height * width + c * height * width + kh * width + kw]);
+                sum_weights += weights[idx];
+            }
+        }
+
+        // Normalize attention weights
+        for (int i = 0; i < kernel_size * kernel_size; i++) {
+            weights[i] /= sum_weights;
+        }
+
+        // Calculate output value
+        int8_t out_value = 0;
+        for (int kh = start_h; kh < end_h; kh++) {
+            for (int kw = start_w; kw < end_w; kw++) {
+                int idx = (kh * width + kw) - (start_h * width + start_w);
+                out_value += weights[idx] * input[b * channels * height * width + c * height * width + kh * width + kw];
+            }
+        }
+
+        output[b * channels * height * width + c * height * width + h * width + w] = out_value;
+
+        delete[] weights;
+    }
+}
+
+// Kernel for pixel shuffle (inplace)
+__global__ void pixel_shuffle_kernel(float* data, int batch_size, int channels, int height, int width, int upscale_factor) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.z * blockDim.z + threadIdx.z;
+    int w = threadIdx.w;
+
+    if (b < batch_size && c < channels && h < height && w < width) {
+        int out_h = h * upscale_factor;
+        int out_w = w * upscale_factor;
+
+        // Calculate input index
+        int in_c = c % (channels / (upscale_factor * upscale_factor));
+        int in_h = h / upscale_factor;
+        int in_w = w / upscale_factor;
+        int in_idx = b * channels * height * width + in_c * height * width + in_h * width + in_w;
+
+        // Calculate output index
+        int out_idx = b * channels * height * width + c * height * width + out_h * width + out_w;
+
+        data[out_idx] = data[in_idx];
+    }
+}
+
+// Kernel for a simple convolution (int8)
+__global__ void conv2d_kernel_int8(const int8_t* input, const int8_t* weight, int8_t* output,
+                                    int batch_size, int in_channels, int out_channels,
+                                    int height, int width, int kernel_size, int padding) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.z * blockDim.z + threadIdx.z;
+    int w = threadIdx.w;
+
+    if (b < batch_size && c < out_channels && h < height && w < width) {
+        int sum = 0;
+        for (int kh = -padding; kh < kernel_size - padding; kh++) {
+            for (int kw = -padding; kw < kernel_size - padding; kw++) {
+                int in_h = h + kh;
+                int in_w = w + kw;
+
+                // Handle boundary cases
+                if (in_h >= 0 && in_h < height && in_w >= 0 && in_w < width) {
+                    for (int ic = 0; ic < in_channels; ic++) {
+                        int in_idx = b * in_channels * height * width + ic * height * width + in_h * width + in_w;
+                        int weight_idx = c * in_channels * kernel_size * kernel_size + ic * kernel_size * kernel_size + (kh + padding) * kernel_size + (kw + padding);
+                        sum += input[in_idx] * weight[weight_idx];
+                    }
+                }
+            }
+        }
+        output[b * out_channels * height * width + c * height * width + h * width + w] = sum;
+    }
+}
+
+extern "C" {
+
+void fancy_transform(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int channels = input_tensor_dim1;
+    int height = input_tensor_dim2;
+    int width = input_tensor_dim3;
+    int reduction_ratio = 16;
+    int kernel_size = 3;
+    int stride = 1;
+    int padding = 1;
+    int upscale_factor = 2;
+    int out_channels = 64;
+
+    // Allocate device memory
+    float *d_input, *d_channel_attn_out, *d_local_attn_out, *d_custom_layer_out;
+    cudaMalloc(&d_input, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_channel_attn_out, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_local_attn_out, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_custom_layer_out, batch_size * out_channels * height * width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Channel Attention (bfloat16)
+    dim3 threadsPerBlock_CA(8, 8);
+    dim3 numBlocks_CA((batch_size + threadsPerBlock_CA.x - 1) / threadsPerBlock_CA.x,
+                      (channels + threadsPerBlock_CA.y - 1) / threadsPerBlock_CA.y);
+    channel_attention_kernel_bf16<<<numBlocks_CA, threadsPerBlock_CA>>>(
+        d_input, d_channel_attn_out, batch_size, channels, height, width, reduction_ratio
+    );
+
+    // Local Attention (int8)
+    int8_t *d_channel_attn_out_int8, *d_local_attn_out_int8;
+    cudaMalloc(&d_channel_attn_out_int8, batch_size * channels * height * width * sizeof(int8_t));
+    cudaMalloc(&d_local_attn_out_int8, batch_size * channels * height * width * sizeof(int8_t));
+    cudaMemcpy(d_channel_attn_out_int8, d_channel_attn_out, batch_size * channels * height * width * sizeof(int8_t), cudaMemcpyDeviceToDevice);
+    dim3 threadsPerBlock_LA(8, 8, 8, 8);
+    dim3 numBlocks_LA((batch_size + threadsPerBlock_LA.x - 1) / threadsPerBlock_LA.x,
+                      (channels + threadsPerBlock_LA.y - 1) / threadsPerBlock_LA.y,
+                      (height + threadsPerBlock_LA.z - 1) / threadsPerBlock_LA.z);
+    local_attention_kernel<<<numBlocks_LA, threadsPerBlock_LA>>>(
+        d_channel_attn_out_int8, d_local_attn_out_int8, batch_size, channels, height, width, kernel_size, stride, padding
+    );
+
+    // Pixel Shuffle (inplace)
+    cudaMemcpy(d_local_attn_out, d_local_attn_out_int8, batch_size * channels * height * width * sizeof(int8_t), cudaMemcpyDeviceToDevice);
+    dim3 threadsPerBlock_PS(8, 8, 8, 8);
+    dim3 numBlocks_PS((batch_size + threadsPerBlock_PS.x - 1) / threadsPerBlock_PS.x,
+                      (channels + threadsPerBlock_PS.y - 1) / threadsPerBlock_PS.y,
+                      ((height / upscale_factor) + threadsPerBlock_PS.z - 1) / threadsPerBlock_PS.z);
+    pixel_shuffle_kernel<<<numBlocks_PS, threadsPerBlock_PS>>>(
+        d_local_attn_out, batch_size, channels, height, width, upscale_factor
+    );
+
+    // Custom layer (int8)
+    int8_t *d_weight_int8, *d_custom_layer_out_int8;
+    cudaMalloc(&d_weight_int8, out_channels * channels * kernel_size * kernel_size * sizeof(int8_t));
+    cudaMalloc(&d_custom_layer_out_int8, batch_size * out_channels * height * width * sizeof(int8_t));
+    dim3 threadsPerBlock_CL(8, 8, 8, 8);
+    dim3 numBlocks_CL((batch_size + threadsPerBlock_CL.x - 1) / threadsPerBlock_CL.x,
+                      (out_channels + threadsPerBlock_CL.y - 1) / threadsPerBlock_CL.y,
+                      (height + threadsPerBlock_CL.z - 1) / threadsPerBlock_CL.z);
+    conv2d_kernel_int8<<<numBlocks_CL, threadsPerBlock_CL>>>(
+        d_local_attn_out_int8, d_weight_int8, d_custom_layer_out_int8, batch_size, channels, out_channels,
+        height, width, kernel_size, padding
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_custom_layer_out_int8, batch_size * out_channels * height * width * sizeof(int8_t), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_channel_attn_out);
+    cudaFree(d_local_attn_out);
+    cudaFree(d_custom_layer_out);
+    cudaFree(d_channel_attn_out_int8);
+    cudaFree(d_local_attn_out_int8);
+    cudaFree(d_weight_int8);
+    cudaFree(d_custom_layer_out_int8);
+}
+
+}  // extern "C"

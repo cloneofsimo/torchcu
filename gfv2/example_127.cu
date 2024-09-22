@@ -1,0 +1,98 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+#define BLOCK_SIZE 32
+
+__global__ void masked_attention_kernel(
+    const half* query, const half* key, const half* value, const bool* mask, 
+    half* output, int batch_size, int seq_len, int embedding_dim) 
+{
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int head_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int seq_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && head_idx < seq_len && seq_idx < seq_len) {
+        float sum = 0.0f;
+        for (int i = 0; i < seq_len; i++) {
+            if (mask[batch_idx * seq_len + i]) {
+                half q = query[batch_idx * seq_len * embedding_dim + head_idx * embedding_dim + i];
+                half k = key[batch_idx * seq_len * embedding_dim + i * embedding_dim + head_idx];
+                sum += __int_as_float(__float_as_int(q) * __float_as_int(k)) / sqrtf(embedding_dim);
+            }
+        }
+
+        half attention_score = __int_as_half(__float_as_int(expf(sum))); // Softmax
+        half val = value[batch_idx * seq_len * embedding_dim + i * embedding_dim + head_idx];
+        output[batch_idx * seq_len * embedding_dim + head_idx * embedding_dim + seq_idx] = attention_score * val;
+    }
+}
+
+extern "C" {
+
+void masked_attention_fp16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* query = va_arg(args, const float*);
+    int query_dim0 = va_arg(args, int);
+    int query_dim1 = va_arg(args, int);
+    int query_dim2 = va_arg(args, int);
+
+    const float* key = va_arg(args, const float*);
+    int key_dim0 = va_arg(args, int);
+    int key_dim1 = va_arg(args, int);
+    int key_dim2 = va_arg(args, int);
+
+    const float* value = va_arg(args, const float*);
+    int value_dim0 = va_arg(args, int);
+    int value_dim1 = va_arg(args, int);
+    int value_dim2 = va_arg(args, int);
+
+    const bool* mask = va_arg(args, const bool*);
+    int mask_dim0 = va_arg(args, int);
+    int mask_dim1 = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    half* d_query, *d_key, *d_value, *d_mask, *d_output;
+    cudaMalloc(&d_query, query_dim0 * query_dim1 * query_dim2 * sizeof(half));
+    cudaMalloc(&d_key, key_dim0 * key_dim1 * key_dim2 * sizeof(half));
+    cudaMalloc(&d_value, value_dim0 * value_dim1 * value_dim2 * sizeof(half));
+    cudaMalloc(&d_mask, mask_dim0 * mask_dim1 * sizeof(bool));
+    cudaMalloc(&d_output, query_dim0 * query_dim1 * query_dim2 * sizeof(half));
+
+    // Copy input data to device
+    cudaMemcpy(d_query, query, query_dim0 * query_dim1 * query_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_key, key, key_dim0 * key_dim1 * key_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_value, value, value_dim0 * value_dim1 * value_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_mask, mask, mask_dim0 * mask_dim1 * sizeof(bool), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+    dim3 numBlocks((query_dim1 + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (query_dim1 + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (query_dim0 + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    masked_attention_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_query, d_key, d_value, d_mask, d_output, query_dim0, query_dim1, query_dim2
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, query_dim0 * query_dim1 * query_dim2 * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_query);
+    cudaFree(d_key);
+    cudaFree(d_value);
+    cudaFree(d_mask);
+    cudaFree(d_output);
+}
+
+} // extern "C"

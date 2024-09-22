@@ -1,0 +1,146 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+__global__ void noise_injection_median_pad_kernel(const float* input_tensor, float noise_level, float* output, 
+                                                int batch_size, int input_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < input_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < input_size; ++i) {
+            __nv_bfloat16 input_val = float_to_bfloat16(input_tensor[row * input_size + i]);
+            __nv_bfloat16 noise_val = float_to_bfloat16(noise_level * curand_uniform() - noise_level * 0.5f);
+            sum += bfloat16_to_float(__hmul(input_val, noise_val));
+        }
+        output[row * input_size + col] = sum;
+    }
+}
+
+__global__ void median_kernel(const float* input_tensor, float* output, int batch_size, int input_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < input_size) {
+        // Calculate median for each row
+        int start_index = row * input_size + col;
+        float temp[input_size];
+        for (int i = 0; i < input_size; ++i) {
+            temp[i] = input_tensor[start_index + i];
+        }
+        // Sort the temporary array (using quicksort)
+        quicksort(temp, 0, input_size - 1);
+        output[row * input_size + col] = temp[input_size / 2];
+    }
+}
+
+__global__ void pad_kernel(const float* input_tensor, float* output, int batch_size, int input_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < input_size + 2) {
+        if (col == 0 || col == input_size + 1) {
+            output[row * (input_size + 2) + col] = 0.0f; // Pad with 0
+        } else {
+            output[row * (input_size + 2) + col] = input_tensor[(row - 1) * input_size + col - 1];
+        }
+    }
+}
+
+// Quicksort implementation for device-side sorting
+__device__ void quicksort(float arr[], int low, int high) {
+    if (low < high) {
+        int pi = partition(arr, low, high);
+        quicksort(arr, low, pi - 1);
+        quicksort(arr, pi + 1, high);
+    }
+}
+
+// Partition function for quicksort
+__device__ int partition(float arr[], int low, int high) {
+    float pivot = arr[high];
+    int i = (low - 1);
+    for (int j = low; j <= high - 1; j++) {
+        if (arr[j] <= pivot) {
+            i++;
+            swap(arr, i, j);
+        }
+    }
+    swap(arr, i + 1, high);
+    return (i + 1);
+}
+
+// Swap function for quicksort
+__device__ void swap(float arr[], int i, int j) {
+    float temp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = temp;
+}
+
+extern "C" {
+
+void noise_injection_median_pad(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract noise level
+    float noise_level = va_arg(args, double);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_size = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_output, *d_median;
+    cudaMalloc(&d_input, batch_size * input_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * (input_size + 2) * sizeof(float));
+    cudaMalloc(&d_median, batch_size * input_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Noise injection (using a kernel for parallel processing)
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((input_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    noise_injection_median_pad_kernel<<<numBlocks, threadsPerBlock>>>(d_input, noise_level, d_input, batch_size, input_size);
+
+    // Calculate median (using a kernel for parallel processing)
+    median_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_median, batch_size, input_size);
+
+    // Pad the median tensor (using a kernel for parallel processing)
+    pad_kernel<<<numBlocks, threadsPerBlock>>>(d_median, d_output, batch_size, input_size);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * (input_size + 2) * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_median);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

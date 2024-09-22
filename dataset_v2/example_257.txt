@@ -1,0 +1,366 @@
+```python
+import torch
+
+def fused_operation(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, label: torch.Tensor) -> list[torch.Tensor]:
+    """
+    Performs a series of fused operations:
+    1. Adaptive average pooling of the input tensor
+    2. Matrix multiplication with the weight tensor
+    3. Add bias and apply label smoothing
+    4. Scale the output using addcmul
+    """
+    # Adaptive Average Pooling (2D)
+    pooled = torch.nn.functional.adaptive_avg_pool2d(input_tensor.to(torch.bfloat16), (1, 1)).to(torch.float32)
+
+    # Matrix Multiplication (with bfloat16 precision)
+    weight_bf16 = weight.to(torch.bfloat16)
+    output = torch.matmul(pooled, weight_bf16.t()).to(torch.float32)
+
+    # Add bias and Label Smoothing
+    label_smooth = (1 - 0.1) * label + 0.1 / label.size(1)  # Example label smoothing with factor 0.1
+    output += bias + label_smooth
+
+    # Addcmul (with int8 precision)
+    scale = torch.tensor(1.0, dtype=torch.int8)
+    output.addcmul_(scale, input_tensor.to(torch.int8), weight.to(torch.int8))  # In-place operation
+
+    return [output, label_smooth]
+
+function_signature = {
+    "name": "fused_operation",
+    "inputs": [
+        ((1, 3, 224, 224), torch.float32),
+        ((1000, 3), torch.float32),
+        ((1000,), torch.float32),
+        ((1000,), torch.float32),
+    ],
+    "outputs": [
+        ((1, 1000), torch.float32),
+        ((1, 1000), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for adaptive average pooling 2D
+__global__ void adaptive_avg_pool2d_kernel(const float* input, float* output, int batch_size, int channels, int height, int width) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int batch = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (row < channels && col < 1 && batch < batch_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < height; ++i) {
+            for (int j = 0; j < width; ++j) {
+                sum += input[batch * channels * height * width + row * height * width + i * width + j];
+            }
+        }
+        output[batch * channels + row] = sum / (height * width);
+    }
+}
+
+// CUDA kernel for matrix multiplication and label smoothing
+__global__ void matmul_label_smoothing_kernel(const float* input, const float* weight, const float* bias, const float* label, float* output,
+                                                int batch_size, int output_size, int input_size, float smoothing_factor) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i < batch_size && j < output_size) {
+        float sum = 0.0f;
+        for (int k = 0; k < input_size; ++k) {
+            __nv_bfloat16 a = float_to_bfloat16(input[i * input_size + k]);
+            __nv_bfloat16 b = float_to_bfloat16(weight[j * input_size + k]);
+            sum += bfloat16_to_float(__hmul(a, b));
+        }
+        output[i * output_size + j] = sum + bias[j] + (1 - smoothing_factor) * label[j] + (smoothing_factor / output_size);
+    }
+}
+
+// CUDA kernel for addcmul (with int8 precision)
+__global__ void addcmul_kernel(float* output, const char* input, const char* weight, int batch_size, int output_size, int input_size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i < batch_size && j < output_size) {
+        float sum = 0.0f;
+        for (int k = 0; k < input_size; ++k) {
+            sum += (int8_t)input[i * input_size + k] * (int8_t)weight[j * input_size + k];
+        }
+        output[i * output_size + j] += sum;
+    }
+}
+
+extern "C" {
+
+void fused_operation(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract label tensor
+    const float* label = va_arg(args, const float*);
+    int label_dim0 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+    float* label_smooth = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int channels = input_tensor_dim1;
+    int height = input_tensor_dim2;
+    int width = input_tensor_dim3;
+    int output_size = weight_dim0;
+    float smoothing_factor = 0.1f;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_label, *d_output, *d_label_smooth;
+    cudaMalloc(&d_input, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_weight, output_size * channels * sizeof(float));
+    cudaMalloc(&d_bias, output_size * sizeof(float));
+    cudaMalloc(&d_label, output_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_size * sizeof(float));
+    cudaMalloc(&d_label_smooth, batch_size * output_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_size * channels * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, output_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_label, label, output_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Adaptive Average Pooling 2D
+    dim3 threadsPerBlock_pooling(16, 16, 1);
+    dim3 numBlocks_pooling((1 + threadsPerBlock_pooling.x - 1) / threadsPerBlock_pooling.x,
+                          (channels + threadsPerBlock_pooling.y - 1) / threadsPerBlock_pooling.y,
+                          (batch_size + threadsPerBlock_pooling.z - 1) / threadsPerBlock_pooling.z);
+    adaptive_avg_pool2d_kernel<<<numBlocks_pooling, threadsPerBlock_pooling>>>(d_input, d_output, batch_size, channels, height, width);
+
+    // Matrix Multiplication and Label Smoothing
+    dim3 threadsPerBlock_matmul(16, 16);
+    dim3 numBlocks_matmul((batch_size + threadsPerBlock_matmul.x - 1) / threadsPerBlock_matmul.x,
+                          (output_size + threadsPerBlock_matmul.y - 1) / threadsPerBlock_matmul.y);
+    matmul_label_smoothing_kernel<<<numBlocks_matmul, threadsPerBlock_matmul>>>(d_output, d_weight, d_bias, d_label, d_output,
+                                                                              batch_size, output_size, channels, smoothing_factor);
+
+    // Addcmul (with int8 precision)
+    char *d_input_int8, *d_weight_int8;
+    cudaMalloc(&d_input_int8, batch_size * channels * height * width * sizeof(char));
+    cudaMalloc(&d_weight_int8, output_size * channels * sizeof(char));
+    cudaMemcpy(d_input_int8, d_input, batch_size * channels * height * width * sizeof(char), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_weight_int8, d_weight, output_size * channels * sizeof(char), cudaMemcpyDeviceToDevice);
+
+    dim3 threadsPerBlock_addcmul(16, 16);
+    dim3 numBlocks_addcmul((batch_size + threadsPerBlock_addcmul.x - 1) / threadsPerBlock_addcmul.x,
+                          (output_size + threadsPerBlock_addcmul.y - 1) / threadsPerBlock_addcmul.y);
+    addcmul_kernel<<<numBlocks_addcmul, threadsPerBlock_addcmul>>>(d_output, d_input_int8, d_weight_int8, batch_size, output_size, channels);
+
+    // Copy results back to host
+    cudaMemcpy(output, d_output, batch_size * output_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(label_smooth, d_label, output_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_label);
+    cudaFree(d_output);
+    cudaFree(d_label_smooth);
+    cudaFree(d_input_int8);
+    cudaFree(d_weight_int8);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for adaptive average pooling 2D
+__global__ void adaptive_avg_pool2d_kernel(const float* input, float* output, int batch_size, int channels, int height, int width) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int batch = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (row < channels && col < 1 && batch < batch_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < height; ++i) {
+            for (int j = 0; j < width; ++j) {
+                sum += input[batch * channels * height * width + row * height * width + i * width + j];
+            }
+        }
+        output[batch * channels + row] = sum / (height * width);
+    }
+}
+
+// CUDA kernel for matrix multiplication and label smoothing
+__global__ void matmul_label_smoothing_kernel(const float* input, const float* weight, const float* bias, const float* label, float* output,
+                                                int batch_size, int output_size, int input_size, float smoothing_factor) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i < batch_size && j < output_size) {
+        float sum = 0.0f;
+        for (int k = 0; k < input_size; ++k) {
+            __nv_bfloat16 a = float_to_bfloat16(input[i * input_size + k]);
+            __nv_bfloat16 b = float_to_bfloat16(weight[j * input_size + k]);
+            sum += bfloat16_to_float(__hmul(a, b));
+        }
+        output[i * output_size + j] = sum + bias[j] + (1 - smoothing_factor) * label[j] + (smoothing_factor / output_size);
+    }
+}
+
+// CUDA kernel for addcmul (with int8 precision)
+__global__ void addcmul_kernel(float* output, const char* input, const char* weight, int batch_size, int output_size, int input_size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i < batch_size && j < output_size) {
+        float sum = 0.0f;
+        for (int k = 0; k < input_size; ++k) {
+            sum += (int8_t)input[i * input_size + k] * (int8_t)weight[j * input_size + k];
+        }
+        output[i * output_size + j] += sum;
+    }
+}
+
+extern "C" {
+
+void fused_operation(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract label tensor
+    const float* label = va_arg(args, const float*);
+    int label_dim0 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+    float* label_smooth = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int channels = input_tensor_dim1;
+    int height = input_tensor_dim2;
+    int width = input_tensor_dim3;
+    int output_size = weight_dim0;
+    float smoothing_factor = 0.1f;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_label, *d_output, *d_label_smooth;
+    cudaMalloc(&d_input, batch_size * channels * height * width * sizeof(float));
+    cudaMalloc(&d_weight, output_size * channels * sizeof(float));
+    cudaMalloc(&d_bias, output_size * sizeof(float));
+    cudaMalloc(&d_label, output_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_size * sizeof(float));
+    cudaMalloc(&d_label_smooth, batch_size * output_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_size * channels * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, output_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_label, label, output_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Adaptive Average Pooling 2D
+    dim3 threadsPerBlock_pooling(16, 16, 1);
+    dim3 numBlocks_pooling((1 + threadsPerBlock_pooling.x - 1) / threadsPerBlock_pooling.x,
+                          (channels + threadsPerBlock_pooling.y - 1) / threadsPerBlock_pooling.y,
+                          (batch_size + threadsPerBlock_pooling.z - 1) / threadsPerBlock_pooling.z);
+    adaptive_avg_pool2d_kernel<<<numBlocks_pooling, threadsPerBlock_pooling>>>(d_input, d_output, batch_size, channels, height, width);
+
+    // Matrix Multiplication and Label Smoothing
+    dim3 threadsPerBlock_matmul(16, 16);
+    dim3 numBlocks_matmul((batch_size + threadsPerBlock_matmul.x - 1) / threadsPerBlock_matmul.x,
+                          (output_size + threadsPerBlock_matmul.y - 1) / threadsPerBlock_matmul.y);
+    matmul_label_smoothing_kernel<<<numBlocks_matmul, threadsPerBlock_matmul>>>(d_output, d_weight, d_bias, d_label, d_output,
+                                                                              batch_size, output_size, channels, smoothing_factor);
+
+    // Addcmul (with int8 precision)
+    char *d_input_int8, *d_weight_int8;
+    cudaMalloc(&d_input_int8, batch_size * channels * height * width * sizeof(char));
+    cudaMalloc(&d_weight_int8, output_size * channels * sizeof(char));
+    cudaMemcpy(d_input_int8, d_input, batch_size * channels * height * width * sizeof(char), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_weight_int8, d_weight, output_size * channels * sizeof(char), cudaMemcpyDeviceToDevice);
+
+    dim3 threadsPerBlock_addcmul(16, 16);
+    dim3 numBlocks_addcmul((batch_size + threadsPerBlock_addcmul.x - 1) / threadsPerBlock_addcmul.x,
+                          (output_size + threadsPerBlock_addcmul.y - 1) / threadsPerBlock_addcmul.y);
+    addcmul_kernel<<<numBlocks_addcmul, threadsPerBlock_addcmul>>>(d_output, d_input_int8, d_weight_int8, batch_size, output_size, channels);
+
+    // Copy results back to host
+    cudaMemcpy(output, d_output, batch_size * output_size * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(label_smooth, d_label, output_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_label);
+    cudaFree(d_output);
+    cudaFree(d_label_smooth);
+    cudaFree(d_input_int8);
+    cudaFree(d_weight_int8);
+}
+
+}  // extern "C"
+```

@@ -1,0 +1,120 @@
+```python
+import torch
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
+
+def sparse_int8_padding_function(inputs: list[torch.Tensor], padding_value: int = 0) -> torch.Tensor:
+    """
+    Performs padding on a list of sparse tensors, converts them to int8, and concatenates them.
+
+    Args:
+        inputs: A list of sparse tensors to be padded.
+        padding_value: The value to use for padding.
+
+    Returns:
+        A single concatenated tensor of int8 dtype.
+    """
+    # Pad the input tensors to the same length
+    padded_inputs = pad_sequence(inputs, batch_first=True, padding_value=padding_value)
+
+    # Convert the padded tensor to int8
+    padded_inputs_int8 = padded_inputs.to(torch.int8)
+
+    # Concatenate the padded tensors
+    output = torch.cat(padded_inputs_int8, dim=1)
+
+    return output
+
+function_signature = {
+    "name": "sparse_int8_padding_function",
+    "inputs": [
+        [((10,), torch.int64), ((12,), torch.int64)],
+        ((), torch.int64)
+    ],
+    "outputs": [
+        ((10, 22), torch.int8),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>  // Include for int8 support
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for padding and concatenation
+__global__ void sparse_int8_padding_kernel(const int* input_data, const int* input_lengths, 
+                                           int8_t* output_data, int batch_size, int max_length, 
+                                           int padding_value) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < max_length) {
+        if (col < input_lengths[row]) {
+            output_data[row * max_length + col] = (int8_t)input_data[row * input_lengths[row] + col];
+        } else {
+            output_data[row * max_length + col] = (int8_t)padding_value;
+        }
+    }
+}
+
+extern "C" {
+
+void sparse_int8_padding_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const int* input_data_0 = va_arg(args, const int*);
+    int input_data_0_len = va_arg(args, int);
+    const int* input_data_1 = va_arg(args, const int*);
+    int input_data_1_len = va_arg(args, int);
+
+    // Extract padding value
+    const int padding_value = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    int8_t* output_data = va_arg(args, int8_t*);
+
+    va_end(args);
+
+    // Calculate batch size and max length
+    int batch_size = 2; // Assuming two input tensors
+    int max_length = (input_data_0_len > input_data_1_len) ? input_data_0_len : input_data_1_len;
+
+    // Allocate device memory
+    int* d_input_data_0, *d_input_data_1, *d_input_lengths;
+    int8_t* d_output_data;
+    cudaMalloc(&d_input_data_0, input_data_0_len * sizeof(int));
+    cudaMalloc(&d_input_data_1, input_data_1_len * sizeof(int));
+    cudaMalloc(&d_input_lengths, batch_size * sizeof(int));
+    cudaMalloc(&d_output_data, batch_size * max_length * sizeof(int8_t));
+
+    // Copy input data to device
+    cudaMemcpy(d_input_data_0, input_data_0, input_data_0_len * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input_data_1, input_data_1, input_data_1_len * sizeof(int), cudaMemcpyHostToDevice);
+    int input_lengths[2] = {input_data_0_len, input_data_1_len};
+    cudaMemcpy(d_input_lengths, input_lengths, batch_size * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(32, 16);
+    dim3 numBlocks((max_length + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    sparse_int8_padding_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input_data_0, d_input_lengths, d_output_data, batch_size, max_length, padding_value
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output_data, d_output_data, batch_size * max_length * sizeof(int8_t), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input_data_0);
+    cudaFree(d_input_data_1);
+    cudaFree(d_input_lengths);
+    cudaFree(d_output_data);
+}
+
+}  // extern "C"
+```

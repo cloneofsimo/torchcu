@@ -1,0 +1,78 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+__global__ void fused_dropout_cumsum_elementwise_product_kernel(const int8_t* input_tensor, const int8_t* weight, float* output,
+                                                                float dropout_p, int batch_size, int seq_len, int weight_len) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size * seq_len) {
+        int batch_index = i / seq_len;
+        int seq_index = i % seq_len;
+
+        float sum = 0.0f;
+        for (int j = 0; j <= seq_index; ++j) {
+            float rand_val = __float2half_rn(rand() / (float)RAND_MAX);
+            if (rand_val > dropout_p) {
+                sum += (float)input_tensor[batch_index * seq_len + j] * (float)weight[j];
+            }
+        }
+        output[i] = sum;
+    }
+}
+
+extern "C" {
+    void fused_dropout_cumsum_elementwise_product(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        // Extract input tensor
+        const int8_t* input_tensor = va_arg(args, const int8_t*);
+        int input_tensor_dim0 = va_arg(args, int);
+        int input_tensor_dim1 = va_arg(args, int);
+
+        // Extract weight tensor
+        const int8_t* weight = va_arg(args, const int8_t*);
+        int weight_dim0 = va_arg(args, int);
+
+        // Extract dropout probability
+        float dropout_p = va_arg(args, double);
+
+        // Extract output tensor (assuming it's preallocated)
+        float* output = va_arg(args, float*);
+
+        va_end(args);
+
+        int batch_size = input_tensor_dim0;
+        int seq_len = input_tensor_dim1;
+        int weight_len = weight_dim0;
+
+        // Allocate device memory
+        int8_t* d_input;
+        int8_t* d_weight;
+        float* d_output;
+        cudaMalloc(&d_input, batch_size * seq_len * sizeof(int8_t));
+        cudaMalloc(&d_weight, weight_len * sizeof(int8_t));
+        cudaMalloc(&d_output, batch_size * seq_len * sizeof(float));
+
+        // Copy data to device
+        cudaMemcpy(d_input, input_tensor, batch_size * seq_len * sizeof(int8_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_weight, weight, weight_len * sizeof(int8_t), cudaMemcpyHostToDevice);
+
+        // Launch kernel
+        dim3 threadsPerBlock(256);
+        dim3 numBlocks((batch_size * seq_len + threadsPerBlock.x - 1) / threadsPerBlock.x);
+        fused_dropout_cumsum_elementwise_product_kernel<<<numBlocks, threadsPerBlock>>>(
+            d_input, d_weight, d_output, dropout_p, batch_size, seq_len, weight_len
+        );
+
+        // Copy result back to host
+        cudaMemcpy(output, d_output, batch_size * seq_len * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_weight);
+        cudaFree(d_output);
+    }
+}

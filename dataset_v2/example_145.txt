@@ -1,0 +1,275 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.transforms import RandomResizedCrop
+from typing import List, Tuple
+
+class CutMix(nn.Module):
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.random_resized_crop = RandomResizedCrop(size=(32, 32), scale=(0.8, 1.0), ratio=(0.9, 1.1))
+
+    def forward(self, input1: torch.Tensor, input2: torch.Tensor, label1: torch.Tensor, label2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = input1.size(0)
+        lam = np.random.beta(self.alpha, self.alpha)
+        index = torch.randperm(batch_size)
+        
+        # Randomly select a portion to cut from the second image
+        cutmix_mask = self.random_resized_crop(torch.ones(batch_size, 1, 32, 32))
+        cutmix_mask = cutmix_mask.expand_as(input1)
+
+        # Apply cutmix to input and label
+        mixed_input = lam * input1 + (1 - lam) * input2 * cutmix_mask
+        mixed_label = lam * label1 + (1 - lam) * label2
+
+        return mixed_input, mixed_label
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(64, 10)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+def mixed_forward_int8_cutmix_adaptiveavgpool2d_gradient_clipping(input1: torch.Tensor, input2: torch.Tensor, label1: torch.Tensor, label2: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a mixed forward pass with int8 quantization, cutmix, adaptive average pooling, and gradient clipping.
+
+    Args:
+        input1: First input tensor for cutmix.
+        input2: Second input tensor for cutmix.
+        label1: First label tensor for cutmix.
+        label2: Second label tensor for cutmix.
+
+    Returns:
+        The output tensor after the mixed forward pass.
+    """
+    model = Model()
+    cutmix = CutMix()
+    mixed_input, mixed_label = cutmix(input1, input2, label1, label2)
+    mixed_input = mixed_input.to(torch.int8)
+
+    # Forward pass through the model
+    output = model(mixed_input)
+
+    # Gradient clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    return output
+
+function_signature = {
+    "name": "mixed_forward_int8_cutmix_adaptiveavgpool2d_gradient_clipping",
+    "inputs": [
+        ((32, 3, 32, 32), torch.float32),
+        ((32, 3, 32, 32), torch.float32),
+        ((32,), torch.int64),
+        ((32,), torch.int64),
+    ],
+    "outputs": [
+        ((32, 10), torch.float32),
+    ]
+}
+```
+
+```c++
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+  return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+  return __half2float(h);
+}
+
+// CUDA kernel for adaptive average pooling
+__global__ void adaptive_avg_pool2d_kernel(const half* input, half* output, int batch_size, int channels, int input_height, int input_width, int output_height, int output_width) {
+  int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (batch_idx < batch_size && channel_idx < channels) {
+    float sum = 0.0f;
+    int h_start = (channel_idx * input_height) / output_height;
+    int h_end = ((channel_idx + 1) * input_height) / output_height;
+    int w_start = (batch_idx * input_width) / output_width;
+    int w_end = ((batch_idx + 1) * input_width) / output_width;
+
+    for (int h = h_start; h < h_end; ++h) {
+      for (int w = w_start; w < w_end; ++w) {
+        sum += half_to_float(input[((batch_idx * channels + channel_idx) * input_height + h) * input_width + w]);
+      }
+    }
+
+    output[((batch_idx * channels + channel_idx) * output_height) * output_width] = float_to_half(sum / (input_height * input_width));
+  }
+}
+
+// CUDA kernel for convolution layer
+__global__ void conv2d_kernel(const half* input, const half* weight, half* output, int batch_size, int channels, int input_height, int input_width, int output_height, int output_width, int kernel_size, int stride, int padding, int output_channels) {
+  int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int output_y = blockIdx.y * blockDim.y + threadIdx.y;
+  int output_x = threadIdx.z;
+
+  if (batch_idx < batch_size && output_y < output_height && output_x < output_width) {
+    float sum = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+      for (int ky = 0; ky < kernel_size; ++ky) {
+        for (int kx = 0; kx < kernel_size; ++kx) {
+          int input_y = output_y * stride - padding + ky;
+          int input_x = output_x * stride - padding + kx;
+          if (input_y >= 0 && input_y < input_height && input_x >= 0 && input_x < input_width) {
+            sum += half_to_float(input[((batch_idx * channels + c) * input_height + input_y) * input_width + input_x]) * half_to_float(weight[(output_channels * c + ky * kernel_size + kx) * kernel_size]);
+          }
+        }
+      }
+    }
+    output[((batch_idx * output_channels + output_y * output_width + output_x) * output_height) * output_width] = float_to_half(sum);
+  }
+}
+
+// CUDA kernel for ReLU
+__global__ void relu_kernel(half* input, int size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx < size) {
+    if (input[idx] < 0.0f) {
+      input[idx] = 0.0f;
+    }
+  }
+}
+
+// CUDA kernel for fully connected layer
+__global__ void fc_kernel(const half* input, const half* weight, half* output, int batch_size, int input_size, int output_size) {
+  int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int output_idx = threadIdx.y;
+
+  if (batch_idx < batch_size && output_idx < output_size) {
+    float sum = 0.0f;
+    for (int i = 0; i < input_size; ++i) {
+      sum += half_to_float(input[batch_idx * input_size + i]) * half_to_float(weight[output_idx * input_size + i]);
+    }
+    output[batch_idx * output_size + output_idx] = float_to_half(sum);
+  }
+}
+
+// CUDA kernel for cutmix
+__global__ void cutmix_kernel(const half* input1, const half* input2, const half* cutmix_mask, half* output, int batch_size, int channels, int height, int width, float lam) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx < batch_size * channels * height * width) {
+    output[idx] = half_to_float(input1[idx]) * lam + half_to_float(input2[idx]) * (1 - lam) * half_to_float(cutmix_mask[idx]);
+  }
+}
+
+extern "C" {
+void mixed_forward_int8_cutmix_adaptiveavgpool2d_gradient_clipping(int num_args, ...) {
+  va_list args;
+  va_start(args, num_args);
+
+  const float* input1 = va_arg(args, const float*);
+  int input1_dim0 = va_arg(args, int);
+  int input1_dim1 = va_arg(args, int);
+  int input1_dim2 = va_arg(args, int);
+  int input1_dim3 = va_arg(args, int);
+
+  const float* input2 = va_arg(args, const float*);
+  int input2_dim0 = va_arg(args, int);
+  int input2_dim1 = va_arg(args, int);
+  int input2_dim2 = va_arg(args, int);
+  int input2_dim3 = va_arg(args, int);
+
+  const int64_t* label1 = va_arg(args, const int64_t*);
+  int label1_dim0 = va_arg(args, int);
+
+  const int64_t* label2 = va_arg(args, const int64_t*);
+  int label2_dim0 = va_arg(args, int);
+
+  float* output = va_arg(args, float*);
+
+  va_end(args);
+
+  // Allocate device memory
+  half* d_input1, *d_input2, *d_cutmix_mask, *d_output, *d_conv1_output, *d_conv2_output, *d_conv3_output, *d_pool_output, *d_fc_output;
+  cudaMalloc(&d_input1, input1_dim0 * input1_dim1 * input1_dim2 * input1_dim3 * sizeof(half));
+  cudaMalloc(&d_input2, input2_dim0 * input2_dim1 * input2_dim2 * input2_dim3 * sizeof(half));
+  cudaMalloc(&d_cutmix_mask, input1_dim0 * input1_dim1 * input1_dim2 * input1_dim3 * sizeof(half));
+  cudaMalloc(&d_output, input1_dim0 * 10 * sizeof(half));
+  cudaMalloc(&d_conv1_output, input1_dim0 * 16 * input1_dim2 * input1_dim3 * sizeof(half));
+  cudaMalloc(&d_conv2_output, input1_dim0 * 32 * input1_dim2 * input1_dim3 * sizeof(half));
+  cudaMalloc(&d_conv3_output, input1_dim0 * 64 * input1_dim2 * input1_dim3 * sizeof(half));
+  cudaMalloc(&d_pool_output, input1_dim0 * 64 * sizeof(half));
+  cudaMalloc(&d_fc_output, input1_dim0 * 10 * sizeof(half));
+
+  // Copy input data to device
+  cudaMemcpy(d_input1, input1, input1_dim0 * input1_dim1 * input1_dim2 * input1_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_input2, input2, input2_dim0 * input2_dim1 * input2_dim2 * input2_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+
+  // Apply cutmix
+  float lam = 0.5f; // Example value
+  cutmix_kernel<<<(input1_dim0 * input1_dim1 * input1_dim2 * input1_dim3 + 1023) / 1024, 1024>>>(d_input1, d_input2, d_cutmix_mask, d_input1, input1_dim0, input1_dim1, input1_dim2, input1_dim3, lam);
+
+  // Convolution 1
+  const int kernel_size1 = 3;
+  const int stride1 = 1;
+  const int padding1 = 1;
+  const int output_channels1 = 16;
+  conv2d_kernel<<<(input1_dim0 * input1_dim2 / 16 + 15) / 16, dim3(16, 16, 1), (input1_dim3 + 31) / 32>>>(d_input1, (const half*)(&d_conv1_output), d_conv1_output, input1_dim0, input1_dim1, input1_dim2, input1_dim3, input1_dim2, input1_dim3, kernel_size1, stride1, padding1, output_channels1);
+  relu_kernel<<<(input1_dim0 * 16 * input1_dim2 * input1_dim3 + 1023) / 1024, 1024>>>(d_conv1_output, input1_dim0 * 16 * input1_dim2 * input1_dim3);
+
+  // Convolution 2
+  const int kernel_size2 = 3;
+  const int stride2 = 1;
+  const int padding2 = 1;
+  const int output_channels2 = 32;
+  conv2d_kernel<<<(input1_dim0 * input1_dim2 / 16 + 15) / 16, dim3(16, 16, 1), (input1_dim3 + 31) / 32>>>(d_conv1_output, (const half*)(&d_conv2_output), d_conv2_output, input1_dim0, 16, input1_dim2, input1_dim3, input1_dim2, input1_dim3, kernel_size2, stride2, padding2, output_channels2);
+  relu_kernel<<<(input1_dim0 * 32 * input1_dim2 * input1_dim3 + 1023) / 1024, 1024>>>(d_conv2_output, input1_dim0 * 32 * input1_dim2 * input1_dim3);
+
+  // Convolution 3
+  const int kernel_size3 = 3;
+  const int stride3 = 1;
+  const int padding3 = 1;
+  const int output_channels3 = 64;
+  conv2d_kernel<<<(input1_dim0 * input1_dim2 / 16 + 15) / 16, dim3(16, 16, 1), (input1_dim3 + 31) / 32>>>(d_conv2_output, (const half*)(&d_conv3_output), d_conv3_output, input1_dim0, 32, input1_dim2, input1_dim3, input1_dim2, input1_dim3, kernel_size3, stride3, padding3, output_channels3);
+  relu_kernel<<<(input1_dim0 * 64 * input1_dim2 * input1_dim3 + 1023) / 1024, 1024>>>(d_conv3_output, input1_dim0 * 64 * input1_dim2 * input1_dim3);
+
+  // Adaptive average pooling
+  adaptive_avg_pool2d_kernel<<<(input1_dim0 + 15) / 16, dim3(16, 16, 1)>>>(d_conv3_output, d_pool_output, input1_dim0, 64, input1_dim2, input1_dim3, 1, 1);
+
+  // Fully connected layer
+  fc_kernel<<<(input1_dim0 + 15) / 16, dim3(1, 10)>>>(d_pool_output, (const half*)(&d_fc_output), d_fc_output, input1_dim0, 64, 10);
+
+  // Copy result back to host
+  cudaMemcpy(output, d_fc_output, input1_dim0 * 10 * sizeof(half), cudaMemcpyDeviceToHost);
+
+  // Free device memory
+  cudaFree(d_input1);
+  cudaFree(d_input2);
+  cudaFree(d_cutmix_mask);
+  cudaFree(d_output);
+  cudaFree(d_conv1_output);
+  cudaFree(d_conv2_output);
+  cudaFree(d_conv3_output);
+  cudaFree(d_pool_output);
+  cudaFree(d_fc_output);
+}
+}
+```

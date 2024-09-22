@@ -1,0 +1,158 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Helper functions for converting between data types
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half(f);
+}
+
+__device__ __forceinline__ float half_to_float(half hf) {
+    return __half2float(hf);
+}
+
+// CUDA kernel for complex bilinear interpolation with bfloat16
+__global__ void complex_bilinear_interp_kernel_bf16(
+    const float* input_tensor, const float* weights, const float* grid, 
+    half* output, int batch_size, int height, int width, int output_height, int output_width,
+    int mode) {
+
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch_size && y < output_height && x < output_width) {
+        // Get grid coordinates
+        float gx = grid[b * height * width * 2 + y * width * 2 + x * 2];
+        float gy = grid[b * height * width * 2 + y * width * 2 + x * 2 + 1];
+
+        // Calculate bilinear interpolation indices
+        int x0 = floorf(gx);
+        int y0 = floorf(gy);
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+
+        // Clamp indices within bounds
+        x0 = max(0, min(x0, width - 1));
+        y0 = max(0, min(y0, height - 1));
+        x1 = max(0, min(x1, width - 1));
+        y1 = max(0, min(y1, height - 1));
+
+        // Bilinear interpolation weights
+        float w00 = (x1 - gx) * (y1 - gy);
+        float w01 = (x1 - gx) * (gy - y0);
+        float w10 = (gx - x0) * (y1 - gy);
+        float w11 = (gx - x0) * (gy - y0);
+
+        // Perform interpolation
+        half sum_real = 0.0f, sum_imag = 0.0f;
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                int idx = b * height * width * 2 + (y0 + i) * width * 2 + (x0 + j) * 2 + i;
+                __nv_bfloat16 real_bf16 = float_to_bfloat16(input_tensor[idx]);
+                __nv_bfloat16 imag_bf16 = float_to_bfloat16(input_tensor[idx + 1]);
+
+                float weight = (i == 0 && j == 0) ? w00 :
+                              (i == 0 && j == 1) ? w01 :
+                              (i == 1 && j == 0) ? w10 : w11;
+
+                // Apply weights
+                sum_real += float_to_half(bfloat16_to_float(real_bf16) * weight);
+                sum_imag += float_to_half(bfloat16_to_float(imag_bf16) * weight);
+            }
+        }
+
+        // Multiply by weights
+        sum_real *= float_to_half(weights[b * height * width + y * width + x]);
+        sum_imag *= float_to_half(weights[b * height * width + y * width + x]);
+
+        // Store result
+        output[b * output_height * output_width * 2 + y * output_width * 2 + x * 2] = sum_real;
+        output[b * output_height * output_width * 2 + y * output_width * 2 + x * 2 + 1] = sum_imag;
+    }
+}
+
+extern "C" {
+
+void complex_bilinear_interp_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract weights tensor
+    const float* weights = va_arg(args, const float*);
+    int weights_dim0 = va_arg(args, int);
+    int weights_dim1 = va_arg(args, int);
+    int weights_dim2 = va_arg(args, int);
+
+    // Extract grid tensor
+    const float* grid = va_arg(args, const float*);
+    int grid_dim0 = va_arg(args, int);
+    int grid_dim1 = va_arg(args, int);
+    int grid_dim2 = va_arg(args, int);
+    int grid_dim3 = va_arg(args, int);
+
+    // Extract output size
+    int output_height = va_arg(args, int);
+    int output_width = va_arg(args, int);
+
+    // Extract mode
+    int mode = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    half* output = va_arg(args, half*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input_tensor, *d_weights, *d_grid;
+    half *d_output;
+    cudaMalloc(&d_input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float));
+    cudaMalloc(&d_weights, weights_dim0 * weights_dim1 * weights_dim2 * sizeof(float));
+    cudaMalloc(&d_grid, grid_dim0 * grid_dim1 * grid_dim2 * grid_dim3 * sizeof(float));
+    cudaMalloc(&d_output, input_tensor_dim0 * output_height * output_width * 2 * sizeof(half));
+
+    // Copy data to device
+    cudaMemcpy(d_input_tensor, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, weights, weights_dim0 * weights_dim1 * weights_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_grid, grid, grid_dim0 * grid_dim1 * grid_dim2 * grid_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((output_width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (output_height + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (input_tensor_dim0 + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    complex_bilinear_interp_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input_tensor, d_weights, d_grid, d_output, input_tensor_dim0, input_tensor_dim2, input_tensor_dim3,
+        output_height, output_width, mode
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, input_tensor_dim0 * output_height * output_width * 2 * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input_tensor);
+    cudaFree(d_weights);
+    cudaFree(d_grid);
+    cudaFree(d_output);
+}
+
+} // extern "C"

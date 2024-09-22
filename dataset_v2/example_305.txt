@@ -1,0 +1,455 @@
+```python
+import torch
+
+def complex_tensor_operation(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on a tensor, including:
+    - Repeat the input tensor along a specific dimension
+    - Perform an element-wise multiplication and addition (addcmul)
+    - Quantize the result to int8 and then back to fp16
+    - Apply a 1D convolution with specified kernel size and stride
+    - Perform bucket-based quantization and cast to bfloat16
+    - Finally, return the result.
+    """
+
+    # Repeat the input tensor along dimension 1
+    repeated_tensor = input_tensor.repeat(1, 3, 1)
+
+    # Element-wise multiplication and addition
+    output = torch.addcmul(repeated_tensor, bias, weight)
+
+    # Quantize to int8 and then back to fp16
+    output_int8 = output.to(torch.int8)
+    output_fp16 = output_int8.to(torch.float16)
+
+    # 1D convolution
+    kernel = torch.randn(1, 1, 3, dtype=torch.float16)
+    output = torch.nn.functional.conv1d(output_fp16, kernel, stride=2)
+
+    # Bucket-based quantization and cast to bfloat16
+    buckets = torch.arange(-1.0, 1.0, 0.2, dtype=torch.float16)
+    output = torch.bucketize(output, buckets).to(torch.bfloat16)
+
+    return output
+
+function_signature = {
+    "name": "complex_tensor_operation",
+    "inputs": [
+        ((1, 1, 10), torch.float32),
+        ((1, 1, 10), torch.float32),
+        ((1, 1, 1), torch.float32),
+    ],
+    "outputs": [
+        ((1, 1, 5), torch.bfloat16),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for type conversions
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half(f);
+}
+__device__ __forceinline__ float half_to_float(half hf) {
+    return __half2float(hf);
+}
+
+// Kernel for 1D convolution with fp16
+__global__ void conv1d_fp16_kernel(const half* input, const half* kernel, half* output, 
+                                   int batch, int in_channels, int input_size, int kernel_size,
+                                   int output_size, int stride) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch && o < output_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < kernel_size; ++i) {
+            int input_idx = b * in_channels * input_size + o * stride + i;
+            int kernel_idx = i;
+            sum += half_to_float(input[input_idx]) * half_to_float(kernel[kernel_idx]);
+        }
+        output[b * in_channels * output_size + o] = float_to_half(sum);
+    }
+}
+
+// Kernel for bucket-based quantization
+__global__ void bucket_quantization_kernel(const float* input, const float* buckets, int* output,
+                                        int batch, int in_channels, int output_size, int num_buckets) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch && o < output_size) {
+        int bucket_idx = 0;
+        float value = input[b * in_channels * output_size + o];
+        while (bucket_idx < num_buckets - 1 && value >= buckets[bucket_idx + 1]) {
+            bucket_idx++;
+        }
+        output[b * in_channels * output_size + o] = bucket_idx;
+    }
+}
+
+extern "C" {
+    
+    void complex_tensor_operation(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        // Extract input tensors
+        const float* input_tensor = va_arg(args, const float*);
+        int input_tensor_dim0 = va_arg(args, int);
+        int input_tensor_dim1 = va_arg(args, int);
+        int input_tensor_dim2 = va_arg(args, int);
+
+        const float* weight = va_arg(args, const float*);
+        int weight_dim0 = va_arg(args, int);
+        int weight_dim1 = va_arg(args, int);
+        int weight_dim2 = va_arg(args, int);
+
+        const float* bias = va_arg(args, const float*);
+        int bias_dim0 = va_arg(args, int);
+        int bias_dim1 = va_arg(args, int);
+        int bias_dim2 = va_arg(args, int);
+
+        // Extract output tensor (assuming it's preallocated)
+        __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+        va_end(args);
+
+        int batch_size = input_tensor_dim0;
+        int in_channels = input_tensor_dim1;
+        int input_size = input_tensor_dim2;
+
+        int kernel_size = 3;
+        int stride = 2;
+        int output_size = (input_size - kernel_size) / stride + 1;
+        int num_buckets = 10; // Number of buckets for quantization
+
+        // Allocate device memory
+        float *d_input, *d_weight, *d_bias, *d_output_fp16;
+        int *d_output_int8, *d_output_buckets;
+        half *d_output_conv;
+        float *d_buckets; 
+
+        cudaMalloc(&d_input, batch_size * in_channels * input_size * sizeof(float));
+        cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * weight_dim2 * sizeof(float));
+        cudaMalloc(&d_bias, bias_dim0 * bias_dim1 * bias_dim2 * sizeof(float));
+        cudaMalloc(&d_output_fp16, batch_size * in_channels * output_size * sizeof(float));
+        cudaMalloc(&d_output_int8, batch_size * in_channels * output_size * sizeof(int));
+        cudaMalloc(&d_output_buckets, batch_size * in_channels * output_size * sizeof(int));
+        cudaMalloc(&d_output_conv, batch_size * in_channels * output_size * sizeof(half));
+        cudaMalloc(&d_buckets, num_buckets * sizeof(float)); 
+
+        // Copy data to device
+        cudaMemcpy(d_input, input_tensor, batch_size * in_channels * input_size * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * weight_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_bias, bias, bias_dim0 * bias_dim1 * bias_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Create buckets on the device
+        float buckets_host[] = {-1.0f, -0.8f, -0.6f, -0.4f, -0.2f, 0.0f, 0.2f, 0.4f, 0.6f, 0.8f};
+        cudaMemcpy(d_buckets, buckets_host, num_buckets * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Repeat the input tensor along dimension 1
+        cudaMemcpy(d_output_fp16, d_input, batch_size * in_channels * input_size * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        // Element-wise multiplication and addition
+        // (Assuming weight and bias are 1x1x1 tensors for simplicity)
+        cudaMemcpy(d_output_fp16, d_input, batch_size * in_channels * input_size * sizeof(float), cudaMemcpyDeviceToDevice); // Reset output to input
+        for (int b = 0; b < batch_size; b++) {
+            for (int c = 0; c < in_channels; c++) {
+                for (int i = 0; i < input_size; i++) {
+                    d_output_fp16[b * in_channels * input_size + c * input_size + i] = d_input[b * in_channels * input_size + c * input_size + i] + d_weight[0] * d_bias[0] * d_input[b * in_channels * input_size + c * input_size + i];
+                }
+            }
+        }
+
+        // Quantize to int8 and then back to fp16
+        // Assuming quantization is done to range [-128, 127] for simplicity
+        for (int b = 0; b < batch_size; b++) {
+            for (int c = 0; c < in_channels; c++) {
+                for (int i = 0; i < input_size; i++) {
+                    d_output_int8[b * in_channels * input_size + c * input_size + i] = static_cast<int>(d_output_fp16[b * in_channels * input_size + c * input_size + i] * 127.0f);
+                    d_output_fp16[b * in_channels * input_size + c * input_size + i] = static_cast<float>(d_output_int8[b * in_channels * input_size + c * input_size + i]) / 127.0f;
+                }
+            }
+        }
+
+        // Launch kernel for 1D convolution with fp16
+        dim3 threadsPerBlock(32, 32);
+        dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                    (output_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+        conv1d_fp16_kernel<<<numBlocks, threadsPerBlock>>>(d_output_fp16, (half*)d_weight, d_output_conv,
+                                                   batch_size, in_channels, input_size, kernel_size,
+                                                   output_size, stride);
+
+        // Launch kernel for bucket-based quantization
+        dim3 threadsPerBlock_q(32, 32);
+        dim3 numBlocks_q((batch_size + threadsPerBlock_q.x - 1) / threadsPerBlock_q.x,
+                         (output_size + threadsPerBlock_q.y - 1) / threadsPerBlock_q.y);
+
+        bucket_quantization_kernel<<<numBlocks_q, threadsPerBlock_q>>>(d_output_conv, d_buckets, d_output_buckets,
+                                                   batch_size, in_channels, output_size, num_buckets);
+
+        // Convert the quantized output to bfloat16
+        for (int b = 0; b < batch_size; b++) {
+            for (int c = 0; c < in_channels; c++) {
+                for (int i = 0; i < output_size; i++) {
+                    output[b * in_channels * output_size + c * output_size + i] = float_to_bfloat16(static_cast<float>(d_output_buckets[b * in_channels * output_size + c * output_size + i]));
+                }
+            }
+        }
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_weight);
+        cudaFree(d_bias);
+        cudaFree(d_output_fp16);
+        cudaFree(d_output_int8);
+        cudaFree(d_output_buckets);
+        cudaFree(d_output_conv);
+        cudaFree(d_buckets);
+    }
+}
+```
+
+**func.py**
+
+```python
+import torch
+
+def complex_tensor_operation(input_tensor: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """
+    Performs a series of operations on a tensor, including:
+    - Repeat the input tensor along a specific dimension
+    - Perform an element-wise multiplication and addition (addcmul)
+    - Quantize the result to int8 and then back to fp16
+    - Apply a 1D convolution with specified kernel size and stride
+    - Perform bucket-based quantization and cast to bfloat16
+    - Finally, return the result.
+    """
+
+    # Repeat the input tensor along dimension 1
+    repeated_tensor = input_tensor.repeat(1, 3, 1)
+
+    # Element-wise multiplication and addition
+    output = torch.addcmul(repeated_tensor, bias, weight)
+
+    # Quantize to int8 and then back to fp16
+    output_int8 = output.to(torch.int8)
+    output_fp16 = output_int8.to(torch.float16)
+
+    # 1D convolution
+    kernel = torch.randn(1, 1, 3, dtype=torch.float16)
+    output = torch.nn.functional.conv1d(output_fp16, kernel, stride=2)
+
+    # Bucket-based quantization and cast to bfloat16
+    buckets = torch.arange(-1.0, 1.0, 0.2, dtype=torch.float16)
+    output = torch.bucketize(output, buckets).to(torch.bfloat16)
+
+    return output
+
+function_signature = {
+    "name": "complex_tensor_operation",
+    "inputs": [
+        ((1, 1, 10), torch.float32),
+        ((1, 1, 10), torch.float32),
+        ((1, 1, 1), torch.float32),
+    ],
+    "outputs": [
+        ((1, 1, 5), torch.bfloat16),
+    ]
+}
+```
+
+**func.cu**
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for type conversions
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half(f);
+}
+__device__ __forceinline__ float half_to_float(half hf) {
+    return __half2float(hf);
+}
+
+// Kernel for 1D convolution with fp16
+__global__ void conv1d_fp16_kernel(const half* input, const half* kernel, half* output, 
+                                   int batch, int in_channels, int input_size, int kernel_size,
+                                   int output_size, int stride) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch && o < output_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < kernel_size; ++i) {
+            int input_idx = b * in_channels * input_size + o * stride + i;
+            int kernel_idx = i;
+            sum += half_to_float(input[input_idx]) * half_to_float(kernel[kernel_idx]);
+        }
+        output[b * in_channels * output_size + o] = float_to_half(sum);
+    }
+}
+
+// Kernel for bucket-based quantization
+__global__ void bucket_quantization_kernel(const float* input, const float* buckets, int* output,
+                                        int batch, int in_channels, int output_size, int num_buckets) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (b < batch && o < output_size) {
+        int bucket_idx = 0;
+        float value = input[b * in_channels * output_size + o];
+        while (bucket_idx < num_buckets - 1 && value >= buckets[bucket_idx + 1]) {
+            bucket_idx++;
+        }
+        output[b * in_channels * output_size + o] = bucket_idx;
+    }
+}
+
+extern "C" {
+    
+    void complex_tensor_operation(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        // Extract input tensors
+        const float* input_tensor = va_arg(args, const float*);
+        int input_tensor_dim0 = va_arg(args, int);
+        int input_tensor_dim1 = va_arg(args, int);
+        int input_tensor_dim2 = va_arg(args, int);
+
+        const float* weight = va_arg(args, const float*);
+        int weight_dim0 = va_arg(args, int);
+        int weight_dim1 = va_arg(args, int);
+        int weight_dim2 = va_arg(args, int);
+
+        const float* bias = va_arg(args, const float*);
+        int bias_dim0 = va_arg(args, int);
+        int bias_dim1 = va_arg(args, int);
+        int bias_dim2 = va_arg(args, int);
+
+        // Extract output tensor (assuming it's preallocated)
+        __nv_bfloat16* output = va_arg(args, __nv_bfloat16*);
+
+        va_end(args);
+
+        int batch_size = input_tensor_dim0;
+        int in_channels = input_tensor_dim1;
+        int input_size = input_tensor_dim2;
+
+        int kernel_size = 3;
+        int stride = 2;
+        int output_size = (input_size - kernel_size) / stride + 1;
+        int num_buckets = 10; // Number of buckets for quantization
+
+        // Allocate device memory
+        float *d_input, *d_weight, *d_bias, *d_output_fp16;
+        int *d_output_int8, *d_output_buckets;
+        half *d_output_conv;
+        float *d_buckets; 
+
+        cudaMalloc(&d_input, batch_size * in_channels * input_size * sizeof(float));
+        cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * weight_dim2 * sizeof(float));
+        cudaMalloc(&d_bias, bias_dim0 * bias_dim1 * bias_dim2 * sizeof(float));
+        cudaMalloc(&d_output_fp16, batch_size * in_channels * output_size * sizeof(float));
+        cudaMalloc(&d_output_int8, batch_size * in_channels * output_size * sizeof(int));
+        cudaMalloc(&d_output_buckets, batch_size * in_channels * output_size * sizeof(int));
+        cudaMalloc(&d_output_conv, batch_size * in_channels * output_size * sizeof(half));
+        cudaMalloc(&d_buckets, num_buckets * sizeof(float)); 
+
+        // Copy data to device
+        cudaMemcpy(d_input, input_tensor, batch_size * in_channels * input_size * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * weight_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_bias, bias, bias_dim0 * bias_dim1 * bias_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Create buckets on the device
+        float buckets_host[] = {-1.0f, -0.8f, -0.6f, -0.4f, -0.2f, 0.0f, 0.2f, 0.4f, 0.6f, 0.8f};
+        cudaMemcpy(d_buckets, buckets_host, num_buckets * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Repeat the input tensor along dimension 1
+        cudaMemcpy(d_output_fp16, d_input, batch_size * in_channels * input_size * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        // Element-wise multiplication and addition
+        // (Assuming weight and bias are 1x1x1 tensors for simplicity)
+        cudaMemcpy(d_output_fp16, d_input, batch_size * in_channels * input_size * sizeof(float), cudaMemcpyDeviceToDevice); // Reset output to input
+        for (int b = 0; b < batch_size; b++) {
+            for (int c = 0; c < in_channels; c++) {
+                for (int i = 0; i < input_size; i++) {
+                    d_output_fp16[b * in_channels * input_size + c * input_size + i] = d_input[b * in_channels * input_size + c * input_size + i] + d_weight[0] * d_bias[0] * d_input[b * in_channels * input_size + c * input_size + i];
+                }
+            }
+        }
+
+        // Quantize to int8 and then back to fp16
+        // Assuming quantization is done to range [-128, 127] for simplicity
+        for (int b = 0; b < batch_size; b++) {
+            for (int c = 0; c < in_channels; c++) {
+                for (int i = 0; i < input_size; i++) {
+                    d_output_int8[b * in_channels * input_size + c * input_size + i] = static_cast<int>(d_output_fp16[b * in_channels * input_size + c * input_size + i] * 127.0f);
+                    d_output_fp16[b * in_channels * input_size + c * input_size + i] = static_cast<float>(d_output_int8[b * in_channels * input_size + c * input_size + i]) / 127.0f;
+                }
+            }
+        }
+
+        // Launch kernel for 1D convolution with fp16
+        dim3 threadsPerBlock(32, 32);
+        dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                    (output_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+        conv1d_fp16_kernel<<<numBlocks, threadsPerBlock>>>(d_output_fp16, (half*)d_weight, d_output_conv,
+                                                   batch_size, in_channels, input_size, kernel_size,
+                                                   output_size, stride);
+
+        // Launch kernel for bucket-based quantization
+        dim3 threadsPerBlock_q(32, 32);
+        dim3 numBlocks_q((batch_size + threadsPerBlock_q.x - 1) / threadsPerBlock_q.x,
+                         (output_size + threadsPerBlock_q.y - 1) / threadsPerBlock_q.y);
+
+        bucket_quantization_kernel<<<numBlocks_q, threadsPerBlock_q>>>(d_output_conv, d_buckets, d_output_buckets,
+                                                   batch_size, in_channels, output_size, num_buckets);
+
+        // Convert the quantized output to bfloat16
+        for (int b = 0; b < batch_size; b++) {
+            for (int c = 0; c < in_channels; c++) {
+                for (int i = 0; i < output_size; i++) {
+                    output[b * in_channels * output_size + c * output_size + i] = float_to_bfloat16(static_cast<float>(d_output_buckets[b * in_channels * output_size + c * output_size + i]));
+                }
+            }
+        }
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_weight);
+        cudaFree(d_bias);
+        cudaFree(d_output_fp16);
+        cudaFree(d_output_int8);
+        cudaFree(d_output_buckets);
+        cudaFree(d_output_conv);
+        cudaFree(d_buckets);
+    }
+}
+```

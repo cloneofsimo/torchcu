@@ -1,0 +1,64 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// CUDA kernel for repeating a tensor along the first dimension
+__global__ void repeat_tensor_kernel(const half* input, half* output, int batch_size, int rows, int cols, int repeat_times) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < repeat_times * batch_size && col < cols) {
+        int original_row = row % batch_size;
+        output[row * cols + col] = input[original_row * cols + col];
+    }
+}
+
+extern "C" {
+
+void repeat_tensor_fp16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+    int input_dim2 = va_arg(args, int);
+
+    // Extract repeat times
+    int repeat_times = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int rows = input_dim1;
+    int cols = input_dim2;
+
+    // Allocate device memory
+    half *d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * rows * cols * sizeof(half));
+    cudaMalloc(&d_output, repeat_times * batch_size * rows * cols * sizeof(half));
+
+    // Copy input data to device (converting to half)
+    cudaMemcpy(d_input, input, batch_size * rows * cols * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((cols + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (repeat_times * batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    repeat_tensor_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, batch_size, rows, cols, repeat_times);
+
+    // Copy result back to host (converting from half)
+    cudaMemcpy(output, d_output, repeat_times * batch_size * rows * cols * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

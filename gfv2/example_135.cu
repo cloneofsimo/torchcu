@@ -1,0 +1,143 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function for converting float to half
+__device__ __forceinline__ half float_to_half(float f) {
+  return __float2half_rn(f);
+}
+
+// Helper function for converting half to float
+__device__ __forceinline__ float half_to_float(half h) {
+  return __half2float(h);
+}
+
+// CUDA kernel for transposed convolution
+__global__ void transposed_conv3d_kernel(const float* input, const float* weight, const float* bias,
+                                       float* output, int batch_size, int in_channels,
+                                       int D_in, int H_in, int W_in, int out_channels,
+                                       int kernel_D, int kernel_H, int kernel_W,
+                                       int stride_D, int stride_H, int stride_W,
+                                       int padding_D, int padding_H, int padding_W) {
+  int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+  int out_channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+  int D_out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (batch_idx < batch_size && out_channel_idx < out_channels && D_out_idx < D_in + 2 * padding_D - kernel_D + 1) {
+    int D_out = D_out_idx * stride_D - padding_D;
+    for (int H_out = 0; H_out < H_in + 2 * padding_H - kernel_H + 1; H_out++) {
+      for (int W_out = 0; W_out < W_in + 2 * padding_W - kernel_W + 1; W_out++) {
+        half sum = 0.0f;
+        for (int in_channel_idx = 0; in_channel_idx < in_channels; in_channel_idx++) {
+          for (int kernel_d = 0; kernel_d < kernel_D; kernel_d++) {
+            for (int kernel_h = 0; kernel_h < kernel_H; kernel_h++) {
+              for (int kernel_w = 0; kernel_w < kernel_W; kernel_w++) {
+                int input_d = D_out + kernel_d - padding_D;
+                int input_h = H_out + kernel_h - padding_H;
+                int input_w = W_out + kernel_w - padding_W;
+                if (input_d >= 0 && input_d < D_in &&
+                    input_h >= 0 && input_h < H_in &&
+                    input_w >= 0 && input_w < W_in) {
+                  int input_idx = batch_idx * in_channels * D_in * H_in * W_in +
+                                 in_channel_idx * D_in * H_in * W_in +
+                                 input_d * H_in * W_in +
+                                 input_h * W_in + input_w;
+                  int weight_idx = in_channel_idx * out_channels * kernel_D * kernel_H * kernel_W +
+                                  out_channel_idx * kernel_D * kernel_H * kernel_W +
+                                  kernel_d * kernel_H * kernel_W +
+                                  kernel_h * kernel_W + kernel_w;
+
+                  sum += float_to_half(input[input_idx]) * float_to_half(weight[weight_idx]);
+                }
+              }
+            }
+          }
+        }
+        sum += float_to_half(bias[out_channel_idx]);
+
+        output[batch_idx * out_channels * (D_in + 2 * padding_D - kernel_D + 1) * (H_in + 2 * padding_H - kernel_H + 1) * (W_in + 2 * padding_W - kernel_W + 1) +
+                out_channel_idx * (D_in + 2 * padding_D - kernel_D + 1) * (H_in + 2 * padding_H - kernel_H + 1) * (W_in + 2 * padding_W - kernel_W + 1) +
+                D_out_idx * (H_in + 2 * padding_H - kernel_H + 1) * (W_in + 2 * padding_W - kernel_W + 1) +
+                H_out * (W_in + 2 * padding_W - kernel_W + 1) + W_out] = half_to_float(sum);
+      }
+    }
+  }
+}
+
+extern "C" {
+
+void transposed_conv3d_envelope_fp16(int num_args, ...) {
+  va_list args;
+  va_start(args, num_args);
+
+  // Extract inputs
+  const float* input = va_arg(args, const float*);
+  int input_dim0 = va_arg(args, int);
+  int input_dim1 = va_arg(args, int);
+  int input_dim2 = va_arg(args, int);
+  int input_dim3 = va_arg(args, int);
+  int input_dim4 = va_arg(args, int);
+
+  const float* weight = va_arg(args, const float*);
+  int weight_dim0 = va_arg(args, int);
+  int weight_dim1 = va_arg(args, int);
+  int weight_dim2 = va_arg(args, int);
+  int weight_dim3 = va_arg(args, int);
+  int weight_dim4 = va_arg(args, int);
+
+  const float* bias = va_arg(args, const float*);
+  int bias_dim0 = va_arg(args, int);
+
+  int stride_D = va_arg(args, int);
+  int stride_H = va_arg(args, int);
+  int stride_W = va_arg(args, int);
+
+  int padding_D = va_arg(args, int);
+  int padding_H = va_arg(args, int);
+  int padding_W = va_arg(args, int);
+
+  // Extract output
+  float* output = va_arg(args, float*);
+
+  va_end(args);
+
+  // Allocate device memory
+  float* d_input;
+  float* d_weight;
+  float* d_bias;
+  float* d_output;
+  cudaMalloc(&d_input, input_dim0 * input_dim1 * input_dim2 * input_dim3 * input_dim4 * sizeof(float));
+  cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * weight_dim2 * weight_dim3 * weight_dim4 * sizeof(float));
+  cudaMalloc(&d_bias, bias_dim0 * sizeof(float));
+  cudaMalloc(&d_output, input_dim0 * weight_dim1 * (input_dim2 + 2 * padding_D - weight_dim2 + 1) * (input_dim3 + 2 * padding_H - weight_dim3 + 1) * (input_dim4 + 2 * padding_W - weight_dim4 + 1) * sizeof(float));
+
+  // Copy inputs to device
+  cudaMemcpy(d_input, input, input_dim0 * input_dim1 * input_dim2 * input_dim3 * input_dim4 * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * weight_dim2 * weight_dim3 * weight_dim4 * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_bias, bias, bias_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+  // Launch kernel
+  dim3 threadsPerBlock(8, 8, 1);
+  dim3 numBlocks((input_dim2 + 2 * padding_D - weight_dim2 + 1 + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                  (weight_dim1 + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                  (input_dim0 + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+  transposed_conv3d_kernel<<<numBlocks, threadsPerBlock>>>(
+      d_input, d_weight, d_bias, d_output, input_dim0, input_dim1, input_dim2, input_dim3, input_dim4,
+      weight_dim1, weight_dim2, weight_dim3, weight_dim4, stride_D, stride_H, stride_W,
+      padding_D, padding_H, padding_W
+  );
+
+  // Copy output to host
+  cudaMemcpy(output, d_output, input_dim0 * weight_dim1 * (input_dim2 + 2 * padding_D - weight_dim2 + 1) * (input_dim3 + 2 * padding_H - weight_dim3 + 1) * (input_dim4 + 2 * padding_W - weight_dim4 + 1) * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Free device memory
+  cudaFree(d_input);
+  cudaFree(d_weight);
+  cudaFree(d_bias);
+  cudaFree(d_output);
+}
+
+}  // extern "C"

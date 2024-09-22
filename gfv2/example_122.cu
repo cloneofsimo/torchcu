@@ -1,0 +1,203 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>  // For expf
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for 3D convolution
+__global__ void conv3d_kernel_bf16(const float* input, const float* weight, const float* bias, float* output,
+                                 int batch_size, int in_channels, int out_channels, int D, int H, int W,
+                                 int kernel_D, int kernel_H, int kernel_W, int padding_D, int padding_H, int padding_W,
+                                 int stride_D, int stride_H, int stride_W) {
+    int out_D = (D + 2 * padding_D - kernel_D) / stride_D + 1;
+    int out_H = (H + 2 * padding_H - kernel_H) / stride_H + 1;
+    int out_W = (W + 2 * padding_W - kernel_W) / stride_W + 1;
+
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (b < batch_size && o < out_channels && d < out_D && o < out_H && d < out_W) {
+        int out_idx = b * out_channels * out_D * out_H * out_W + o * out_D * out_H * out_W + d * out_H * out_W + h * out_W + w;
+        output[out_idx] = bias[o];  // Initialize with bias
+
+        // Iterate over kernel elements
+        for (int k = 0; k < in_channels; ++k) {
+            for (int kd = 0; kd < kernel_D; ++kd) {
+                for (int kh = 0; kh < kernel_H; ++kh) {
+                    for (int kw = 0; kw < kernel_W; ++kw) {
+                        // Calculate input indices for convolution
+                        int id = d * stride_D + kd - padding_D;
+                        int ih = h * stride_H + kh - padding_H;
+                        int iw = w * stride_W + kw - padding_W;
+
+                        // Check if input indices are valid
+                        if (id >= 0 && id < D && ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                            int in_idx = b * in_channels * D * H * W + k * D * H * W + id * H * W + ih * W + iw;
+                            int weight_idx = o * in_channels * kernel_D * kernel_H * kernel_W + k * kernel_D * kernel_H * kernel_W + kd * kernel_H * kernel_W + kh * kernel_W + kw;
+
+                            // Apply convolution operation
+                            __nv_bfloat16 a = float_to_bfloat16(input[in_idx]);
+                            __nv_bfloat16 b = float_to_bfloat16(weight[weight_idx]);
+                            output[out_idx] += bfloat16_to_float(__hmul(a, b));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// CUDA kernel for log softmax with temperature scaling
+__global__ void log_softmax_kernel(const float* input, float* output, int batch_size, int channels, int D, int H, int W, float temperature) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.z * blockDim.z + threadIdx.z;
+    int h = threadIdx.z;
+    int w = threadIdx.w;
+
+    if (b < batch_size && c < channels && d < D && h < H && w < W) {
+        int idx = b * channels * D * H * W + c * D * H * W + d * H * W + h * W + w;
+        float max_val = input[idx];
+        for (int i = 0; i < channels; ++i) {
+            int temp_idx = b * channels * D * H * W + i * D * H * W + d * H * W + h * W + w;
+            max_val = fmaxf(max_val, input[temp_idx]);
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < channels; ++i) {
+            int temp_idx = b * channels * D * H * W + i * D * H * W + d * H * W + h * W + w;
+            sum += expf((input[temp_idx] - max_val) / temperature);
+        }
+
+        output[idx] = (input[idx] - max_val) / temperature - logf(sum); 
+    }
+}
+
+// CUDA kernel for rolling along the last dimension
+__global__ void roll_kernel(const float* input, float* output, int batch_size, int channels, int D, int H, int W) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.z * blockDim.z + threadIdx.z;
+    int h = threadIdx.z;
+    int w = threadIdx.w;
+
+    if (b < batch_size && c < channels && d < D && h < H && w < W) {
+        int idx = b * channels * D * H * W + c * D * H * W + d * H * W + h * W + w;
+        int shifted_w = (w + 1) % W; // Roll by 1 position
+        int shifted_idx = b * channels * D * H * W + c * D * H * W + d * H * W + h * W + shifted_w;
+        output[shifted_idx] = input[idx]; 
+    }
+}
+
+extern "C" {
+
+void conv3d_log_softmax_roll_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+    int input_dim2 = va_arg(args, int);
+    int input_dim3 = va_arg(args, int);
+    int input_dim4 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+    int weight_dim3 = va_arg(args, int);
+    int weight_dim4 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract temperature
+    float temperature = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int in_channels = input_dim1;
+    int out_channels = weight_dim0;
+    int D = input_dim2;
+    int H = input_dim3;
+    int W = input_dim4;
+
+    int kernel_D = weight_dim2;
+    int kernel_H = weight_dim3;
+    int kernel_W = weight_dim4;
+
+    int padding_D = 1; // Example padding, adjust as needed
+    int padding_H = 1;
+    int padding_W = 1;
+
+    int stride_D = 1; // Example stride, adjust as needed
+    int stride_H = 1;
+    int stride_W = 1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output;
+    cudaMalloc(&d_input, batch_size * in_channels * D * H * W * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * in_channels * kernel_D * kernel_H * kernel_W * sizeof(float));
+    cudaMalloc(&d_bias, out_channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * D * H * W * sizeof(float));
+
+    // Copy data to device
+    cudaMemcpy(d_input, input, batch_size * in_channels * D * H * W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, out_channels * in_channels * kernel_D * kernel_H * kernel_W * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, out_channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch conv3d kernel
+    dim3 threadsPerBlock(16, 16, 4); // Adjust thread block size as needed
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (D + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    conv3d_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output, batch_size, in_channels, out_channels, D, H, W,
+        kernel_D, kernel_H, kernel_W, padding_D, padding_H, padding_W, stride_D, stride_H, stride_W
+    );
+
+    // Launch log_softmax kernel
+    threadsPerBlock = dim3(16, 16, 4);
+    numBlocks = dim3((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (D + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    log_softmax_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_output, batch_size, out_channels, D, H, W, temperature);
+
+    // Launch roll kernel
+    threadsPerBlock = dim3(16, 16, 4);
+    numBlocks = dim3((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (out_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (D + threadsPerBlock.z - 1) / threadsPerBlock.z);
+    roll_kernel<<<numBlocks, threadsPerBlock>>>(d_output, d_output, batch_size, out_channels, D, H, W);
+
+    // Copy output back to host
+    cudaMemcpy(output, d_output, batch_size * out_channels * D * H * W * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}

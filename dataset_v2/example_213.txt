@@ -1,0 +1,110 @@
+```python
+import torch
+
+def scatter_logspace_geglu_function(input_tensor: torch.Tensor, indices: torch.Tensor, base: float) -> torch.Tensor:
+    """
+    Performs a scatter operation on a logspace tensor followed by a GEGLU activation.
+    """
+    logspace_tensor = torch.logspace(0, 1, input_tensor.shape[1], base=base)
+    scattered_tensor = torch.scatter(logspace_tensor.unsqueeze(0).repeat(input_tensor.shape[0], 1), 1, indices, input_tensor)
+    geglu_output = torch.nn.functional.gelu(scattered_tensor)
+    return geglu_output
+
+function_signature = {
+    "name": "scatter_logspace_geglu_function",
+    "inputs": [
+        ((10, 5), torch.float32),
+        ((10,), torch.int64),
+        (float)
+    ],
+    "outputs": [
+        ((10, 5), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <math.h>  
+#include <stdarg.h>
+
+// Helper function for log space calculation
+__device__ __forceinline__ float log_space(float start, float end, int num, float base) {
+    return powf(base, start + (end - start) * (float(num) / (num - 1)));
+}
+
+// Helper function for GEGLU activation
+__device__ __forceinline__ float geglu(float x) {
+    return x * (1.0f + torch::erf(x / sqrtf(2.0f)));
+}
+
+// CUDA kernel for scatter operation on log space tensor followed by GEGLU
+__global__ void scatter_logspace_geglu_kernel(const float* input_tensor, const int* indices, float* output,
+                                              int batch_size, int input_size, float base) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < batch_size) {
+        for (int j = 0; j < input_size; ++j) {
+            int index = indices[i];
+            if (index >= 0 && index < input_size) {
+                output[i * input_size + j] = input_tensor[i * input_size + j];
+            }
+            else {
+                output[i * input_size + j] = log_space(0.0f, 1.0f, j, base);
+            }
+            output[i * input_size + j] = geglu(output[i * input_size + j]);
+        }
+    }
+}
+
+extern "C" {
+
+void scatter_logspace_geglu_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract indices tensor
+    const int* indices = va_arg(args, const int*);
+
+    // Extract base value
+    float base = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_size = input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * input_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * input_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int threadsPerBlock = 256;
+    int numBlocks = (batch_size + threadsPerBlock - 1) / threadsPerBlock;
+
+    scatter_logspace_geglu_kernel<<<numBlocks, threadsPerBlock>>>(d_input, indices, d_output,
+                                                                   batch_size, input_size, base);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+}  // extern "C"
+```

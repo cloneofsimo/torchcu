@@ -1,0 +1,137 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for dynamic convolution, ReLU, and bucketing using bfloat16
+__global__ void dynamic_conv_rrelu_bf16_kernel(const float* input, const float* weight, const float* bias, const int* bucket_sizes,
+                                           float lower, float upper, float* output, int batch_size, int input_channels,
+                                           int output_channels, int input_height, int input_width, int kernel_size) {
+
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int output_channel = blockIdx.y * blockDim.y + threadIdx.y;
+    int output_x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && output_channel < output_channels && output_x < input_width) {
+
+        float sum = bias[output_channel];
+        for (int input_channel = 0; input_channel < input_channels; input_channel++) {
+            for (int kernel_y = 0; kernel_y < kernel_size; kernel_y++) {
+                for (int kernel_x = 0; kernel_x < kernel_size; kernel_x++) {
+
+                    int input_y = output_y + kernel_y - 1;
+                    int input_x = output_x + kernel_x - 1;
+
+                    if (input_y >= 0 && input_y < input_height && input_x >= 0 && input_x < input_width) {
+                        __nv_bfloat16 a = float_to_bfloat16(input[batch_idx * input_channels * input_height * input_width +
+                                                          input_channel * input_height * input_width + input_y * input_width + input_x]);
+                        __nv_bfloat16 b = float_to_bfloat16(weight[output_channel * input_channels * kernel_size * kernel_size +
+                                                          input_channel * kernel_size * kernel_size + kernel_y * kernel_size + kernel_x]);
+                        sum += bfloat16_to_float(__hmul(a, b));
+                    }
+                }
+            }
+        }
+
+        sum = fmaxf(sum, lower * sum + upper * 0.0f);  // RReLU activation
+        int bucket = -1;
+        for (int i = 0; i < 8; i++) {
+            if (sum < bucket_sizes[i]) {
+                bucket = i;
+                break;
+            }
+        }
+        output[batch_idx * output_channels * input_height * input_width + output_channel * input_height * input_width + output_y * input_width + output_x] = bucket;
+    }
+}
+
+extern "C" {
+
+void dynamic_conv_rrelu_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+    int input_dim2 = va_arg(args, int);
+    int input_dim3 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+    int weight_dim3 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract bucket sizes
+    const int* bucket_sizes = va_arg(args, const int*);
+
+    // Extract lower bound for RReLU
+    const float lower = va_arg(args, float);
+
+    // Extract upper bound for RReLU
+    const float upper = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int input_channels = input_dim1;
+    int output_channels = weight_dim0;
+    int input_height = input_dim2;
+    int input_width = input_dim3;
+    int kernel_size = weight_dim2;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output;
+    cudaMalloc(&d_input, batch_size * input_channels * input_height * input_width * sizeof(float));
+    cudaMalloc(&d_weight, output_channels * input_channels * kernel_size * kernel_size * sizeof(float));
+    cudaMalloc(&d_bias, output_channels * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_channels * input_height * input_width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * input_channels * input_height * input_width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, output_channels * input_channels * kernel_size * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, output_channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((input_width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (output_channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    dynamic_conv_rrelu_bf16_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, bucket_sizes, lower, upper, d_output, batch_size, input_channels, output_channels,
+        input_height, input_width, kernel_size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * output_channels * input_height * input_width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

@@ -1,0 +1,55 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+__global__ void my_function_kernel(const float *input_tensor, float scalar, const float *other_tensor, 
+                                    float *output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        output[idx] = input_tensor[idx] * scalar + other_tensor[idx];
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float *input_tensor = va_arg(args, const float*);
+    int input_tensor_size = va_arg(args, int);
+    float scalar = va_arg(args, float);
+    const float *other_tensor = va_arg(args, const float*);
+    int other_tensor_size = va_arg(args, int);
+
+    float *output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_other_tensor, *d_output;
+    cudaMalloc(&d_input, input_tensor_size * sizeof(float));
+    cudaMalloc(&d_other_tensor, other_tensor_size * sizeof(float));
+    cudaMalloc(&d_output, input_tensor_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, input_tensor_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_other_tensor, other_tensor, other_tensor_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int threadsPerBlock = 256;
+    int numBlocks = (input_tensor_size + threadsPerBlock - 1) / threadsPerBlock;
+
+    my_function_kernel<<<numBlocks, threadsPerBlock>>>(d_input, scalar, d_other_tensor, d_output, input_tensor_size);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, input_tensor_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_other_tensor);
+    cudaFree(d_output);
+}
+
+} // extern "C"

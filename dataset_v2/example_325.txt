@@ -1,0 +1,327 @@
+```python
+import torch
+import torch.nn.functional as F
+
+def depthwise_conv2d_topk_bf16(input_tensor: torch.Tensor, weight: torch.Tensor, threshold: float) -> list[torch.Tensor]:
+    """
+    Performs a depthwise convolution, applies a threshold, and then finds the top-k values.
+    Uses bfloat16 for intermediate computations and returns the top-k values and their indices as a list.
+
+    Args:
+        input_tensor: Input tensor of shape (batch_size, in_channels, height, width).
+        weight: Depthwise convolution weight tensor of shape (in_channels, 1, kernel_size, kernel_size).
+        threshold: Threshold value for filtering the output.
+
+    Returns:
+        A list containing two tensors:
+            - Top-k values: Tensor of shape (batch_size, k).
+            - Indices of the top-k values: Tensor of shape (batch_size, k).
+    """
+    # Convert input and weights to bfloat16
+    input_bf16 = input_tensor.to(torch.bfloat16)
+    weight_bf16 = weight.to(torch.bfloat16)
+    
+    # Perform depthwise convolution in bfloat16
+    output_bf16 = F.conv2d(input_bf16, weight_bf16, groups=input_tensor.shape[1])
+    
+    # Apply threshold
+    output_bf16 = torch.where(output_bf16 > threshold, output_bf16, torch.zeros_like(output_bf16))
+    
+    # Find the top-k values in each batch
+    batch_size = input_tensor.shape[0]
+    k = 5  # Fixed k for this example (can be adjusted)
+    topk_values, topk_indices = torch.topk(output_bf16.view(batch_size, -1), k=k, dim=1)
+
+    # Convert back to float32
+    topk_values = topk_values.to(torch.float32)
+    topk_indices = topk_indices.to(torch.float32)
+    
+    return [topk_values, topk_indices]
+
+function_signature = {
+    "name": "depthwise_conv2d_topk_bf16",
+    "inputs": [
+        ((1, 4, 10, 10), torch.float32),
+        ((4, 1, 3, 3), torch.float32),
+        (torch.float32),
+    ],
+    "outputs": [
+        ((1, 5), torch.float32),
+        ((1, 5), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversions
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Depthwise convolution kernel (with bfloat16 intermediate computations)
+__global__ void depthwise_conv2d_kernel(const float* input, const float* weight, float* output, 
+                                         int batch_size, int in_channels, int height, int width, 
+                                         int kernel_size, float threshold) {
+    int batch = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel = blockIdx.y * blockDim.y + threadIdx.y;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch < batch_size && channel < in_channels && row < height) {
+        int col = 0;
+        float sum = 0.0f;
+        for (int i = -kernel_size / 2; i <= kernel_size / 2; ++i) {
+            for (int j = -kernel_size / 2; j <= kernel_size / 2; ++j) {
+                if (row + i >= 0 && row + i < height && col + j >= 0 && col + j < width) {
+                    __nv_bfloat16 input_val = float_to_bfloat16(input[batch * in_channels * height * width + channel * height * width + (row + i) * width + (col + j)]);
+                    __nv_bfloat16 weight_val = float_to_bfloat16(weight[channel * kernel_size * kernel_size + (i + kernel_size / 2) * kernel_size + (j + kernel_size / 2)]);
+                    sum += bfloat16_to_float(__hmul(input_val, weight_val));
+                }
+            }
+        }
+        output[batch * in_channels * height * width + channel * height * width + row * width + col] = sum > threshold ? sum : 0.0f;
+    }
+}
+
+// Kernel for finding the top-k values
+__global__ void topk_kernel(const float* data, float* topk_values, int* topk_indices, 
+                          int batch_size, int num_elements, int k) {
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch < batch_size) {
+        // Simple selection sort
+        for (int i = 0; i < k; ++i) {
+            int max_index = i;
+            float max_value = data[batch * num_elements + i];
+
+            for (int j = i + 1; j < num_elements; ++j) {
+                if (data[batch * num_elements + j] > max_value) {
+                    max_value = data[batch * num_elements + j];
+                    max_index = j;
+                }
+            }
+
+            // Swap values and indices
+            float temp_value = data[batch * num_elements + i];
+            data[batch * num_elements + i] = max_value;
+            data[batch * num_elements + max_index] = temp_value;
+
+            int temp_index = topk_indices[batch * k + i];
+            topk_indices[batch * k + i] = max_index;
+            topk_indices[batch * k + max_index] = temp_index;
+
+            topk_values[batch * k + i] = max_value;
+        }
+    }
+}
+
+extern "C" {
+void depthwise_conv2d_topk_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int in_channels = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int kernel_size = va_arg(args, int);
+
+    // Extract threshold
+    float threshold = va_arg(args, double);
+
+    // Extract output tensors
+    float* topk_values = va_arg(args, float*);
+    int* topk_indices = va_arg(args, int*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, batch_size * in_channels * height * width * sizeof(float));
+    cudaMalloc(&d_weight, in_channels * kernel_size * kernel_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * in_channels * height * width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * in_channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, in_channels * kernel_size * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch depthwise convolution kernel
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((height + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (in_channels + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    depthwise_conv2d_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_output, 
+                                                            batch_size, in_channels, height, width, 
+                                                            kernel_size, threshold);
+
+    // Find top-k values
+    int num_elements = height * width;
+    int k = 5; // Fixed k for this example
+
+    dim3 topk_threadsPerBlock(32);
+    dim3 topk_numBlocks((batch_size + topk_threadsPerBlock.x - 1) / topk_threadsPerBlock.x);
+
+    topk_kernel<<<topk_numBlocks, topk_threadsPerBlock>>>(d_output, topk_values, topk_indices, 
+                                                            batch_size, num_elements, k);
+
+    // Copy results back to host
+    cudaMemcpy(topk_values, d_output, batch_size * k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper functions for bfloat16 conversions
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Depthwise convolution kernel (with bfloat16 intermediate computations)
+__global__ void depthwise_conv2d_kernel(const float* input, const float* weight, float* output, 
+                                         int batch_size, int in_channels, int height, int width, 
+                                         int kernel_size, float threshold) {
+    int batch = blockIdx.z * blockDim.z + threadIdx.z;
+    int channel = blockIdx.y * blockDim.y + threadIdx.y;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch < batch_size && channel < in_channels && row < height) {
+        int col = 0;
+        float sum = 0.0f;
+        for (int i = -kernel_size / 2; i <= kernel_size / 2; ++i) {
+            for (int j = -kernel_size / 2; j <= kernel_size / 2; ++j) {
+                if (row + i >= 0 && row + i < height && col + j >= 0 && col + j < width) {
+                    __nv_bfloat16 input_val = float_to_bfloat16(input[batch * in_channels * height * width + channel * height * width + (row + i) * width + (col + j)]);
+                    __nv_bfloat16 weight_val = float_to_bfloat16(weight[channel * kernel_size * kernel_size + (i + kernel_size / 2) * kernel_size + (j + kernel_size / 2)]);
+                    sum += bfloat16_to_float(__hmul(input_val, weight_val));
+                }
+            }
+        }
+        output[batch * in_channels * height * width + channel * height * width + row * width + col] = sum > threshold ? sum : 0.0f;
+    }
+}
+
+// Kernel for finding the top-k values
+__global__ void topk_kernel(const float* data, float* topk_values, int* topk_indices, 
+                          int batch_size, int num_elements, int k) {
+    int batch = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch < batch_size) {
+        // Simple selection sort
+        for (int i = 0; i < k; ++i) {
+            int max_index = i;
+            float max_value = data[batch * num_elements + i];
+
+            for (int j = i + 1; j < num_elements; ++j) {
+                if (data[batch * num_elements + j] > max_value) {
+                    max_value = data[batch * num_elements + j];
+                    max_index = j;
+                }
+            }
+
+            // Swap values and indices
+            float temp_value = data[batch * num_elements + i];
+            data[batch * num_elements + i] = max_value;
+            data[batch * num_elements + max_index] = temp_value;
+
+            int temp_index = topk_indices[batch * k + i];
+            topk_indices[batch * k + i] = max_index;
+            topk_indices[batch * k + max_index] = temp_index;
+
+            topk_values[batch * k + i] = max_value;
+        }
+    }
+}
+
+extern "C" {
+void depthwise_conv2d_topk_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int in_channels = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int kernel_size = va_arg(args, int);
+
+    // Extract threshold
+    float threshold = va_arg(args, double);
+
+    // Extract output tensors
+    float* topk_values = va_arg(args, float*);
+    int* topk_indices = va_arg(args, int*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float* d_input, *d_weight, *d_output;
+    cudaMalloc(&d_input, batch_size * in_channels * height * width * sizeof(float));
+    cudaMalloc(&d_weight, in_channels * kernel_size * kernel_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * in_channels * height * width * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * in_channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, in_channels * kernel_size * kernel_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch depthwise convolution kernel
+    dim3 threadsPerBlock(16, 16, 1);
+    dim3 numBlocks((height + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (in_channels + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                   (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    depthwise_conv2d_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_weight, d_output, 
+                                                            batch_size, in_channels, height, width, 
+                                                            kernel_size, threshold);
+
+    // Find top-k values
+    int num_elements = height * width;
+    int k = 5; // Fixed k for this example
+
+    dim3 topk_threadsPerBlock(32);
+    dim3 topk_numBlocks((batch_size + topk_threadsPerBlock.x - 1) / topk_threadsPerBlock.x);
+
+    topk_kernel<<<topk_numBlocks, topk_threadsPerBlock>>>(d_output, topk_values, topk_indices, 
+                                                            batch_size, num_elements, k);
+
+    // Copy results back to host
+    cudaMemcpy(topk_values, d_output, batch_size * k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+```

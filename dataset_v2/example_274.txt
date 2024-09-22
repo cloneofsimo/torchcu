@@ -1,0 +1,248 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MyModule(nn.Module):
+    def __init__(self, num_features, num_groups):
+        super(MyModule, self).__init__()
+        self.group_norm = nn.GroupNorm(num_groups=num_groups, num_channels=num_features)
+        self.linear = nn.Linear(num_features, num_features)
+
+    def forward(self, x):
+        x = self.group_norm(x)
+        x = self.linear(x)
+        x = F.relu(x)
+        return x
+
+def my_function(input_tensor: torch.Tensor, cutmix_alpha: float = 0.5) -> torch.Tensor:
+    """
+    Performs a series of operations including group normalization, cutmix,
+    and a linear layer with ReLU activation.
+    """
+    # Input should always have a tensor of size at least 1
+    assert len(input_tensor.size()) >= 1
+
+    # Group Normalization
+    x = MyModule(num_features=input_tensor.shape[1], num_groups=4)(input_tensor)
+
+    # CutMix
+    if cutmix_alpha > 0:
+        x = cutmix(x, cutmix_alpha)
+
+    # Linear Layer with ReLU
+    x = nn.Linear(input_tensor.shape[1], input_tensor.shape[1])(x)
+    x = F.relu(x)
+
+    # Ensure FP32 output
+    x = x.to(torch.float32)
+
+    return x
+
+def cutmix(x, alpha):
+    """
+    Applies CutMix augmentation to the input tensor.
+    """
+    # TODO: Implement CutMix augmentation logic here
+    return x
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((1, 16, 16, 16), torch.float32),
+        (float, torch.float32)
+    ],
+    "outputs": [
+        ((1, 16, 16, 16), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h> 
+
+__device__ __forceinline__ float float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for group normalization
+__global__ void group_norm_kernel(const float* input, float* output, const float* gamma, 
+                                  const float* beta, int N, int C, int H, int W, int G) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (n < N && c < C) {
+        int group = c / G;
+        int group_offset = group * G;
+        int channel_in_group = c % G;
+
+        // Calculate mean and variance for the group
+        float sum = 0.0f;
+        float sqr_sum = 0.0f;
+        for (int h = 0; h < H; ++h) {
+            for (int w = 0; w < W; ++w) {
+                int index = (n * C + c) * H * W + h * W + w;
+                sum += input[index];
+                sqr_sum += input[index] * input[index];
+            }
+        }
+
+        float mean = sum / (H * W * G);
+        float variance = sqr_sum / (H * W * G) - mean * mean;
+        float std = sqrt(variance + 1e-5f);
+
+        // Apply normalization
+        int index = (n * C + c) * H * W + blockIdx.z * blockDim.z + threadIdx.z;
+        output[index] = (input[index] - mean) / std;
+        output[index] = output[index] * gamma[c] + beta[c];
+    }
+}
+
+// CUDA kernel for linear layer with ReLU
+__global__ void linear_relu_kernel(const float* input, const float* weight, const float* bias,
+                                    float* output, int N, int C, int K) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int k = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (n < N && k < K) {
+        float sum = 0.0f;
+        for (int c = 0; c < C; ++c) {
+            sum += input[n * C + c] * weight[c * K + k];
+        }
+        output[n * K + k] = fmaxf(sum + bias[k], 0.0f);
+    }
+}
+
+// CUDA kernel for CutMix augmentation (Simplified version)
+__global__ void cutmix_kernel(float* input, float* output, int N, int C, int H, int W,
+                              float alpha) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.z * blockDim.z + threadIdx.z;
+    int w = threadIdx.z;
+
+    if (n < N && c < C && h < H && w < W) {
+        float lambda = (1.0f - alpha) * (1.0f - alpha);
+        output[n * C * H * W + c * H * W + h * W + w] = lambda * input[n * C * H * W + c * H * W + h * W + w];
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract cutmix_alpha
+    float cutmix_alpha = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int N = input_tensor_dim0;
+    int C = input_tensor_dim1;
+    int H = input_tensor_dim2;
+    int W = input_tensor_dim3;
+    int G = 4; // Number of groups for group norm
+
+    // Allocate device memory
+    float *d_input, *d_output, *d_gamma, *d_beta, *d_weight, *d_bias;
+    cudaMalloc(&d_input, N * C * H * W * sizeof(float));
+    cudaMalloc(&d_output, N * C * H * W * sizeof(float));
+    cudaMalloc(&d_gamma, C * sizeof(float));
+    cudaMalloc(&d_beta, C * sizeof(float));
+    cudaMalloc(&d_weight, C * C * sizeof(float)); // Assuming square weight matrix
+    cudaMalloc(&d_bias, C * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, N * C * H * W * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Initialize group norm parameters (gamma and beta)
+    float gamma_data[C] = {1.0f};
+    float beta_data[C] = {0.0f};
+    cudaMemcpy(d_gamma, gamma_data, C * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_beta, beta_data, C * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Initialize linear layer weights and biases
+    float weight_data[C * C] = {0.0f};
+    float bias_data[C] = {0.0f};
+    for (int i = 0; i < C; ++i) {
+        weight_data[i * C + i] = 1.0f; // Initialize diagonal elements to 1.0
+    }
+    cudaMemcpy(d_weight, weight_data, C * C * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias_data, C * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Group Normalization
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (C + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    group_norm_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_output, d_gamma, d_beta,
+                                                  N, C, H, W, G);
+
+    // CutMix
+    if (cutmix_alpha > 0.0f) {
+        dim3 threadsPerBlockCutmix(16, 16, 8); // Adjust block size for CutMix
+        dim3 numBlocksCutmix((N + threadsPerBlockCutmix.x - 1) / threadsPerBlockCutmix.x, 
+                           (C + threadsPerBlockCutmix.y - 1) / threadsPerBlockCutmix.y,
+                           (H + threadsPerBlockCutmix.z - 1) / threadsPerBlockCutmix.z);
+        cutmix_kernel<<<numBlocksCutmix, threadsPerBlockCutmix>>>(d_output, d_output, N, C, H, W, cutmix_alpha);
+    }
+
+    // Linear Layer with ReLU
+    dim3 threadsPerBlockLinear(16, 16);
+    dim3 numBlocksLinear((N + threadsPerBlockLinear.x - 1) / threadsPerBlockLinear.x, 
+                        (C + threadsPerBlockLinear.y - 1) / threadsPerBlockLinear.y);
+    linear_relu_kernel<<<numBlocksLinear, threadsPerBlockLinear>>>(d_output, d_weight, d_bias, d_output, 
+                                                     N, C, C); // K = C for square weight matrix
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, N * C * H * W * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_gamma);
+    cudaFree(d_beta);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+}
+
+}  // extern "C"
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h> 
+
+// ... (rest of the code is the same as above)
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    // ... (rest of the code is the same as above)
+}
+
+}  // extern "C"
+```

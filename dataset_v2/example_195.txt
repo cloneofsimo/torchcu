@@ -1,0 +1,345 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class AttentionModule(nn.Module):
+    def __init__(self, hidden_size, attention_size):
+        super(AttentionModule, self).__init__()
+        self.hidden_size = hidden_size
+        self.attention_size = attention_size
+        self.W = nn.Linear(hidden_size, attention_size, bias=False)
+        self.V = nn.Linear(attention_size, 1, bias=False)
+
+    def forward(self, x):
+        # x: (batch_size, sequence_length, hidden_size)
+        e = self.V(torch.tanh(self.W(x)))  # (batch_size, sequence_length, 1)
+        alpha = F.softmax(e, dim=1)  # (batch_size, sequence_length, 1)
+        context = torch.sum(alpha * x, dim=1)  # (batch_size, hidden_size)
+        return context, alpha
+
+class MyModel(nn.Module):
+    def __init__(self, hidden_size, attention_size, temperature):
+        super(MyModel, self).__init__()
+        self.attention = AttentionModule(hidden_size, attention_size)
+        self.temperature = temperature
+
+    def forward(self, input_tensor, target_tensor):
+        # Input tensor: (batch_size, seq_len, hidden_size)
+        # Target tensor: (batch_size, seq_len, hidden_size)
+        
+        # Calculate attention context
+        context, alpha = self.attention(input_tensor)
+        
+        # Apply log_softmax with temperature
+        logits = F.log_softmax(context / self.temperature, dim=-1)  # (batch_size, hidden_size)
+        
+        # Calculate margin ranking loss
+        loss = F.margin_ranking_loss(logits, torch.zeros_like(logits), target_tensor, margin=0.2)
+        
+        # Apply max filter to attention weights
+        alpha_max = torch.max(alpha, dim=1)[0]  # (batch_size, 1)
+        
+        return loss, alpha_max
+
+def my_function(input_tensor: torch.Tensor, target_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Performs attention, log_softmax with temperature, margin ranking loss, and max filtering.
+    """
+    model = MyModel(hidden_size=128, attention_size=64, temperature=2.0)
+    loss, alpha_max = model(input_tensor.half(), target_tensor.half())
+    return loss.float(), alpha_max.float()
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((16, 32, 128), torch.float16),
+        ((16, 32, 128), torch.float16)
+    ],
+    "outputs": [
+        ((1,), torch.float32),
+        ((16,), torch.float32)
+    ]
+}
+```
+
+```c++
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+#define  FLOAT2HALF(x)   ((half)((x) * 65536.0f))
+#define  HALF2FLOAT(x)   ((float)((x) / 65536.0f))
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return FLOAT2HALF(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return HALF2FLOAT(h);
+}
+
+__global__ void attention_kernel(const half* input, const half* target, float* output_loss, half* output_alpha_max,
+                                int batch_size, int seq_len, int hidden_size, int attention_size, float temperature) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (i < batch_size) {
+        half sum_loss = 0.0f;
+        half max_alpha = -FLT_MAX;
+        
+        for (int j = 0; j < seq_len; ++j) {
+            half context[128] = {0.0f};
+            half alpha[32] = {0.0f};
+            
+            // Calculate attention context
+            for (int k = 0; k < hidden_size; ++k) {
+                context[k] = input[i * seq_len * hidden_size + j * hidden_size + k];
+            }
+            
+            // Apply log_softmax with temperature
+            half log_softmax[128] = {0.0f};
+            for (int k = 0; k < hidden_size; ++k) {
+                log_softmax[k] = exp(context[k] / temperature);
+            }
+            float sum = 0.0f;
+            for (int k = 0; k < hidden_size; ++k) {
+                sum += log_softmax[k];
+            }
+            for (int k = 0; k < hidden_size; ++k) {
+                log_softmax[k] = log(log_softmax[k] / sum);
+            }
+            
+            // Calculate margin ranking loss
+            sum_loss +=  max(0.0f, 0.2f + log_softmax[i] - log_softmax[j]);
+            
+            // Apply max filter to attention weights
+            alpha[j] = log_softmax[i];
+            if (alpha[j] > max_alpha) {
+                max_alpha = alpha[j];
+            }
+        }
+        output_loss[i] = half_to_float(sum_loss / seq_len);
+        output_alpha_max[i] = max_alpha;
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+    
+    // Extract input tensors
+    const half* input_tensor = va_arg(args, const half*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    
+    const half* target_tensor = va_arg(args, const half*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+    int target_tensor_dim2 = va_arg(args, int);
+    
+    // Extract output tensors (assuming they are preallocated)
+    float* output_loss = va_arg(args, float*);
+    half* output_alpha_max = va_arg(args, half*);
+    
+    va_end(args);
+    
+    int batch_size = input_tensor_dim0;
+    int seq_len = input_tensor_dim1;
+    int hidden_size = input_tensor_dim2;
+    int attention_size = 64;
+    float temperature = 2.0f;
+    
+    // Launch kernel
+    dim3 threadsPerBlock(128);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    
+    attention_kernel<<<numBlocks, threadsPerBlock>>>(input_tensor, target_tensor, output_loss, output_alpha_max,
+                                                batch_size, seq_len, hidden_size, attention_size, temperature);
+    
+    cudaDeviceSynchronize();
+}
+
+}  // extern "C"
+```
+
+**func.py**
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class AttentionModule(nn.Module):
+    def __init__(self, hidden_size, attention_size):
+        super(AttentionModule, self).__init__()
+        self.hidden_size = hidden_size
+        self.attention_size = attention_size
+        self.W = nn.Linear(hidden_size, attention_size, bias=False)
+        self.V = nn.Linear(attention_size, 1, bias=False)
+
+    def forward(self, x):
+        # x: (batch_size, sequence_length, hidden_size)
+        e = self.V(torch.tanh(self.W(x)))  # (batch_size, sequence_length, 1)
+        alpha = F.softmax(e, dim=1)  # (batch_size, sequence_length, 1)
+        context = torch.sum(alpha * x, dim=1)  # (batch_size, hidden_size)
+        return context, alpha
+
+class MyModel(nn.Module):
+    def __init__(self, hidden_size, attention_size, temperature):
+        super(MyModel, self).__init__()
+        self.attention = AttentionModule(hidden_size, attention_size)
+        self.temperature = temperature
+
+    def forward(self, input_tensor, target_tensor):
+        # Input tensor: (batch_size, seq_len, hidden_size)
+        # Target tensor: (batch_size, seq_len, hidden_size)
+        
+        # Calculate attention context
+        context, alpha = self.attention(input_tensor)
+        
+        # Apply log_softmax with temperature
+        logits = F.log_softmax(context / self.temperature, dim=-1)  # (batch_size, hidden_size)
+        
+        # Calculate margin ranking loss
+        loss = F.margin_ranking_loss(logits, torch.zeros_like(logits), target_tensor, margin=0.2)
+        
+        # Apply max filter to attention weights
+        alpha_max = torch.max(alpha, dim=1)[0]  # (batch_size, 1)
+        
+        return loss, alpha_max
+
+def my_function(input_tensor: torch.Tensor, target_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Performs attention, log_softmax with temperature, margin ranking loss, and max filtering.
+    """
+    model = MyModel(hidden_size=128, attention_size=64, temperature=2.0)
+    loss, alpha_max = model(input_tensor.half(), target_tensor.half())
+    return loss.float(), alpha_max.float()
+
+function_signature = {
+    "name": "my_function",
+    "inputs": [
+        ((16, 32, 128), torch.float16),
+        ((16, 32, 128), torch.float16)
+    ],
+    "outputs": [
+        ((1,), torch.float32),
+        ((16,), torch.float32)
+    ]
+}
+```
+
+**func.cu**
+
+```c++
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+#define  FLOAT2HALF(x)   ((half)((x) * 65536.0f))
+#define  HALF2FLOAT(x)   ((float)((x) / 65536.0f))
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return FLOAT2HALF(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return HALF2FLOAT(h);
+}
+
+__global__ void attention_kernel(const half* input, const half* target, float* output_loss, half* output_alpha_max,
+                                int batch_size, int seq_len, int hidden_size, int attention_size, float temperature) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (i < batch_size) {
+        half sum_loss = 0.0f;
+        half max_alpha = -FLT_MAX;
+        
+        for (int j = 0; j < seq_len; ++j) {
+            half context[128] = {0.0f};
+            half alpha[32] = {0.0f};
+            
+            // Calculate attention context
+            for (int k = 0; k < hidden_size; ++k) {
+                context[k] = input[i * seq_len * hidden_size + j * hidden_size + k];
+            }
+            
+            // Apply log_softmax with temperature
+            half log_softmax[128] = {0.0f};
+            for (int k = 0; k < hidden_size; ++k) {
+                log_softmax[k] = exp(context[k] / temperature);
+            }
+            float sum = 0.0f;
+            for (int k = 0; k < hidden_size; ++k) {
+                sum += log_softmax[k];
+            }
+            for (int k = 0; k < hidden_size; ++k) {
+                log_softmax[k] = log(log_softmax[k] / sum);
+            }
+            
+            // Calculate margin ranking loss
+            sum_loss +=  max(0.0f, 0.2f + log_softmax[i] - log_softmax[j]);
+            
+            // Apply max filter to attention weights
+            alpha[j] = log_softmax[i];
+            if (alpha[j] > max_alpha) {
+                max_alpha = alpha[j];
+            }
+        }
+        output_loss[i] = half_to_float(sum_loss / seq_len);
+        output_alpha_max[i] = max_alpha;
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+    
+    // Extract input tensors
+    const half* input_tensor = va_arg(args, const half*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    
+    const half* target_tensor = va_arg(args, const half*);
+    int target_tensor_dim0 = va_arg(args, int);
+    int target_tensor_dim1 = va_arg(args, int);
+    int target_tensor_dim2 = va_arg(args, int);
+    
+    // Extract output tensors (assuming they are preallocated)
+    float* output_loss = va_arg(args, float*);
+    half* output_alpha_max = va_arg(args, half*);
+    
+    va_end(args);
+    
+    int batch_size = input_tensor_dim0;
+    int seq_len = input_tensor_dim1;
+    int hidden_size = input_tensor_dim2;
+    int attention_size = 64;
+    float temperature = 2.0f;
+    
+    // Launch kernel
+    dim3 threadsPerBlock(128);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    
+    attention_kernel<<<numBlocks, threadsPerBlock>>>(input_tensor, target_tensor, output_loss, output_alpha_max,
+                                                batch_size, seq_len, hidden_size, attention_size, temperature);
+    
+    cudaDeviceSynchronize();
+}
+
+}  // extern "C"
+```

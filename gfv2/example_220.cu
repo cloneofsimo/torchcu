@@ -1,0 +1,191 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// Define constants for FFT dimensions
+#define FFT_DIM1 8
+#define FFT_DIM2 8
+#define FFT_DIM3 8
+
+// Define constants for complex numbers
+#define COMPLEX_REAL 0
+#define COMPLEX_IMAG 1
+
+// Helper functions for complex number manipulation
+__device__ __forceinline__ float2 complex_mul(float2 a, float2 b) {
+  return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+__device__ __forceinline__ float2 complex_add(float2 a, float2 b) {
+  return make_float2(a.x + b.x, a.y + b.y);
+}
+
+// 3D FFT kernel
+__global__ void rfft3d_kernel(const float* input, float2* output, int batch_size, int in_channels, int dim1, int dim2, int dim3) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = batch_idx * in_channels * dim1 * dim2 * dim3 + channel_idx * dim1 * dim2 * dim3;
+
+    if (batch_idx < batch_size && channel_idx < in_channels) {
+        for (int i = 0; i < dim1; i++) {
+            for (int j = 0; j < dim2; j++) {
+                for (int k = 0; k < dim3; k++) {
+                    output[idx + i * dim2 * dim3 + j * dim3 + k].x = input[idx + i * dim2 * dim3 + j * dim3 + k];
+                }
+            }
+        }
+    }
+}
+
+// 3D iFFT kernel
+__global__ void irfft3d_kernel(const float2* input, float* output, int batch_size, int in_channels, int dim1, int dim2, int dim3) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = batch_idx * in_channels * dim1 * dim2 * dim3 + channel_idx * dim1 * dim2 * dim3;
+
+    if (batch_idx < batch_size && channel_idx < in_channels) {
+        for (int i = 0; i < dim1; i++) {
+            for (int j = 0; j < dim2; j++) {
+                for (int k = 0; k < dim3; k++) {
+                    output[idx + i * dim2 * dim3 + j * dim3 + k] = input[idx + i * dim2 * dim3 + j * dim3 + k].x;
+                }
+            }
+        }
+    }
+}
+
+// 3D convolution kernel in frequency domain
+__global__ void conv3d_fft_kernel(const float2* input_fft, const float2* weight_fft, float2* output_fft, int batch_size, 
+                                    int in_channels, int out_channels, int kernel_size1, int kernel_size2, int kernel_size3,
+                                    int dim1, int dim2, int dim3) {
+
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = batch_idx * out_channels * dim1 * dim2 * dim3 + channel_idx * dim1 * dim2 * dim3;
+
+    if (batch_idx < batch_size && channel_idx < out_channels) {
+        for (int i = 0; i < dim1; i++) {
+            for (int j = 0; j < dim2; j++) {
+                for (int k = 0; k < dim3; k++) {
+                    float2 sum = make_float2(0.0f, 0.0f);
+                    for (int c = 0; c < in_channels; c++) {
+                        int weight_idx = c * kernel_size1 * kernel_size2 * kernel_size3 + 
+                                         channel_idx * kernel_size1 * kernel_size2 * kernel_size3 +
+                                         i * kernel_size2 * kernel_size3 + j * kernel_size3 + k;
+                        int input_idx = batch_idx * in_channels * dim1 * dim2 * dim3 + c * dim1 * dim2 * dim3 +
+                                         i * dim2 * dim3 + j * dim3 + k;
+                        sum = complex_add(sum, complex_mul(input_fft[input_idx], weight_fft[weight_idx]));
+                    }
+                    output_fft[idx + i * dim2 * dim3 + j * dim3 + k] = sum;
+                }
+            }
+        }
+    }
+}
+
+// Element-wise comparison kernel
+__global__ void elementwise_gt_kernel(const float* input, const float* comparison, float* output, int batch_size, 
+                                     int out_channels, int dim1, int dim2, int dim3) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = batch_idx * out_channels * dim1 * dim2 * dim3 + channel_idx * dim1 * dim2 * dim3;
+
+    if (batch_idx < batch_size && channel_idx < out_channels) {
+        for (int i = 0; i < dim1; i++) {
+            for (int j = 0; j < dim2; j++) {
+                for (int k = 0; k < dim3; k++) {
+                    output[idx + i * dim2 * dim3 + j * dim3 + k] = (input[idx + i * dim2 * dim3 + j * dim3 + k] > 
+                                                                      comparison[idx + i * dim2 * dim3 + j * dim3 + k]) ?
+                                                                      input[idx + i * dim2 * dim3 + j * dim3 + k] : 0.0f;
+                }
+            }
+        }
+    }
+}
+
+extern "C" {
+
+// CUDA kernel for 3D convolution using FFT, element-wise comparison, and output
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+    int input_dim2 = va_arg(args, int);
+    int input_dim3 = va_arg(args, int);
+    int input_dim4 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+    int weight_dim3 = va_arg(args, int);
+    int weight_dim4 = va_arg(args, int);
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_output;
+    float2 *d_input_fft, *d_weight_fft, *d_output_fft;
+    float *d_comparison;
+    cudaMalloc(&d_input, input_dim0 * input_dim1 * input_dim2 * input_dim3 * input_dim4 * sizeof(float));
+    cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * weight_dim2 * weight_dim3 * weight_dim4 * sizeof(float));
+    cudaMalloc(&d_output, input_dim0 * weight_dim0 * input_dim2 * input_dim3 * input_dim4 * sizeof(float));
+    cudaMalloc(&d_input_fft, input_dim0 * input_dim1 * FFT_DIM1 * FFT_DIM2 * FFT_DIM3 * 2 * sizeof(float));
+    cudaMalloc(&d_weight_fft, weight_dim0 * weight_dim1 * FFT_DIM1 * FFT_DIM2 * FFT_DIM3 * 2 * sizeof(float));
+    cudaMalloc(&d_output_fft, input_dim0 * weight_dim0 * FFT_DIM1 * FFT_DIM2 * FFT_DIM3 * 2 * sizeof(float));
+    cudaMalloc(&d_comparison, input_dim0 * weight_dim0 * input_dim2 * input_dim3 * input_dim4 * sizeof(float));
+
+    // Copy input and weight data to device
+    cudaMemcpy(d_input, input, input_dim0 * input_dim1 * input_dim2 * input_dim3 * input_dim4 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * weight_dim2 * weight_dim3 * weight_dim4 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Perform FFT on input and weight tensors
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((input_dim0 + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (input_dim1 + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    rfft3d_kernel<<<numBlocks, threadsPerBlock>>>(d_input, d_input_fft, input_dim0, input_dim1, FFT_DIM1, FFT_DIM2, FFT_DIM3);
+    rfft3d_kernel<<<numBlocks, threadsPerBlock>>>(d_weight, d_weight_fft, weight_dim0, weight_dim1, FFT_DIM1, FFT_DIM2, FFT_DIM3);
+
+    // Perform convolution in frequency domain
+    numBlocks = ((input_dim0 + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                 (weight_dim0 + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    conv3d_fft_kernel<<<numBlocks, threadsPerBlock>>>(d_input_fft, d_weight_fft, d_output_fft, input_dim0, input_dim1, 
+                                                      weight_dim0, weight_dim2, weight_dim3, weight_dim4, FFT_DIM1, 
+                                                      FFT_DIM2, FFT_DIM3);
+
+    // Perform inverse FFT
+    irfft3d_kernel<<<numBlocks, threadsPerBlock>>>(d_output_fft, d_output, input_dim0, weight_dim0, FFT_DIM1, FFT_DIM2, FFT_DIM3);
+
+    // Generate random tensor for comparison on device
+    cudaMemcpy(d_comparison, d_output, input_dim0 * weight_dim0 * input_dim2 * input_dim3 * input_dim4 * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaLaunchKernel(elementwise_gt_kernel, 
+                     (input_dim0 + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                     (weight_dim0 + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                     1, threadsPerBlock, 0, 0, 0, 0, d_output, d_comparison, d_output, input_dim0, weight_dim0,
+                     input_dim2, input_dim3, input_dim4);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, input_dim0 * weight_dim0 * input_dim2 * input_dim3 * input_dim4 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+    cudaFree(d_input_fft);
+    cudaFree(d_weight_fft);
+    cudaFree(d_output_fft);
+    cudaFree(d_comparison);
+}
+
+}

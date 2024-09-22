@@ -1,0 +1,114 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h> 
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to half
+__device__ __forceinline__ half bfloat16_to_half(__nv_bfloat16 bf) {
+    return __bfloat162half(bf);
+}
+
+// CUDA kernel for convolution and diagflat using bfloat16
+__global__ void conv_diagflat_kernel_bf16(const float* input, const float* weight, half* output,
+                                        int batch_size, int in_channels, int in_height, int in_width,
+                                        int out_channels, int kernel_height, int kernel_width,
+                                        int stride_height, int stride_width, int padding_height, int padding_width) {
+    int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int batch_idx = blockIdx.z;
+
+    if (out_x < in_width && out_y < in_height && batch_idx < batch_size) {
+        int in_x_start = out_x * stride_width - padding_width;
+        int in_y_start = out_y * stride_height - padding_height;
+
+        for (int out_c = 0; out_c < out_channels; ++out_c) {
+            __nv_bfloat16 sum = 0.0f;
+            for (int in_c = 0; in_c < in_channels; ++in_c) {
+                for (int k_y = 0; k_y < kernel_height; ++k_y) {
+                    for (int k_x = 0; k_x < kernel_width; ++k_x) {
+                        int in_x = in_x_start + k_x;
+                        int in_y = in_y_start + k_y;
+
+                        if (in_x >= 0 && in_x < in_width && in_y >= 0 && in_y < in_height) {
+                            __nv_bfloat16 input_val = float_to_bfloat16(input[batch_idx * in_channels * in_height * in_width + in_c * in_height * in_width + in_y * in_width + in_x]);
+                            __nv_bfloat16 weight_val = float_to_bfloat16(weight[out_c * in_channels * kernel_height * kernel_width + in_c * kernel_height * kernel_width + k_y * kernel_width + k_x]);
+                            sum += __hmul(input_val, weight_val);
+                        }
+                    }
+                }
+            }
+
+            // Store the result in the flattened diagonal
+            output[batch_idx * out_channels * in_height * in_width + out_c * in_height * in_width + out_y * in_width + out_x] = bfloat16_to_half(sum);
+        }
+    }
+}
+
+extern "C" {
+
+void conv_bf16_diagflat(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int in_channels = va_arg(args, int);
+    int in_height = va_arg(args, int);
+    int in_width = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int out_channels = va_arg(args, int);
+    int kernel_height = va_arg(args, int);
+    int kernel_width = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    half* output = va_arg(args, half*);
+
+    va_end(args);
+
+    // Assuming stride and padding are 1
+    int stride_height = 1;
+    int stride_width = 1;
+    int padding_height = 1;
+    int padding_width = 1;
+
+    // Allocate device memory
+    float *d_input, *d_weight;
+    half *d_output;
+    cudaMalloc(&d_input, batch_size * in_channels * in_height * in_width * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * in_channels * kernel_height * kernel_width * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * in_height * in_width * sizeof(half));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * in_channels * in_height * in_width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, out_channels * in_channels * kernel_height * kernel_width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((in_width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (in_height + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   batch_size);
+
+    conv_diagflat_kernel_bf16<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, batch_size, in_channels, in_height, in_width,
+        out_channels, kernel_height, kernel_width, stride_height, stride_width, padding_height, padding_width
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * out_channels * in_height * in_width * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

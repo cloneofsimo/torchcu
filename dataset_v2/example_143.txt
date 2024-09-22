@@ -1,0 +1,379 @@
+## func.py
+
+```python
+import torch
+import torch.nn.functional as F
+
+class AudioProcessor(torch.nn.Module):
+    def __init__(self, n_fft, hop_length, win_length, sample_rate, mel_bins, 
+                 f_min, f_max, normalization_mode="per_channel",
+                 int8_mode=False, bf16_mode=False):
+        super(AudioProcessor, self).__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.sample_rate = sample_rate
+        self.mel_bins = mel_bins
+        self.f_min = f_min
+        self.f_max = f_max
+        self.normalization_mode = normalization_mode
+        self.int8_mode = int8_mode
+        self.bf16_mode = bf16_mode
+
+        # Define mel filterbank
+        self.mel_filterbank = torch.nn.functional.mel_scale(
+            n_mels=self.mel_bins,
+            f_min=self.f_min,
+            f_max=self.f_max,
+            n_stft=self.n_fft // 2 + 1,
+            sample_rate=self.sample_rate
+        )
+
+    def forward(self, audio_data):
+        """
+        Processes audio data through the following steps:
+        - STFT
+        - Mel spectrogram
+        - Normalization (per-channel or global)
+        - Cross-fade
+        - Adaptive average pooling
+        """
+        if self.bf16_mode:
+            audio_data = audio_data.to(torch.bfloat16)
+        else:
+            if self.int8_mode:
+                audio_data = audio_data.to(torch.int8)
+
+        # STFT
+        stft = torch.stft(
+            audio_data,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=torch.hamming_window(self.win_length)
+        )
+
+        # Magnitude and Mel Spectrogram
+        magnitude = torch.abs(stft)
+        mel_spectrogram = torch.matmul(magnitude, self.mel_filterbank)
+
+        # Normalization
+        if self.normalization_mode == "per_channel":
+            mel_spectrogram = F.layer_norm(mel_spectrogram, (mel_spectrogram.shape[1],))
+        elif self.normalization_mode == "global":
+            mel_spectrogram = F.layer_norm(mel_spectrogram, (mel_spectrogram.shape[1], mel_spectrogram.shape[2]))
+        
+        # Cross-fade
+        fade_in_length = int(0.1 * self.sample_rate / self.hop_length)  # 100ms fade-in
+        fade_out_length = int(0.1 * self.sample_rate / self.hop_length)  # 100ms fade-out
+        mel_spectrogram = F.cross_fade(mel_spectrogram, mel_spectrogram, fade_in_length, fade_out_length)
+
+        # Adaptive Average Pooling
+        mel_spectrogram = F.adaptive_avg_pool1d(mel_spectrogram, 1)
+
+        if self.bf16_mode:
+            return mel_spectrogram.to(torch.float32)
+        else:
+            if self.int8_mode:
+                return mel_spectrogram.to(torch.float32)
+            else:
+                return mel_spectrogram
+
+function_signature = {
+    "name": "audio_processor",
+    "inputs": [
+        ((1, 16000), torch.float32),
+    ],
+    "outputs": [
+        ((1, 128, 1), torch.float32)
+    ]
+}
+```
+
+## func.cu
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+#define BLOCK_SIZE 256
+
+__device__ float fast_log2(float n) {
+    int bits = reinterpret_cast<int&>(n);
+    int exponent = (bits >> 23) & 0xFF;
+    return float(exponent - 127) + (float(bits & 0x7FFFFF) / 8388608.0f); 
+}
+
+__device__ float mel_scale(float f) {
+    return 2595.0f * log10f(1.0f + f / 700.0f);
+}
+
+__device__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+__global__ void stft_kernel(const float* input, float* output, int n_fft, int hop_length, int win_length,
+                        int num_frames, int num_bins, float* window, int sample_rate) {
+    int frame_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int bin_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (frame_idx < num_frames && bin_idx < num_bins) {
+        int start_idx = frame_idx * hop_length;
+        int end_idx = min(start_idx + n_fft, num_frames * hop_length);
+
+        float sum_real = 0.0f;
+        float sum_imag = 0.0f;
+
+        for (int i = start_idx, j = 0; i < end_idx; ++i, ++j) {
+            float sample = input[i];
+            float window_val = window[j];
+            sum_real += sample * window_val * cosf(2.0f * M_PI * bin_idx * j / n_fft);
+            sum_imag -= sample * window_val * sinf(2.0f * M_PI * bin_idx * j / n_fft);
+        }
+
+        output[frame_idx * num_bins * 2 + bin_idx * 2] = sum_real;
+        output[frame_idx * num_bins * 2 + bin_idx * 2 + 1] = sum_imag;
+    }
+}
+
+__global__ void mel_filterbank_kernel(const float* magnitude, float* mel_spectrogram, 
+                                      const float* mel_filterbank, int num_frames, int num_bins,
+                                      int num_mel_bins) {
+    int frame_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int mel_bin_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (frame_idx < num_frames && mel_bin_idx < num_mel_bins) {
+        float sum = 0.0f;
+        for (int bin_idx = 0; bin_idx < num_bins; ++bin_idx) {
+            sum += magnitude[frame_idx * num_bins + bin_idx] * 
+                   mel_filterbank[mel_bin_idx * num_bins + bin_idx];
+        }
+        mel_spectrogram[frame_idx * num_mel_bins + mel_bin_idx] = sum;
+    }
+}
+
+__global__ void layer_norm_kernel(const float* input, float* output, int num_frames, int num_features,
+                                   int normalization_mode, float* mean, float* var, 
+                                   float* inv_stddev, int num_channels) {
+    int frame_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int feature_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (frame_idx < num_frames && feature_idx < num_features) {
+        float sum = 0.0f;
+        if (normalization_mode == 0) {
+            for (int ch = 0; ch < num_channels; ++ch) {
+                sum += input[frame_idx * num_features * num_channels + feature_idx * num_channels + ch];
+            }
+        } else {
+            sum = input[frame_idx * num_features + feature_idx];
+        }
+
+        float normalized_value = (sum - mean[feature_idx]) * inv_stddev[feature_idx];
+        output[frame_idx * num_features + feature_idx] = normalized_value;
+    }
+}
+
+__global__ void cross_fade_kernel(float* input, int num_frames, int num_features, int fade_length) {
+    int frame_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int feature_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (frame_idx < num_frames && feature_idx < num_features) {
+        float alpha = 0.0f;
+        if (frame_idx < fade_length) {
+            alpha = (float)frame_idx / fade_length;
+        } else if (frame_idx >= num_frames - fade_length) {
+            alpha = 1.0f - (float)(frame_idx - (num_frames - fade_length)) / fade_length;
+        }
+
+        input[frame_idx * num_features + feature_idx] *= alpha;
+    }
+}
+
+__global__ void adaptive_avg_pool1d_kernel(const float* input, float* output, int num_frames, 
+                                          int num_features) {
+    int frame_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int feature_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (frame_idx < num_frames && feature_idx < num_features) {
+        float sum = 0.0f;
+        for (int i = 0; i < num_frames; ++i) {
+            sum += input[i * num_features + feature_idx];
+        }
+        output[feature_idx] = sum / num_frames;
+    }
+}
+
+extern "C" {
+    void audio_processor(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        // Extract input tensor
+        const float* input = va_arg(args, const float*);
+        int input_dim0 = va_arg(args, int);
+        int input_dim1 = va_arg(args, int);
+
+        // Extract output tensor
+        float* output = va_arg(args, float*);
+        int output_dim0 = va_arg(args, int);
+        int output_dim1 = va_arg(args, int);
+        int output_dim2 = va_arg(args, int);
+
+        // Extract parameters
+        int n_fft = va_arg(args, int);
+        int hop_length = va_arg(args, int);
+        int win_length = va_arg(args, int);
+        int sample_rate = va_arg(args, int);
+        int mel_bins = va_arg(args, int);
+        int f_min = va_arg(args, int);
+        int f_max = va_arg(args, int);
+        int normalization_mode = va_arg(args, int);
+        int int8_mode = va_arg(args, int);
+        int bf16_mode = va_arg(args, int);
+
+        va_end(args);
+
+        int num_frames = input_dim1 / hop_length;
+        int num_bins = n_fft / 2 + 1;
+        int num_mel_bins = mel_bins;
+
+        // Allocate device memory
+        float *d_input, *d_stft, *d_magnitude, *d_mel_spectrogram, *d_output;
+        float *d_mel_filterbank, *d_mean, *d_var, *d_inv_stddev, *d_window;
+        cudaMalloc(&d_input, input_dim0 * input_dim1 * sizeof(float));
+        cudaMalloc(&d_stft, num_frames * num_bins * 2 * sizeof(float));
+        cudaMalloc(&d_magnitude, num_frames * num_bins * sizeof(float));
+        cudaMalloc(&d_mel_spectrogram, num_frames * num_mel_bins * sizeof(float));
+        cudaMalloc(&d_output, output_dim0 * output_dim1 * output_dim2 * sizeof(float));
+        cudaMalloc(&d_mel_filterbank, num_mel_bins * num_bins * sizeof(float));
+        cudaMalloc(&d_mean, num_mel_bins * sizeof(float));
+        cudaMalloc(&d_var, num_mel_bins * sizeof(float));
+        cudaMalloc(&d_inv_stddev, num_mel_bins * sizeof(float));
+        cudaMalloc(&d_window, win_length * sizeof(float));
+
+        // Copy input data to device
+        cudaMemcpy(d_input, input, input_dim0 * input_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Create mel filterbank on device
+        float* h_mel_filterbank = new float[num_mel_bins * num_bins];
+        for (int mel_bin_idx = 0; mel_bin_idx < num_mel_bins; ++mel_bin_idx) {
+            for (int bin_idx = 0; bin_idx < num_bins; ++bin_idx) {
+                float f = (float)bin_idx * sample_rate / n_fft;
+                h_mel_filterbank[mel_bin_idx * num_bins + bin_idx] =
+                    mel_scale(f) - mel_scale(f_min);
+            }
+        }
+        cudaMemcpy(d_mel_filterbank, h_mel_filterbank, num_mel_bins * num_bins * sizeof(float), cudaMemcpyHostToDevice);
+        delete[] h_mel_filterbank;
+
+        // Create hamming window on device
+        float* h_window = new float[win_length];
+        for (int i = 0; i < win_length; ++i) {
+            h_window[i] = 0.54f - 0.46f * cosf(2.0f * M_PI * i / (win_length - 1));
+        }
+        cudaMemcpy(d_window, h_window, win_length * sizeof(float), cudaMemcpyHostToDevice);
+        delete[] h_window;
+
+        // STFT
+        dim3 stft_threads(BLOCK_SIZE);
+        dim3 stft_blocks((num_frames + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                         (num_bins + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        stft_kernel<<<stft_blocks, stft_threads>>>(d_input, d_stft, n_fft, hop_length, win_length,
+                                                   num_frames, num_bins, d_window, sample_rate);
+
+        // Magnitude
+        dim3 magnitude_threads(BLOCK_SIZE);
+        dim3 magnitude_blocks((num_frames + BLOCK_SIZE - 1) / BLOCK_SIZE, 
+                              (num_bins + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        for (int i = 0; i < num_frames * num_bins; ++i) {
+            d_magnitude[i] = sqrtf(d_stft[2 * i] * d_stft[2 * i] + d_stft[2 * i + 1] * d_stft[2 * i + 1]);
+        }
+
+        // Mel Spectrogram
+        dim3 mel_threads(BLOCK_SIZE);
+        dim3 mel_blocks((num_frames + BLOCK_SIZE - 1) / BLOCK_SIZE, 
+                        (num_mel_bins + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        mel_filterbank_kernel<<<mel_blocks, mel_threads>>>(d_magnitude, d_mel_spectrogram, 
+                                                             d_mel_filterbank, num_frames, num_bins,
+                                                             num_mel_bins);
+
+        // Layer Normalization
+        if (normalization_mode == 0) {
+            // Per-channel normalization
+            cudaMemset(d_mean, 0, num_mel_bins * sizeof(float));
+            cudaMemset(d_var, 0, num_mel_bins * sizeof(float));
+            dim3 norm_threads(BLOCK_SIZE);
+            dim3 norm_blocks((num_frames + BLOCK_SIZE - 1) / BLOCK_SIZE, 
+                              (num_mel_bins + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+            // Calculate mean and variance
+            layer_norm_kernel<<<norm_blocks, norm_threads>>>(d_mel_spectrogram, d_mean, num_frames, num_mel_bins,
+                                                              normalization_mode, d_mean, d_var, d_inv_stddev, 1);
+
+            // Calculate inverse standard deviation
+            for (int i = 0; i < num_mel_bins; ++i) {
+                d_inv_stddev[i] = 1.0f / sqrtf(d_var[i] + 1e-6f);
+            }
+
+            // Normalize
+            layer_norm_kernel<<<norm_blocks, norm_threads>>>(d_mel_spectrogram, d_mel_spectrogram, num_frames, num_mel_bins,
+                                                              normalization_mode, d_mean, d_var, d_inv_stddev, 1);
+        } else if (normalization_mode == 1) {
+            // Global normalization
+            cudaMemset(d_mean, 0, num_mel_bins * sizeof(float));
+            cudaMemset(d_var, 0, num_mel_bins * sizeof(float));
+            dim3 norm_threads(BLOCK_SIZE);
+            dim3 norm_blocks((num_frames + BLOCK_SIZE - 1) / BLOCK_SIZE, 
+                              (num_mel_bins + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+            // Calculate mean and variance
+            layer_norm_kernel<<<norm_blocks, norm_threads>>>(d_mel_spectrogram, d_mean, num_frames, num_mel_bins,
+                                                              normalization_mode, d_mean, d_var, d_inv_stddev, num_mel_bins);
+
+            // Calculate inverse standard deviation
+            for (int i = 0; i < num_mel_bins; ++i) {
+                d_inv_stddev[i] = 1.0f / sqrtf(d_var[i] + 1e-6f);
+            }
+
+            // Normalize
+            layer_norm_kernel<<<norm_blocks, norm_threads>>>(d_mel_spectrogram, d_mel_spectrogram, num_frames, num_mel_bins,
+                                                              normalization_mode, d_mean, d_var, d_inv_stddev, num_mel_bins);
+        }
+
+        // Cross-fade
+        int fade_length = int(0.1 * sample_rate / hop_length);
+        dim3 cross_fade_threads(BLOCK_SIZE);
+        dim3 cross_fade_blocks((num_frames + BLOCK_SIZE - 1) / BLOCK_SIZE, 
+                               (num_mel_bins + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        cross_fade_kernel<<<cross_fade_blocks, cross_fade_threads>>>(d_mel_spectrogram, num_frames, num_mel_bins, fade_length);
+
+        // Adaptive Average Pooling
+        dim3 pool_threads(BLOCK_SIZE);
+        dim3 pool_blocks((num_frames + BLOCK_SIZE - 1) / BLOCK_SIZE, 
+                          (num_mel_bins + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        adaptive_avg_pool1d_kernel<<<pool_blocks, pool_threads>>>(d_mel_spectrogram, d_output, num_frames, num_mel_bins);
+
+        // Copy result back to host
+        cudaMemcpy(output, d_output, output_dim0 * output_dim1 * output_dim2 * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_stft);
+        cudaFree(d_magnitude);
+        cudaFree(d_mel_spectrogram);
+        cudaFree(d_output);
+        cudaFree(d_mel_filterbank);
+        cudaFree(d_mean);
+        cudaFree(d_var);
+        cudaFree(d_inv_stddev);
+        cudaFree(d_window);
+    }
+}
+```

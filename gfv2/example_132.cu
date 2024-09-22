@@ -1,0 +1,78 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <cmath>
+#include <stdarg.h>
+
+// Helper function for logsumexp
+__device__ float logsumexp_kernel(const float* input, int n, int dim) {
+    float max_val = input[0];
+    for (int i = 1; i < n; ++i) {
+        max_val = fmaxf(max_val, input[i]);
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += expf(input[i] - max_val);
+    }
+    return logf(sum) + max_val;
+}
+
+// CUDA kernel for logsumexp
+__global__ void logsumexp_kernel_gpu(const float* input, float* output, int batch_size, int input_dim, int dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < input_dim) {
+        int idx = row * input_dim + col;
+        int offset = (dim == 0) ? col : row * input_dim;
+        output[idx] = logsumexp_kernel(input + offset, input_dim, dim);
+    }
+}
+
+extern "C" {
+
+void logsumexp_grad_checkpointing(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+    int input_dim2 = va_arg(args, int);
+
+    // Extract dimension
+    int dim = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int input_dim = input_dim1; // Assuming dim 1 is the dimension to reduce
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim * input_dim2 * sizeof(float));
+    cudaMalloc(&d_output, batch_size * input_dim * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * input_dim * input_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((input_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    logsumexp_kernel_gpu<<<numBlocks, threadsPerBlock>>>(d_input, d_output, batch_size, input_dim, dim);
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+}
+
+} // extern "C"

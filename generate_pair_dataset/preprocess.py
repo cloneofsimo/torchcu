@@ -1,8 +1,14 @@
 # split up dataset into *.py and *.cu
 
 import glob
+import os
+import shutil
 
 def splitup(input_dir, output_dir):
+    # remove output_dir if exists
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
     for file in glob.glob(f"{input_dir}/*.txt"):
         with open(file, "r") as f:
             filename = file.split("/")[-1]
@@ -11,6 +17,11 @@ def splitup(input_dir, output_dir):
             try:
                 py_code = content.split("```python")[1].split("```")[0]
                 cu_code = content.split("```c++")[1].split("```")[0]
+                # check if there is cutlass or cudnn in cu_code
+                if "cutlass" in cu_code or "cudnn" in cu_code:
+                    print(f"skip {file}")
+                    continue
+                
             except:
                 print(f"Error: {file}")
                 continue

@@ -1,0 +1,171 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// CUDA Kernel for Spectrogram Calculation
+// ---------------------------------------------------------------------------------------------------------------------------------
+__global__ void spectrogram_kernel(const float* input, float* output, int batch_size, int num_samples, int n_fft, int hop_length, int win_length) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int sample_idx = idx * hop_length;
+    if (sample_idx >= num_samples) {
+        return;
+    }
+
+    // Apply Hann window
+    float window[256];  // Assuming win_length = 256
+    for (int i = 0; i < win_length; i++) {
+        window[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (win_length - 1)));
+    }
+
+    // Calculate FFT
+    for (int b = 0; b < batch_size; b++) {
+        float complex_data[256] = {0.0f};
+        for (int i = 0; i < win_length; i++) {
+            if (sample_idx + i < num_samples) {
+                complex_data[i] = input[b * num_samples + sample_idx + i] * window[i];
+            }
+        }
+
+        // Use CUDA cufft library for FFT (replace with optimized cufft calls)
+        // cufftHandle plan;
+        // cufftPlan1d(&plan, n_fft, CUFFT_C2C, 1); 
+        // cufftExecC2C(plan, complex_data, complex_data, CUFFT_FORWARD);
+        // cufftDestroy(plan);
+
+        // Apply magnitude squared operation
+        for (int i = 0; i < n_fft / 2 + 1; i++) {
+            output[b * (n_fft / 2 + 1) * batch_size + idx * (n_fft / 2 + 1) + i] = complex_data[i].real * complex_data[i].real + complex_data[i].imag * complex_data[i].imag; 
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// CUDA Kernel for Convolution (TBC)
+// ---------------------------------------------------------------------------------------------------------------------------------
+__global__ void conv_tbc_kernel(const float* input, const float* weight, const float* bias, float* output, 
+                                 int batch_size, int in_channels, int out_channels, int kernel_size, int input_length, int output_length) {
+
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (b < batch_size && t < output_length && c < out_channels) {
+        float sum = 0.0f;
+        for (int k = 0; k < kernel_size; k++) {
+            if (t + k < input_length) {
+                for (int i = 0; i < in_channels; i++) {
+                    sum += input[b * in_channels * input_length + (t + k) * in_channels + i] * weight[c * in_channels * kernel_size + i * kernel_size + k];
+                }
+            }
+        }
+        output[b * out_channels * output_length + t * out_channels + c] = sum + bias[c]; 
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// CUDA Kernel for ELU Activation
+// ---------------------------------------------------------------------------------------------------------------------------------
+__global__ void elu_kernel(float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        if (output[idx] > 0) {
+            output[idx] = output[idx]; // No change
+        } else {
+            output[idx] = expf(output[idx]) - 1.0f;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+//  External C Function
+// ---------------------------------------------------------------------------------------------------------------------------------
+extern "C" {
+
+void spectrogram_conv_elu_fp32_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract inputs
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+    int weight_dim2 = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+    int bias_dim0 = va_arg(args, int);
+
+    // Extract output
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Input dimensions
+    int batch_size = input_tensor_dim0;
+    int num_samples = input_tensor_dim2;
+    int in_channels = weight_dim1; // 1 (assuming grayscale)
+    int out_channels = weight_dim0;
+    int kernel_size = weight_dim2; 
+    int output_length = input_tensor_dim2 - kernel_size + 1;  // Assuming no padding
+
+    // FFT parameters
+    int n_fft = 256;
+    int hop_length = 128;
+    int win_length = 256; 
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_spectrogram, *d_output;
+    cudaMalloc(&d_input, batch_size * num_samples * sizeof(float));
+    cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * weight_dim2 * sizeof(float));
+    cudaMalloc(&d_bias, bias_dim0 * sizeof(float));
+    cudaMalloc(&d_spectrogram, batch_size * (n_fft / 2 + 1) * output_length * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_channels * output_length * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * num_samples * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * weight_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, bias_dim0 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Spectrogram computation
+    dim3 threadsPerBlock_spectrogram(256);
+    dim3 numBlocks_spectrogram((num_samples + hop_length - 1) / hop_length);
+
+    spectrogram_kernel<<<numBlocks_spectrogram, threadsPerBlock_spectrogram>>>(
+        d_input, d_spectrogram, batch_size, num_samples, n_fft, hop_length, win_length);
+
+    // Convolution computation
+    dim3 threadsPerBlock_conv(16, 16, 4);
+    dim3 numBlocks_conv((batch_size + threadsPerBlock_conv.x - 1) / threadsPerBlock_conv.x,
+                         (output_length + threadsPerBlock_conv.y - 1) / threadsPerBlock_conv.y,
+                         (out_channels + threadsPerBlock_conv.z - 1) / threadsPerBlock_conv.z);
+
+    conv_tbc_kernel<<<numBlocks_conv, threadsPerBlock_conv>>>(
+        d_spectrogram, d_weight, d_bias, d_output,
+        batch_size, in_channels, out_channels, kernel_size, output_length, output_length);
+
+    // ELU activation
+    dim3 threadsPerBlock_elu(256);
+    dim3 numBlocks_elu((batch_size * out_channels * output_length + threadsPerBlock_elu.x - 1) / threadsPerBlock_elu.x);
+    elu_kernel<<<numBlocks_elu, threadsPerBlock_elu>>>(d_output, batch_size * out_channels * output_length);
+
+    // Copy output data back to host
+    cudaMemcpy(output, d_output, batch_size * out_channels * output_length * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_spectrogram);
+    cudaFree(d_output);
+}
+
+} // extern "C"
+

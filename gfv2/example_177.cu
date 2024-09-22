@@ -1,0 +1,149 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to __half
+__device__ __forceinline__ __half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert __half to float
+__device__ __forceinline__ float half_to_float(__half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for pruned linear layer with ReLU and fused dropout
+__global__ void pruned_linear_relu_dropout_kernel(const float* input, const __half* weight, const __half* bias, 
+                                                float* output, const __half* mask, int batch_size, 
+                                                int in_features, int out_features, float dropout_rate) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < out_features) {
+        float sum = 0.0f;
+        for (int i = 0; i < in_features; ++i) {
+            if (mask[col * in_features + i] != 0.0f) {
+                sum += half_to_float(__hmul(__half2float(input[row * in_features + i]), 
+                                        weight[col * in_features + i]));
+            }
+        }
+        sum += half_to_float(bias[col]);
+
+        // Apply dropout with the same logic as PyTorch's FusedDropout
+        if (rand() / RAND_MAX < dropout_rate) {
+            sum = 0.0f;
+        } else {
+            sum /= (1.0f - dropout_rate);
+        }
+
+        output[row * out_features + col] = fmaxf(sum, 0.0f); // ReLU activation
+    }
+}
+
+// CUDA kernel for second linear layer with ReLU
+__global__ void linear_relu_kernel(const float* input, const __half* weight, const __half* bias,
+                                   float* output, int batch_size, int in_features, int out_features) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < out_features) {
+        float sum = 0.0f;
+        for (int i = 0; i < in_features; ++i) {
+            sum += half_to_float(__hmul(__half2float(input[row * in_features + i]),
+                                        weight[col * in_features + i]));
+        }
+        sum += half_to_float(bias[col]);
+        output[row * out_features + col] = fmaxf(sum, 0.0f); // ReLU activation
+    }
+}
+
+extern "C" {
+
+void my_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Model parameters (assume hardcoded for now)
+    int batch_size = input_tensor_dim0;
+    int in_features = 10;
+    int hidden_features = 5;
+    int out_features = 2;
+    float dropout_rate = 0.2f;
+
+    // Allocate device memory for all tensors
+    float *d_input, *d_output;
+    __half *d_fc1_weight, *d_fc1_bias, *d_fc1_mask, *d_fc2_weight, *d_fc2_bias;
+
+    cudaMalloc(&d_input, batch_size * in_features * sizeof(float));
+    cudaMalloc(&d_output, batch_size * out_features * sizeof(float));
+    cudaMalloc(&d_fc1_weight, hidden_features * in_features * sizeof(__half));
+    cudaMalloc(&d_fc1_bias, hidden_features * sizeof(__half));
+    cudaMalloc(&d_fc1_mask, hidden_features * in_features * sizeof(__half));
+    cudaMalloc(&d_fc2_weight, out_features * hidden_features * sizeof(__half));
+    cudaMalloc(&d_fc2_bias, out_features * sizeof(__half));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * in_features * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Initialize weights and biases on device
+    // (In a real implementation, these would be loaded from a model file)
+    for (int i = 0; i < hidden_features * in_features; ++i) {
+        d_fc1_weight[i] = __float2half_rn(rand() / float(RAND_MAX));
+    }
+    for (int i = 0; i < hidden_features; ++i) {
+        d_fc1_bias[i] = __float2half_rn(rand() / float(RAND_MAX));
+    }
+    for (int i = 0; i < hidden_features * in_features; ++i) {
+        d_fc1_mask[i] = __float2half_rn(rand() / float(RAND_MAX) > 0.5f ? 1.0f : 0.0f);
+    }
+    for (int i = 0; i < out_features * hidden_features; ++i) {
+        d_fc2_weight[i] = __float2half_rn(rand() / float(RAND_MAX));
+    }
+    for (int i = 0; i < out_features; ++i) {
+        d_fc2_bias[i] = __float2half_rn(rand() / float(RAND_MAX));
+    }
+
+    // Launch the first pruned linear layer kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((hidden_features + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                    (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    pruned_linear_relu_dropout_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_fc1_weight, d_fc1_bias, d_output, d_fc1_mask, batch_size,
+        in_features, hidden_features, dropout_rate
+    );
+
+    // Launch the second linear layer kernel
+    numBlocks = ((out_features + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                 (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    linear_relu_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, d_fc2_weight, d_fc2_bias, d_input, batch_size,
+        hidden_features, out_features
+    ); // Reusing d_input for the second layer's output
+
+    // Copy result back to host
+    cudaMemcpy(output, d_input, batch_size * out_features * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_fc1_weight);
+    cudaFree(d_fc1_bias);
+    cudaFree(d_fc1_mask);
+    cudaFree(d_fc2_weight);
+    cudaFree(d_fc2_bias);
+}
+
+}  // extern "C"

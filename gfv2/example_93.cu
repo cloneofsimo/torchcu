@@ -1,0 +1,202 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// CUDA kernel for audio normalization
+__global__ void audio_normalization_kernel(const float* input, float* output, 
+                                        int batch_size, int sequence_length) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * sequence_length) {
+        int batch_id = idx / sequence_length;
+        int time_id = idx % sequence_length;
+
+        float sum = 0.0f;
+        for (int i = 0; i < sequence_length; ++i) {
+            sum += input[batch_id * sequence_length + i];
+        }
+        float mean = sum / sequence_length;
+
+        float sum_squared = 0.0f;
+        for (int i = 0; i < sequence_length; ++i) {
+            sum_squared += (input[batch_id * sequence_length + i] - mean) * (input[batch_id * sequence_length + i] - mean);
+        }
+        float std = sqrt(sum_squared / (sequence_length - 1));
+
+        output[idx] = (input[idx] - mean) / std;
+    }
+}
+
+// CUDA kernel for group normalization
+__global__ void group_norm_kernel(const float* input, float* output, 
+                                 int batch_size, int feature_dim, int num_groups) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * feature_dim) {
+        int batch_id = idx / feature_dim;
+        int feature_id = idx % feature_dim;
+        int group_id = feature_id / (feature_dim / num_groups);
+
+        float sum = 0.0f;
+        for (int i = 0; i < feature_dim / num_groups; ++i) {
+            sum += input[batch_id * feature_dim + group_id * (feature_dim / num_groups) + i];
+        }
+        float mean = sum / (feature_dim / num_groups);
+
+        float sum_squared = 0.0f;
+        for (int i = 0; i < feature_dim / num_groups; ++i) {
+            sum_squared += (input[batch_id * feature_dim + group_id * (feature_dim / num_groups) + i] - mean) 
+                           * (input[batch_id * feature_dim + group_id * (feature_dim / num_groups) + i] - mean);
+        }
+        float std = sqrt(sum_squared / (feature_dim / num_groups));
+
+        output[idx] = (input[idx] - mean) / std;
+    }
+}
+
+// CUDA kernel for linear projection and ReLU activation
+__global__ void linear_relu_kernel(const float* input, const float* weight, float* output, 
+                                 int batch_size, int input_dim, int output_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * output_dim) {
+        int batch_id = idx / output_dim;
+        int output_id = idx % output_dim;
+
+        float sum = 0.0f;
+        for (int i = 0; i < input_dim; ++i) {
+            sum += input[batch_id * input_dim + i] * weight[output_id * input_dim + i];
+        }
+        output[idx] = fmaxf(sum, 0.0f);  // ReLU activation
+    }
+}
+
+// CUDA kernel for residual connection and layer normalization
+__global__ void residual_layernorm_kernel(const float* input, const float* encoder_output, 
+                                        float* output, int batch_size, int feature_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * feature_dim) {
+        output[idx] = input[idx] + encoder_output[idx];
+
+        // Layer normalization
+        float sum = 0.0f;
+        for (int i = 0; i < feature_dim; ++i) {
+            sum += output[idx + i];
+        }
+        float mean = sum / feature_dim;
+
+        float sum_squared = 0.0f;
+        for (int i = 0; i < feature_dim; ++i) {
+            sum_squared += (output[idx + i] - mean) * (output[idx + i] - mean);
+        }
+        float std = sqrt(sum_squared / feature_dim);
+
+        for (int i = 0; i < feature_dim; ++i) {
+            output[idx + i] = (output[idx + i] - mean) / std;
+        }
+    }
+}
+
+extern "C" {
+
+void audio_normalization_transformer_decoder(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    const bool* attention_mask = va_arg(args, const bool*);
+    int attention_mask_dim0 = va_arg(args, int);
+    int attention_mask_dim1 = va_arg(args, int);
+    const float* encoder_output = va_arg(args, const float*);
+    int encoder_output_dim0 = va_arg(args, int);
+    int encoder_output_dim1 = va_arg(args, int);
+    const float* decoder_hidden_states = va_arg(args, const float*);
+    int decoder_hidden_states_dim0 = va_arg(args, int);
+    int decoder_hidden_states_dim1 = va_arg(args, int);
+
+    // Extract weights
+    int num_weights = va_arg(args, int);
+    const float** weights = new const float*[num_weights];
+    for (int i = 0; i < num_weights; ++i) {
+        weights[i] = va_arg(args, const float*);
+    }
+
+    // Extract output tensor
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int sequence_length = input_tensor_dim1;
+    int feature_dim = encoder_output_dim1;
+    int num_groups = 8;
+
+    // Allocate device memory
+    float *d_input, *d_attention_mask, *d_encoder_output, *d_decoder_hidden_states, *d_output, *d_weights[num_weights];
+    cudaMalloc(&d_input, batch_size * sequence_length * sizeof(float));
+    cudaMalloc(&d_attention_mask, batch_size * sequence_length * sizeof(bool));
+    cudaMalloc(&d_encoder_output, batch_size * feature_dim * sizeof(float));
+    cudaMalloc(&d_decoder_hidden_states, batch_size * feature_dim * sizeof(float));
+    cudaMalloc(&d_output, batch_size * feature_dim * sizeof(float));
+    for (int i = 0; i < num_weights; ++i) {
+        cudaMalloc(&d_weights[i], feature_dim * feature_dim * sizeof(float));
+    }
+
+    // Copy data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * sequence_length * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_attention_mask, attention_mask, batch_size * sequence_length * sizeof(bool), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_encoder_output, encoder_output, batch_size * feature_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_decoder_hidden_states, decoder_hidden_states, batch_size * feature_dim * sizeof(float), cudaMemcpyHostToDevice);
+    for (int i = 0; i < num_weights; ++i) {
+        cudaMemcpy(d_weights[i], weights[i], feature_dim * feature_dim * sizeof(float), cudaMemcpyHostToDevice);
+    }
+
+    // 1. Audio Normalization
+    audio_normalization_kernel<<<(batch_size * sequence_length + 255) / 256, 256>>>(
+        d_input, d_output, batch_size, sequence_length
+    );
+
+    // 2. Transformer Decoder
+    d_decoder_hidden_states = d_output;
+
+    for (int i = 0; i < num_weights; ++i) {
+        // Apply attention mask (not implemented here)
+        // ...
+
+        // Linear projection and group normalization
+        linear_relu_kernel<<<(batch_size * feature_dim + 255) / 256, 256>>>(
+            d_decoder_hidden_states, d_weights[i], d_output, batch_size, feature_dim, feature_dim
+        );
+        group_norm_kernel<<<(batch_size * feature_dim + 255) / 256, 256>>>(
+            d_output, d_decoder_hidden_states, batch_size, feature_dim, num_groups
+        );
+
+        // Attention and multi-head attention (not implemented here for simplicity)
+
+        // Residual connection and layer normalization
+        residual_layernorm_kernel<<<(batch_size * feature_dim + 255) / 256, 256>>>(
+            d_decoder_hidden_states, d_encoder_output, d_output, batch_size, feature_dim
+        );
+        d_decoder_hidden_states = d_output;
+
+        // Further layers can be added as needed
+    }
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * feature_dim * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_attention_mask);
+    cudaFree(d_encoder_output);
+    cudaFree(d_decoder_hidden_states);
+    cudaFree(d_output);
+    for (int i = 0; i < num_weights; ++i) {
+        cudaFree(d_weights[i]);
+    }
+    delete[] weights;
+}
+
+}  // extern "C"

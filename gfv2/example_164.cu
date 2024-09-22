@@ -1,0 +1,169 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for bilateral filtering
+__global__ void bilateral_filter_kernel(const float* input, float* output, 
+                                         int batch, int channels, int height, int width, 
+                                         int kernel_size, float sigma_color, float sigma_space) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = batch * channels * height * width + y * width + x;
+
+    if (x >= 0 && x < width && y >= 0 && y < height) {
+        float sum = 0.0f;
+        float weight_sum = 0.0f;
+
+        for (int ky = -kernel_size / 2; ky <= kernel_size / 2; ++ky) {
+            for (int kx = -kernel_size / 2; kx <= kernel_size / 2; ++kx) {
+                int neighbor_x = x + kx;
+                int neighbor_y = y + ky;
+                if (neighbor_x >= 0 && neighbor_x < width && neighbor_y >= 0 && neighbor_y < height) {
+                    int neighbor_idx = batch * channels * height * width + neighbor_y * width + neighbor_x;
+                    float color_distance = 0.0f;
+                    for (int c = 0; c < channels; ++c) {
+                        color_distance += abs(input[idx + c * height * width] - input[neighbor_idx + c * height * width]);
+                    }
+                    float spatial_distance = sqrt(kx * kx + ky * ky);
+                    float weight = exp(-(color_distance * color_distance) / (2 * sigma_color * sigma_color) - 
+                                    (spatial_distance * spatial_distance) / (2 * sigma_space * sigma_space));
+                    sum += weight * input[neighbor_idx];
+                    weight_sum += weight;
+                }
+            }
+        }
+        output[idx] = sum / weight_sum;
+    }
+}
+
+// CUDA kernel for soft margin loss
+__global__ void soft_margin_loss_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = logf(1.0f + expf(-input[idx]));
+    }
+}
+
+// CUDA kernel for gradient clipping
+__global__ void gradient_clipping_kernel(float* gradient, int size, float clip_value) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        gradient[idx] = fminf(fmaxf(gradient[idx], -clip_value), clip_value);
+    }
+}
+
+// CUDA kernel for minimum filtering
+__global__ void min_filter_kernel(const float* input, float* output, 
+                                  int batch, int channels, int height, int width,
+                                  int kernel_size) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = batch * channels * height * width + y * width + x;
+
+    if (x >= 0 && x < width && y >= 0 && y < height) {
+        float min_value = FLT_MAX;
+        for (int ky = -kernel_size / 2; ky <= kernel_size / 2; ++ky) {
+            for (int kx = -kernel_size / 2; kx <= kernel_size / 2; ++kx) {
+                int neighbor_x = x + kx;
+                int neighbor_y = y + ky;
+                if (neighbor_x >= 0 && neighbor_x < width && neighbor_y >= 0 && neighbor_y < height) {
+                    int neighbor_idx = batch * channels * height * width + neighbor_y * width + neighbor_x;
+                    min_value = fminf(min_value, input[neighbor_idx]);
+                }
+            }
+        }
+        output[idx] = min_value;
+    }
+}
+
+extern "C" {
+
+void my_image_processing(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract kernel size
+    int kernel_size = va_arg(args, int);
+
+    // Extract sigma_color
+    float sigma_color = va_arg(args, float);
+
+    // Extract sigma_space
+    float sigma_space = va_arg(args, float);
+
+    // Extract clip_value
+    float clip_value = va_arg(args, float);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch = input_tensor_dim0;
+    int channels = input_tensor_dim1;
+    int height = input_tensor_dim2;
+    int width = input_tensor_dim3;
+
+    // Allocate device memory
+    float *d_input, *d_filtered_image, *d_min_filtered_image, *d_loss, *d_gradient;
+    cudaMalloc(&d_input, batch * channels * height * width * sizeof(float));
+    cudaMalloc(&d_filtered_image, batch * channels * height * width * sizeof(float));
+    cudaMalloc(&d_min_filtered_image, batch * channels * height * width * sizeof(float));
+    cudaMalloc(&d_loss, batch * sizeof(float));  // For soft margin loss
+    cudaMalloc(&d_gradient, batch * channels * height * width * sizeof(float));  // For gradient clipping
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch * channels * height * width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Bilateral filtering
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (height + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    bilateral_filter_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_filtered_image, batch, channels, height, width, kernel_size, sigma_color, sigma_space
+    );
+
+    // Soft margin loss
+    int size = batch * channels * height * width;
+    soft_margin_loss_kernel<<<(size + 255) / 256, 256>>>(d_filtered_image, d_loss, size);
+
+    // Gradient clipping
+    gradient_clipping_kernel<<<(size + 255) / 256, 256>>>(d_filtered_image, size, clip_value);
+
+    // Minimum filtering
+    min_filter_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_filtered_image, d_min_filtered_image, batch, channels, height, width, kernel_size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_min_filtered_image, batch * channels * height * width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_filtered_image);
+    cudaFree(d_min_filtered_image);
+    cudaFree(d_loss);
+    cudaFree(d_gradient);
+}
+
+}  // extern "C"

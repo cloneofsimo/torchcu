@@ -1,0 +1,125 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <complex>
+
+// Structure to represent a complex number
+typedef struct {
+    float real;
+    float imag;
+} Complex;
+
+// Helper function for complex multiplication
+__device__ Complex complex_mul(Complex a, Complex b) {
+    Complex result;
+    result.real = a.real * b.real - a.imag * b.imag;
+    result.imag = a.real * b.imag + a.imag * b.real;
+    return result;
+}
+
+// CUDA kernel for 3D FFT convolution
+__global__ void fft_conv3d_inplace_kernel(Complex* input_fft, Complex* kernel_fft, Complex* output_fft,
+                                        int batch_size, int input_dim0, int input_dim1, int input_dim2,
+                                        int kernel_dim0, int kernel_dim1, int kernel_dim2) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int freq_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int freq_idx2 = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (batch_idx < batch_size && freq_idx < input_dim0 && freq_idx2 < input_dim1 && freq_idx < input_dim2) {
+        int input_idx = batch_idx * input_dim0 * input_dim1 * input_dim2 + freq_idx * input_dim1 * input_dim2 + freq_idx2 * input_dim2 + freq_idx;
+        int kernel_idx = freq_idx * kernel_dim1 * kernel_dim2 + freq_idx2 * kernel_dim2 + freq_idx;
+        output_fft[input_idx] = complex_mul(input_fft[input_idx], kernel_fft[kernel_idx]);
+    }
+}
+
+// CUDA kernel for inverse 3D FFT
+__global__ void inverse_fft3d_kernel(Complex* input_fft, float* output, int batch_size, int input_dim0, int input_dim1, int input_dim2) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int spatial_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int spatial_idx2 = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (batch_idx < batch_size && spatial_idx < input_dim0 && spatial_idx2 < input_dim1 && spatial_idx < input_dim2) {
+        int input_idx = batch_idx * input_dim0 * input_dim1 * input_dim2 + spatial_idx * input_dim1 * input_dim2 + spatial_idx2 * input_dim2 + spatial_idx;
+        output[input_idx] = input_fft[input_idx].real;
+    }
+}
+
+extern "C" {
+
+void fft_conv3d_inplace(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    float* input_tensor = va_arg(args, float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+    int input_tensor_dim3 = va_arg(args, int);
+
+    // Extract kernel tensor
+    float* kernel = va_arg(args, float*);
+    int kernel_dim0 = va_arg(args, int);
+    int kernel_dim1 = va_arg(args, int);
+    int kernel_dim2 = va_arg(args, int);
+
+    va_end(args);
+
+    // Calculate padding sizes for kernel
+    int pad_size0 = (input_tensor_dim0 - kernel_dim0) / 2;
+    int pad_size1 = (input_tensor_dim1 - kernel_dim1) / 2;
+    int pad_size2 = (input_tensor_dim2 - kernel_dim2) / 2;
+
+    // Allocate device memory
+    Complex* d_input_fft;
+    Complex* d_kernel_fft;
+    Complex* d_output_fft;
+    float* d_output;
+
+    cudaMalloc(&d_input_fft, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(Complex));
+    cudaMalloc(&d_kernel_fft, kernel_dim0 * kernel_dim1 * kernel_dim2 * sizeof(Complex));
+    cudaMalloc(&d_output_fft, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(Complex));
+    cudaMalloc(&d_output, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float));
+
+    // Copy input tensor to device
+    cudaMemcpy(d_input_fft, input_tensor, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyHostToDevice);
+    // Copy kernel tensor to device
+    cudaMemcpy(d_kernel_fft, kernel, kernel_dim0 * kernel_dim1 * kernel_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Perform 3D FFT on input and kernel
+    // (Implementation omitted for brevity, requires cuFFT library)
+
+    // Launch convolution kernel
+    dim3 threadsPerBlock(16, 16, 16);
+    dim3 numBlocks((input_tensor_dim3 + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                    (input_tensor_dim0 + threadsPerBlock.y - 1) / threadsPerBlock.y, 
+                    (input_tensor_dim1 + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    fft_conv3d_inplace_kernel<<<numBlocks, threadsPerBlock>>>(d_input_fft, d_kernel_fft, d_output_fft,
+                                                    input_tensor_dim3, input_tensor_dim0, input_tensor_dim1, input_tensor_dim2,
+                                                    kernel_dim0, kernel_dim1, kernel_dim2);
+
+    // Perform inverse 3D FFT on output
+    // (Implementation omitted for brevity, requires cuFFT library)
+
+    // Launch inverse FFT kernel
+    dim3 threadsPerBlock2(16, 16, 16);
+    dim3 numBlocks2((input_tensor_dim3 + threadsPerBlock2.x - 1) / threadsPerBlock2.x,
+                    (input_tensor_dim0 + threadsPerBlock2.y - 1) / threadsPerBlock2.y,
+                    (input_tensor_dim1 + threadsPerBlock2.z - 1) / threadsPerBlock2.z);
+
+    inverse_fft3d_kernel<<<numBlocks2, threadsPerBlock2>>>(d_output_fft, d_output, input_tensor_dim3, input_tensor_dim0, input_tensor_dim1, input_tensor_dim2);
+
+    // Copy output back to host
+    cudaMemcpy(input_tensor, d_output, input_tensor_dim0 * input_tensor_dim1 * input_tensor_dim2 * input_tensor_dim3 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input_fft);
+    cudaFree(d_kernel_fft);
+    cudaFree(d_output_fft);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

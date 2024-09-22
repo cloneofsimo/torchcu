@@ -1,0 +1,74 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+// CUDA kernel for index selection
+__global__ void index_select_kernel(const float* input_tensor, const int* indices, float* output,
+                                    int batch_size, int input_dim, int num_indices) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && index < num_indices) {
+        int selected_index = indices[index];
+        if (selected_index >= 0 && selected_index < input_dim) {
+            output[row * num_indices + index] = input_tensor[row * input_dim + selected_index];
+        } else {
+            output[row * num_indices + index] = 0.0f; // Handle out-of-bounds indices
+        }
+    }
+}
+
+extern "C" {
+
+void index_select_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract indices tensor
+    const int* indices = va_arg(args, const int*);
+    int indices_dim0 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim = input_tensor_dim1;
+    int num_indices = indices_dim0;
+
+    // Allocate device memory
+    float *d_input, *d_output;
+    int *d_indices;
+    cudaMalloc(&d_input, batch_size * input_dim * sizeof(float));
+    cudaMalloc(&d_indices, num_indices * sizeof(int));
+    cudaMalloc(&d_output, batch_size * num_indices * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_indices, indices, num_indices * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((num_indices + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    index_select_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_indices, d_output, batch_size, input_dim, num_indices
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * num_indices * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_indices);
+    cudaFree(d_output);
+}
+
+} // extern "C"

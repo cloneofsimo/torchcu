@@ -1,0 +1,122 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// Helper functions for bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// Helper functions for FP16
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// Kernel for GELU activation
+__global__ void gelu_kernel(const float* input, half* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx];
+        output[idx] = float_to_half(0.5f * x * (1.0f + erf(x / sqrtf(2.0f))));
+    }
+}
+
+// Kernel for Mish activation
+__global__ void mish_kernel(const half* input, half* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = half_to_float(input[idx]);
+        output[idx] = float_to_half(x * tanhf(logf(1.0f + expf(x))));
+    }
+}
+
+// Kernel for matrix exponential
+__global__ void matrix_exp_kernel(const float* input, float* output, int rows, int cols) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < rows && col < cols) {
+        output[row * cols + col] = expf(input[row * cols + col]);
+    }
+}
+
+// Function to calculate the determinant of a 2x2 matrix
+__device__ float det2x2(float a, float b, float c, float d) {
+    return (a * d) - (b * c);
+}
+
+// Kernel for calculating the determinant
+__global__ void det_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx == 0) { // Only calculate the determinant for the first element
+        float a = input[0];
+        float b = input[1];
+        float c = input[2];
+        float d = input[3];
+        output[0] = det2x2(a, b, c, d);
+    }
+}
+
+extern "C" {
+
+void complex_activation_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Allocate device memory for output tensors
+    half* d_gelu_output;
+    cudaMalloc(&d_gelu_output, input_tensor_dim0 * input_tensor_dim1 * sizeof(half));
+    float* d_det_output;
+    cudaMalloc(&d_det_output, sizeof(float));
+    float* d_matrix_exp_output;
+    cudaMalloc(&d_matrix_exp_output, input_tensor_dim0 * input_tensor_dim1 * sizeof(float));
+    half* d_mish_output;
+    cudaMalloc(&d_mish_output, input_tensor_dim0 * input_tensor_dim1 * sizeof(half));
+
+    // Launch kernels
+    int size = input_tensor_dim0 * input_tensor_dim1;
+    gelu_kernel<<<(size + 255) / 256, 256>>>(input_tensor, d_gelu_output, size);
+    det_kernel<<<1, 1>>>(input_tensor, d_det_output, size);
+    matrix_exp_kernel<<<(input_tensor_dim0 + 15) / 16, 16, 1>>>(input_tensor, d_matrix_exp_output, input_tensor_dim0, input_tensor_dim1);
+    mish_kernel<<<(size + 255) / 256, 256>>>(d_gelu_output, d_mish_output, size);
+
+    // Extract output tensors
+    half* h_gelu_output = va_arg(args, half*);
+    float* h_det_output = va_arg(args, float*);
+    float* h_matrix_exp_output = va_arg(args, float*);
+    half* h_mish_output = va_arg(args, half*);
+
+    // Copy results back to host
+    cudaMemcpy(h_gelu_output, d_gelu_output, input_tensor_dim0 * input_tensor_dim1 * sizeof(half), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_det_output, d_det_output, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_matrix_exp_output, d_matrix_exp_output, input_tensor_dim0 * input_tensor_dim1 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_mish_output, d_mish_output, input_tensor_dim0 * input_tensor_dim1 * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_gelu_output);
+    cudaFree(d_det_output);
+    cudaFree(d_matrix_exp_output);
+    cudaFree(d_mish_output);
+
+    va_end(args);
+}
+
+}  // extern "C"

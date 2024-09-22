@@ -1,0 +1,100 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+__global__ void grouped_conv2d_relu_kernel(const float* input, const float* weight, const float* bias, float* output,
+                                          int batch, int in_channels, int out_channels, int groups, 
+                                          int in_height, int in_width, int kernel_height, int kernel_width, 
+                                          int stride_height, int stride_width, int padding_height, int padding_width) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    int o = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.z * blockDim.z + threadIdx.z;
+    int w = threadIdx.z;
+
+    if (b < batch && o < out_channels && h < in_height && w < in_width) {
+        int group_id = o / (out_channels / groups);
+        int out_channel_in_group = o % (out_channels / groups);
+
+        float sum = 0.0f;
+        for (int ic = 0; ic < in_channels / groups; ic++) {
+            for (int kh = 0; kh < kernel_height; kh++) {
+                for (int kw = 0; kw < kernel_width; kw++) {
+                    int ih = h * stride_height - padding_height + kh;
+                    int iw = w * stride_width - padding_width + kw;
+
+                    if (ih >= 0 && ih < in_height && iw >= 0 && iw < in_width) {
+                        sum += input[(b * in_channels + group_id * (in_channels / groups) + ic) * in_height * in_width + ih * in_width + iw] * 
+                               weight[(out_channel_in_group * (in_channels / groups) + ic) * kernel_height * kernel_width + kh * kernel_width + kw];
+                    }
+                }
+            }
+        }
+        output[(b * out_channels + o) * in_height * in_width + h * in_width + w] = fmaxf(sum + bias[o], 0.0f);
+    }
+}
+
+extern "C" {
+
+void grouped_conv_relu_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    const float* input = va_arg(args, const float*);
+    int batch = va_arg(args, int);
+    int in_channels = va_arg(args, int);
+    int in_height = va_arg(args, int);
+    int in_width = va_arg(args, int);
+
+    const float* weight = va_arg(args, const float*);
+    int out_channels = va_arg(args, int);
+    int kernel_height = va_arg(args, int);
+    int kernel_width = va_arg(args, int);
+
+    const float* bias = va_arg(args, const float*);
+    int groups = va_arg(args, int);
+
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    // Define stride and padding (you can modify these as needed)
+    int stride_height = 1;
+    int stride_width = 1;
+    int padding_height = 1;
+    int padding_width = 1;
+
+    // Calculate output dimensions
+    int out_height = (in_height + 2 * padding_height - kernel_height) / stride_height + 1;
+    int out_width = (in_width + 2 * padding_width - kernel_width) / stride_width + 1;
+
+    // Allocate device memory
+    float *d_input, *d_weight, *d_bias, *d_output;
+    cudaMalloc(&d_input, batch * in_channels * in_height * in_width * sizeof(float));
+    cudaMalloc(&d_weight, out_channels * (in_channels / groups) * kernel_height * kernel_width * sizeof(float));
+    cudaMalloc(&d_bias, out_channels * sizeof(float));
+    cudaMalloc(&d_output, batch * out_channels * out_height * out_width * sizeof(float));
+
+    // Copy data to device
+    cudaMemcpy(d_input, input, batch * in_channels * in_height * in_width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, out_channels * (in_channels / groups) * kernel_height * kernel_width * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, out_channels * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 blockDim(16, 16, 1); // Thread block dimensions
+    dim3 gridDim((batch + blockDim.x - 1) / blockDim.x, (out_channels + blockDim.y - 1) / blockDim.y, (out_height + blockDim.z - 1) / blockDim.z); // Grid dimensions
+    grouped_conv2d_relu_kernel<<<gridDim, blockDim>>>(d_input, d_weight, d_bias, d_output,
+                                                  batch, in_channels, out_channels, groups,
+                                                  in_height, in_width, kernel_height, kernel_width,
+                                                  stride_height, stride_width, padding_height, padding_width);
+
+    // Copy output back to host
+    cudaMemcpy(output, d_output, batch * out_channels * out_height * out_width * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+}
+
+} // extern "C"

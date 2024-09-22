@@ -1,0 +1,99 @@
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function for softmax calculation
+__device__ float expf(float x) {
+    return __expf(x);
+}
+
+// CUDA kernel for attention-weighted average
+__global__ void attention_weighted_average_kernel(
+    const float* input_tensor,
+    const float* attention_weights,
+    float fading_in_factor,
+    half* output,
+    int batch_size,
+    int sequence_length,
+    int embedding_dim
+) {
+    int batch_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int embedding_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && embedding_idx < embedding_dim) {
+        float sum_exp = 0.0f;
+        float weighted_sum = 0.0f;
+        for (int i = 0; i < sequence_length; ++i) {
+            float attention_weight = attention_weights[batch_idx * sequence_length + i];
+            float exp_attention_weight = expf(attention_weight);
+            sum_exp += exp_attention_weight;
+            weighted_sum += input_tensor[batch_idx * sequence_length * embedding_dim + i * embedding_dim + embedding_idx] * exp_attention_weight;
+        }
+
+        weighted_sum /= sum_exp;
+        weighted_sum *= fading_in_factor;
+        output[batch_idx * embedding_dim + embedding_idx] = __float2half_rn(weighted_sum);
+    }
+}
+
+extern "C" {
+
+void attention_weighted_average(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensors
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    const float* attention_weights = va_arg(args, const float*);
+    int attention_weights_dim0 = va_arg(args, int);
+    int attention_weights_dim1 = va_arg(args, int);
+
+    float fading_in_factor = (float)va_arg(args, double); // Read as double, cast to float
+
+    // Extract output tensor
+    half* output = va_arg(args, half*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int sequence_length = input_tensor_dim1;
+    int embedding_dim = input_tensor_dim2;
+
+    // Allocate device memory
+    float *d_input, *d_attention_weights;
+    half *d_output;
+
+    cudaMalloc(&d_input, batch_size * sequence_length * embedding_dim * sizeof(float));
+    cudaMalloc(&d_attention_weights, batch_size * sequence_length * sizeof(float));
+    cudaMalloc(&d_output, batch_size * embedding_dim * sizeof(half));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * sequence_length * embedding_dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_attention_weights, attention_weights, batch_size * sequence_length * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((embedding_dim + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    attention_weighted_average_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_attention_weights, fading_in_factor, d_output,
+        batch_size, sequence_length, embedding_dim
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * embedding_dim * sizeof(half), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_attention_weights);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

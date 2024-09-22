@@ -1,0 +1,476 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CannyEdgeDetector3D(nn.Module):
+    def __init__(self, kernel_size=3, sigma=1.0, high_threshold=0.2, low_threshold=0.1):
+        super(CannyEdgeDetector3D, self).__init__()
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+        self.high_threshold = high_threshold
+        self.low_threshold = low_threshold
+
+    def forward(self, input_tensor):
+        # 1. Gaussian Blur
+        input_tensor = F.pad(input_tensor, (self.kernel_size // 2,)*6, mode='reflect')  # 3D padding
+        input_tensor = F.conv3d(input_tensor, self._gaussian_kernel_3d())
+
+        # 2. Gradient Calculation (Sobel)
+        gx = F.conv3d(input_tensor, self._sobel_kernel_3d('x'))
+        gy = F.conv3d(input_tensor, self._sobel_kernel_3d('y'))
+        gz = F.conv3d(input_tensor, self._sobel_kernel_3d('z'))
+
+        # 3. Gradient Magnitude and Direction
+        gradient_magnitude = torch.sqrt(gx**2 + gy**2 + gz**2)
+        gradient_direction = torch.atan2(gy, gx)  # Only considering x-y plane for direction
+
+        # 4. Non-Maximum Suppression
+        gradient_magnitude = F.pad(gradient_magnitude, (1,)*6, mode='constant', value=0)
+        nms_output = self._non_max_suppression_3d(gradient_magnitude, gradient_direction)
+
+        # 5. Double Thresholding and Hysteresis
+        strong_edges = nms_output > self.high_threshold
+        weak_edges = (nms_output > self.low_threshold) & (nms_output <= self.high_threshold)
+
+        # Connect weak edges to strong edges
+        connected_edges = self._hysteresis_thresholding(strong_edges, weak_edges)
+        
+        return connected_edges.to(torch.int8)
+
+    def _gaussian_kernel_3d(self):
+        # Create 3D Gaussian kernel
+        kernel_size = self.kernel_size
+        sigma = self.sigma
+        x = torch.arange(-kernel_size // 2, kernel_size // 2 + 1, dtype=torch.float32)
+        y = x
+        z = x
+        xv, yv, zv = torch.meshgrid(x, y, z)
+        gaussian_kernel = torch.exp(-(xv**2 + yv**2 + zv**2) / (2 * sigma**2))
+        gaussian_kernel /= gaussian_kernel.sum()
+        gaussian_kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size, kernel_size)
+        return gaussian_kernel.to(torch.float32)
+
+    def _sobel_kernel_3d(self, direction):
+        # Create Sobel kernel for x, y, or z direction
+        if direction == 'x':
+            kernel = torch.tensor([
+                [[-1, 0, 1],
+                 [-2, 0, 2],
+                 [-1, 0, 1]],
+                [[-1, 0, 1],
+                 [-2, 0, 2],
+                 [-1, 0, 1]],
+                [[-1, 0, 1],
+                 [-2, 0, 2],
+                 [-1, 0, 1]]
+            ], dtype=torch.float32)
+        elif direction == 'y':
+            kernel = torch.tensor([
+                [[-1, -2, -1],
+                 [0, 0, 0],
+                 [1, 2, 1]],
+                [[-1, -2, -1],
+                 [0, 0, 0],
+                 [1, 2, 1]],
+                [[-1, -2, -1],
+                 [0, 0, 0],
+                 [1, 2, 1]]
+            ], dtype=torch.float32)
+        elif direction == 'z':
+            kernel = torch.tensor([
+                [[-1, -1, -1],
+                 [-1, -1, -1],
+                 [-1, -1, -1]],
+                [[0, 0, 0],
+                 [0, 0, 0],
+                 [0, 0, 0]],
+                [[1, 1, 1],
+                 [1, 1, 1],
+                 [1, 1, 1]]
+            ], dtype=torch.float32)
+        else:
+            raise ValueError("Invalid direction. Choose 'x', 'y', or 'z'.")
+
+        kernel = kernel.view(1, 1, 3, 3, 3)
+        return kernel.to(torch.float32)
+
+    def _non_max_suppression_3d(self, gradient_magnitude, gradient_direction):
+        # Perform Non-Maximum Suppression in 3D
+        # This implementation focuses on a simplified version for demonstration
+        # More robust methods exist, but are more complex.
+        
+        # Convert gradient direction to angles
+        gradient_direction = gradient_direction * 180 / torch.pi
+        gradient_direction = gradient_direction.to(torch.int8)
+        
+        # Define possible gradient directions (8 directions)
+        directions = [(-1, -1, -1), (-1, -1, 0), (-1, -1, 1),
+                     (-1, 0, -1), (-1, 0, 1), (-1, 1, -1),
+                     (-1, 1, 0), (-1, 1, 1)]
+
+        # Non-maximum suppression
+        nms_output = torch.zeros_like(gradient_magnitude)
+        for i in range(1, gradient_magnitude.shape[1]-1):
+            for j in range(1, gradient_magnitude.shape[2]-1):
+                for k in range(1, gradient_magnitude.shape[3]-1):
+                    for dx, dy, dz in directions:
+                        if gradient_magnitude[0, i, j, k] <= gradient_magnitude[0, i+dx, j+dy, k+dz]:
+                            nms_output[0, i, j, k] = 0
+                            break  # If any neighbor is stronger, suppress current pixel
+                        else:
+                            nms_output[0, i, j, k] = gradient_magnitude[0, i, j, k]
+        return nms_output
+
+    def _hysteresis_thresholding(self, strong_edges, weak_edges):
+        # Simple 3D hysteresis thresholding
+        # More efficient algorithms exist for connecting weak edges
+        connected_edges = strong_edges.clone()
+        for i in range(1, strong_edges.shape[1]-1):
+            for j in range(1, strong_edges.shape[2]-1):
+                for k in range(1, strong_edges.shape[3]-1):
+                    if weak_edges[0, i, j, k] and any(strong_edges[0, i+dx, j+dy, k+dz] for dx, dy, dz in [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)]):
+                        connected_edges[0, i, j, k] = 1
+        return connected_edges
+
+
+function_signature = {
+    "name": "canny_edge_detector_3d",
+    "inputs": [
+        ((10, 10, 10), torch.float32),
+    ],
+    "outputs": [
+        ((10, 10, 10), torch.int8),
+    ]
+}
+```
+
+```c++
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math_functions.h>
+#include <stdarg.h>
+
+#define BLOCK_SIZE 16
+
+__global__ void gaussian_blur_3d_kernel(const float* input, float* output, int batch_size, 
+                                      int depth, int height, int width, int kernel_size, float sigma) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    int idz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (idx < width && idy < height && idz < depth) {
+        float sum = 0.0f;
+        int kernel_half = kernel_size / 2;
+
+        for (int kx = -kernel_half; kx <= kernel_half; kx++) {
+            for (int ky = -kernel_half; ky <= kernel_half; ky++) {
+                for (int kz = -kernel_half; kz <= kernel_half; kz++) {
+                    int x = idx + kx;
+                    int y = idy + ky;
+                    int z = idz + kz;
+
+                    if (x >= 0 && x < width && y >= 0 && y < height && z >= 0 && z < depth) {
+                        float kernel_value = exp(-(kx * kx + ky * ky + kz * kz) / (2 * sigma * sigma));
+                        sum += input[idz * width * height + idy * width + idx + kx + ky * width + kz * width * height] * kernel_value;
+                    }
+                }
+            }
+        }
+        output[idz * width * height + idy * width + idx] = sum;
+    }
+}
+
+__global__ void sobel_kernel_3d(const float* input, float* output, int batch_size, 
+                               int depth, int height, int width, int kernel_size, int direction) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    int idz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (idx < width && idy < height && idz < depth) {
+        float sum = 0.0f;
+        int kernel_half = kernel_size / 2;
+
+        for (int kx = -kernel_half; kx <= kernel_half; kx++) {
+            for (int ky = -kernel_half; ky <= kernel_half; ky++) {
+                for (int kz = -kernel_half; kz <= kernel_half; kz++) {
+                    int x = idx + kx;
+                    int y = idy + ky;
+                    int z = idz + kz;
+
+                    if (x >= 0 && x < width && y >= 0 && y < height && z >= 0 && z < depth) {
+                        // Sobel kernel for x-direction (replace with other directions if needed)
+                        if (direction == 0) { // X
+                            if (kx == -1 && ky == -1 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == -1 && kz == 0) sum -= 2 * input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == -1 && kz == 1) sum -= input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 0 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 0 && kz == 1) sum -= input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 1 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 1 && kz == 0) sum -= 2 * input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 1 && kz == 1) sum -= input[z * width * height + y * width + x];
+
+                            if (kx == 1 && ky == -1 && kz == -1) sum += input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == -1 && kz == 0) sum += 2 * input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == -1 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 0 && kz == -1) sum += input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 0 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 1 && kz == -1) sum += input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 1 && kz == 0) sum += 2 * input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 1 && kz == 1) sum += input[z * width * height + y * width + x];
+                        } else if (direction == 1) { // Y
+                            if (kx == -1 && ky == -1 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == 0 && ky == -1 && kz == -1) sum -= 2 * input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == -1 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == -1 && kz == 0) sum -= input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == -1 && kz == 0) sum -= input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == -1 && kz == 1) sum -= input[z * width * height + y * width + x];
+                            if (kx == 0 && ky == -1 && kz == 1) sum -= 2 * input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == -1 && kz == 1) sum -= input[z * width * height + y * width + x];
+
+                            if (kx == -1 && ky == 1 && kz == -1) sum += input[z * width * height + y * width + x];
+                            if (kx == 0 && ky == 1 && kz == -1) sum += 2 * input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 1 && kz == -1) sum += input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 1 && kz == 0) sum += input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 1 && kz == 0) sum += input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 1 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == 0 && ky == 1 && kz == 1) sum += 2 * input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 1 && kz == 1) sum += input[z * width * height + y * width + x];
+                        } else if (direction == 2) { // Z
+                            if (kx == -1 && ky == -1 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 0 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 1 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == 0 && ky == -1 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == 0 && ky == 1 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == -1 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 0 && kz == -1) sum -= input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 1 && kz == -1) sum -= input[z * width * height + y * width + x];
+
+                            if (kx == -1 && ky == -1 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 0 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == -1 && ky == 1 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == 0 && ky == -1 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == 0 && ky == 1 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == -1 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 0 && kz == 1) sum += input[z * width * height + y * width + x];
+                            if (kx == 1 && ky == 1 && kz == 1) sum += input[z * width * height + y * width + x];
+                        }
+                    }
+                }
+            }
+        }
+        output[idz * width * height + idy * width + idx] = sum;
+    }
+}
+
+__global__ void gradient_magnitude_3d_kernel(const float* gx, const float* gy, const float* gz, 
+                                               float* gradient_magnitude, int batch_size, int depth, int height, int width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    int idz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (idx < width && idy < height && idz < depth) {
+        float gx_val = gx[idz * width * height + idy * width + idx];
+        float gy_val = gy[idz * width * height + idy * width + idx];
+        float gz_val = gz[idz * width * height + idy * width + idx];
+
+        gradient_magnitude[idz * width * height + idy * width + idx] = sqrtf(gx_val * gx_val + gy_val * gy_val + gz_val * gz_val);
+    }
+}
+
+__global__ void non_max_suppression_3d_kernel(const float* gradient_magnitude, const int* gradient_direction, 
+                                               char* nms_output, int batch_size, int depth, int height, int width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    int idz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (idx < width && idy < height && idz < depth) {
+        float current_magnitude = gradient_magnitude[idz * width * height + idy * width + idx];
+        int current_direction = gradient_direction[idz * width * height + idy * width + idx];
+
+        // Check neighbors based on gradient direction
+        if (current_direction == 0) { // 0 degrees
+            if (current_magnitude <= gradient_magnitude[idz * width * height + idy * width + idx + 1] ||
+                current_magnitude <= gradient_magnitude[idz * width * height + (idy + 1) * width + idx]) {
+                nms_output[idz * width * height + idy * width + idx] = 0;
+                return;
+            }
+        } else if (current_direction == 1) { // 45 degrees
+            if (current_magnitude <= gradient_magnitude[idz * width * height + (idy + 1) * width + idx + 1] ||
+                current_magnitude <= gradient_magnitude[idz * width * height + idy * width + idx + 1]) {
+                nms_output[idz * width * height + idy * width + idx] = 0;
+                return;
+            }
+        } else if (current_direction == 2) { // 90 degrees
+            if (current_magnitude <= gradient_magnitude[idz * width * height + (idy + 1) * width + idx] ||
+                current_magnitude <= gradient_magnitude[idz * width * height + idy * width + idx - 1]) {
+                nms_output[idz * width * height + idy * width + idx] = 0;
+                return;
+            }
+        } else if (current_direction == 3) { // 135 degrees
+            if (current_magnitude <= gradient_magnitude[idz * width * height + (idy + 1) * width + idx - 1] ||
+                current_magnitude <= gradient_magnitude[idz * width * height + idy * width + idx - 1]) {
+                nms_output[idz * width * height + idy * width + idx] = 0;
+                return;
+            }
+        } else if (current_direction == 4) { // 180 degrees
+            if (current_magnitude <= gradient_magnitude[idz * width * height + idy * width + idx - 1] ||
+                current_magnitude <= gradient_magnitude[idz * width * height + (idy - 1) * width + idx]) {
+                nms_output[idz * width * height + idy * width + idx] = 0;
+                return;
+            }
+        } else if (current_direction == 5) { // 225 degrees
+            if (current_magnitude <= gradient_magnitude[idz * width * height + (idy - 1) * width + idx - 1] ||
+                current_magnitude <= gradient_magnitude[idz * width * height + idy * width + idx - 1]) {
+                nms_output[idz * width * height + idy * width + idx] = 0;
+                return;
+            }
+        } else if (current_direction == 6) { // 270 degrees
+            if (current_magnitude <= gradient_magnitude[idz * width * height + (idy - 1) * width + idx] ||
+                current_magnitude <= gradient_magnitude[idz * width * height + idy * width + idx + 1]) {
+                nms_output[idz * width * height + idy * width + idx] = 0;
+                return;
+            }
+        } else if (current_direction == 7) { // 315 degrees
+            if (current_magnitude <= gradient_magnitude[idz * width * height + (idy - 1) * width + idx + 1] ||
+                current_magnitude <= gradient_magnitude[idz * width * height + idy * width + idx + 1]) {
+                nms_output[idz * width * height + idy * width + idx] = 0;
+                return;
+            }
+        }
+
+        // Suppress if no stronger neighbor found
+        nms_output[idz * width * height + idy * width + idx] = 1;
+    }
+}
+
+__global__ void hysteresis_thresholding_3d_kernel(const char* strong_edges, const char* weak_edges,
+                                                   char* connected_edges, int batch_size, int depth, int height, int width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    int idz = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (idx < width && idy < height && idz < depth) {
+        if (weak_edges[idz * width * height + idy * width + idx] &&
+            (strong_edges[idz * width * height + idy * width + idx + 1] || 
+             strong_edges[idz * width * height + (idy + 1) * width + idx] || 
+             strong_edges[idz * width * height + (idy - 1) * width + idx] ||
+             strong_edges[idz * width * height + idy * width + idx - 1] ||
+             strong_edges[(idz + 1) * width * height + idy * width + idx] ||
+             strong_edges[(idz - 1) * width * height + idy * width + idx])) {
+            connected_edges[idz * width * height + idy * width + idx] = 1;
+        } else {
+            connected_edges[idz * width * height + idy * width + idx] = strong_edges[idz * width * height + idy * width + idx];
+        }
+    }
+}
+
+extern "C" {
+
+void canny_edge_detector_3d(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int batch_size = va_arg(args, int);
+    int depth = va_arg(args, int);
+    int height = va_arg(args, int);
+    int width = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    char* output = va_arg(args, char*);
+
+    va_end(args);
+
+    // Allocate device memory
+    float *d_input, *d_gx, *d_gy, *d_gz, *d_gradient_magnitude;
+    char *d_nms_output, *d_connected_edges;
+    int *d_gradient_direction; 
+    cudaMalloc(&d_input, batch_size * depth * height * width * sizeof(float));
+    cudaMalloc(&d_gx, batch_size * depth * height * width * sizeof(float));
+    cudaMalloc(&d_gy, batch_size * depth * height * width * sizeof(float));
+    cudaMalloc(&d_gz, batch_size * depth * height * width * sizeof(float));
+    cudaMalloc(&d_gradient_magnitude, batch_size * depth * height * width * sizeof(float));
+    cudaMalloc(&d_gradient_direction, batch_size * depth * height * width * sizeof(int));
+    cudaMalloc(&d_nms_output, batch_size * depth * height * width * sizeof(char));
+    cudaMalloc(&d_connected_edges, batch_size * depth * height * width * sizeof(char));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * depth * height * width * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Gaussian Blur
+    dim3 blur_threads(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+    dim3 blur_blocks((width + blur_threads.x - 1) / blur_threads.x, 
+                    (height + blur_threads.y - 1) / blur_threads.y, 
+                    (depth + blur_threads.z - 1) / blur_threads.z);
+    gaussian_blur_3d_kernel<<<blur_blocks, blur_threads>>>(d_input, d_input, batch_size, depth, height, width, 3, 1.0f); // 3x3 kernel, sigma 1.0
+
+    // Gradient Calculation (Sobel)
+    dim3 sobel_threads(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+    dim3 sobel_blocks((width + sobel_threads.x - 1) / sobel_threads.x, 
+                    (height + sobel_threads.y - 1) / sobel_threads.y, 
+                    (depth + sobel_threads.z - 1) / sobel_threads.z);
+    sobel_kernel_3d<<<sobel_blocks, sobel_threads>>>(d_input, d_gx, batch_size, depth, height, width, 3, 0); // X direction
+    sobel_kernel_3d<<<sobel_blocks, sobel_threads>>>(d_input, d_gy, batch_size, depth, height, width, 3, 1); // Y direction
+    sobel_kernel_3d<<<sobel_blocks, sobel_threads>>>(d_input, d_gz, batch_size, depth, height, width, 3, 2); // Z direction
+
+    // Gradient Magnitude
+    dim3 grad_mag_threads(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grad_mag_blocks((width + grad_mag_threads.x - 1) / grad_mag_threads.x, 
+                        (height + grad_mag_threads.y - 1) / grad_mag_threads.y, 
+                        (depth + grad_mag_threads.z - 1) / grad_mag_threads.z);
+    gradient_magnitude_3d_kernel<<<grad_mag_blocks, grad_mag_threads>>>(d_gx, d_gy, d_gz, d_gradient_magnitude, batch_size, depth, height, width);
+
+    // Gradient Direction
+    // Simplified direction calculation (only using x-y plane)
+    dim3 dir_threads(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+    dim3 dir_blocks((width + dir_threads.x - 1) / dir_threads.x, 
+                    (height + dir_threads.y - 1) / dir_threads.y, 
+                    (depth + dir_threads.z - 1) / dir_threads.z);
+    for (int i = 0; i < batch_size * depth * height * width; i++) {
+        float gx_val = d_gx[i];
+        float gy_val = d_gy[i];
+        if (gx_val == 0.0f && gy_val == 0.0f) {
+            d_gradient_direction[i] = 0;
+        } else {
+            float angle = atan2f(gy_val, gx_val) * 180.0f / M_PI;
+            if (angle >= 0 && angle < 22.5) d_gradient_direction[i] = 0;
+            else if (angle >= 22.5 && angle < 67.5) d_gradient_direction[i] = 1;
+            else if (angle >= 67.5 && angle < 112.5) d_gradient_direction[i] = 2;
+            else if (angle >= 112.5 && angle < 157.5) d_gradient_direction[i] = 3;
+            else if (angle >= 157.5 && angle < 202.5) d_gradient_direction[i] = 4;
+            else if (angle >= 202.5 && angle < 247.5) d_gradient_direction[i] = 5;
+            else if (angle >= 247.5 && angle < 292.5) d_gradient_direction[i] = 6;
+            else if (angle >= 292.5 && angle < 337.5) d_gradient_direction[i] = 7;
+            else d_gradient_direction[i] = 0;
+        }
+    }
+
+    // Non-Maximum Suppression
+    dim3 nms_threads(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+    dim3 nms_blocks((width + nms_threads.x - 1) / nms_threads.x, 
+                    (height + nms_threads.y - 1) / nms_threads.y, 
+                    (depth + nms_threads.z - 1) / nms_threads.z);
+    non_max_suppression_3d_kernel<<<nms_blocks, nms_threads>>>(d_gradient_magnitude, d_gradient_direction, d_nms_output, batch_size, depth, height, width);
+
+    // Hysteresis Thresholding
+    dim3 hysteresis_threads(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+    dim3 hysteresis_blocks((width + hysteresis_threads.x - 1) / hysteresis_threads.x, 
+                        (height + hysteresis_threads.y - 1) / hysteresis_threads.y, 
+                        (depth + hysteresis_threads.z - 1) / hysteresis_threads.z);
+    hysteresis_thresholding_3d_kernel<<<hysteresis_blocks, hysteresis_threads>>>(d_nms_output, d_nms_output, d_connected_edges, batch_size, depth, height, width); // Using d_nms_output as both strong and weak edges here (for simplicity)
+
+    // Copy result back to host
+    cudaMemcpy(output, d_connected_edges, batch_size * depth * height * width * sizeof(char), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_gx);
+    cudaFree(d_gy);
+    cudaFree(d_gz);
+    cudaFree(d_gradient_magnitude);
+    cudaFree(d_gradient_direction);
+    cuda

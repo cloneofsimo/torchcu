@@ -1,0 +1,92 @@
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>
+
+// Helper function to convert float to half
+__device__ __forceinline__ half float_to_half(float f) {
+    return __float2half_rn(f);
+}
+
+// Helper function to convert half to float
+__device__ __forceinline__ float half_to_float(half h) {
+    return __half2float(h);
+}
+
+// CUDA kernel for einsum-based inner product with broadcasting and int8 output
+__global__ void einsum_inner_product_int8_kernel(const float* input_tensor, const float* weight, int8_t* output,
+                                                int batch_size, int input_dim1, int input_dim2, int weight_dim1) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if (i < batch_size && j < input_dim1 && k < weight_dim1) {
+        float sum = 0.0f;
+        for (int l = 0; l < input_dim2; ++l) {
+            half a = float_to_half(input_tensor[i * input_dim1 * input_dim2 + j * input_dim2 + l]);
+            half b = float_to_half(weight[l * weight_dim1 + k]);
+            sum += half_to_float(__hmul(a, b));
+        }
+        output[i * input_dim1 * weight_dim1 + j * weight_dim1 + k] = __int_as_char(sum);
+    }
+}
+
+extern "C" {
+
+void einsum_inner_product_int8(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+    int input_tensor_dim2 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    int8_t* output = va_arg(args, int8_t*);
+
+    va_end(args);
+
+    int batch_size = input_tensor_dim0;
+    int input_dim1 = input_tensor_dim1;
+    int input_dim2 = input_tensor_dim2;
+    int weight_dim1 = weight_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_weight;
+    int8_t *d_output;
+    cudaMalloc(&d_input, batch_size * input_dim1 * input_dim2 * sizeof(float));
+    cudaMalloc(&d_weight, weight_dim0 * weight_dim1 * sizeof(float));
+    cudaMalloc(&d_output, batch_size * input_dim1 * weight_dim1 * sizeof(int8_t));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, batch_size * input_dim1 * input_dim2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, weight_dim0 * weight_dim1 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    dim3 threadsPerBlock(8, 8, 8);
+    dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (input_dim1 + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                   (weight_dim1 + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+    einsum_inner_product_int8_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_output, batch_size, input_dim1, input_dim2, weight_dim1
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, batch_size * input_dim1 * weight_dim1 * sizeof(int8_t), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

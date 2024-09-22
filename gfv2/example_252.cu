@@ -1,0 +1,147 @@
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <complex>
+#include <stdarg.h>
+
+// Define the complex type used for FFT
+typedef std::complex<float> complex_float;
+
+// Helper function to convert float to __nv_bfloat16
+__device__ __forceinline__ __nv_bfloat16 float_to_bfloat16(float f) {
+    return __float2bfloat16(f);
+}
+
+// Helper function to convert __nv_bfloat16 to float
+__device__ __forceinline__ float bfloat16_to_float(__nv_bfloat16 bf) {
+    return __bfloat162float(bf);
+}
+
+// CUDA kernel for instance normalization
+__global__ void instance_norm_kernel(const float* input, float* output, int batch_size, int feature_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < feature_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum += input[row * feature_size + i];
+        }
+        float mean = sum / feature_size;
+
+        float sum_sq = 0.0f;
+        for (int i = 0; i < feature_size; ++i) {
+            sum_sq += (input[row * feature_size + i] - mean) * (input[row * feature_size + i] - mean);
+        }
+        float std = sqrt(sum_sq / feature_size);
+
+        output[row * feature_size + col] = (input[row * feature_size + col] - mean) / (std + 1e-5f);
+    }
+}
+
+// CUDA kernel for convolution with FFT using bfloat16
+__global__ void conv1d_fft_bf16_kernel(const float* input, const float* weight, const float* bias, float* output,
+                                        int batch_size, int input_size, int kernel_size, int output_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < output_size) {
+        complex_float sum = 0.0f;
+        for (int i = 0; i < kernel_size; ++i) {
+            __nv_bfloat16 a = float_to_bfloat16(input[row * input_size + i]);
+            __nv_bfloat16 b = float_to_bfloat16(weight[i * output_size + col]);
+            sum += bfloat16_to_float(__hmul(a, b));
+        }
+        output[row * output_size + col] = bfloat16_to_float(__hmul(float_to_bfloat16(sum.real()), float_to_bfloat16(bias[col])));
+    }
+}
+
+// CUDA kernel for sigmoid activation
+__global__ void sigmoid_kernel(float* data, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        data[idx] = 1.0f / (1.0f + expf(-data[idx]));
+    }
+}
+
+extern "C" {
+
+void conv1d_instance_norm_sigmoid_bf16(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input = va_arg(args, const float*);
+    int input_dim0 = va_arg(args, int);
+    int input_dim1 = va_arg(args, int);
+
+    // Extract weight tensor
+    const float* weight = va_arg(args, const float*);
+    int weight_dim0 = va_arg(args, int);
+    int weight_dim1 = va_arg(args, int);
+
+    // Extract bias tensor
+    const float* bias = va_arg(args, const float*);
+    int bias_dim = va_arg(args, int);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int batch_size = input_dim0;
+    int input_size = input_dim1;
+    int kernel_size = weight_dim0;
+    int output_size = weight_dim1;
+
+    // Allocate device memory
+    float* d_input, *d_weight, *d_bias, *d_output, *d_normalized_output;
+    cudaMalloc(&d_input, batch_size * input_size * sizeof(float));
+    cudaMalloc(&d_weight, kernel_size * output_size * sizeof(float));
+    cudaMalloc(&d_bias, output_size * sizeof(float));
+    cudaMalloc(&d_output, batch_size * output_size * sizeof(float));
+    cudaMalloc(&d_normalized_output, batch_size * output_size * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input, batch_size * input_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight, weight, kernel_size * output_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, bias, output_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Perform convolution using FFT
+    dim3 threadsPerBlock(32, 1);
+    dim3 numBlocks((output_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    conv1d_fft_bf16_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_weight, d_bias, d_output, batch_size, input_size, kernel_size, output_size
+    );
+
+    // Perform instance normalization
+    threadsPerBlock = dim3(32, 1);
+    numBlocks = dim3((output_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    instance_norm_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_output, d_normalized_output, batch_size, output_size
+    );
+
+    // Perform sigmoid activation
+    threadsPerBlock = dim3(256, 1);
+    numBlocks = dim3((batch_size * output_size + threadsPerBlock.x - 1) / threadsPerBlock.x, 1);
+    sigmoid_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_normalized_output, batch_size * output_size
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_normalized_output, batch_size * output_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_weight);
+    cudaFree(d_bias);
+    cudaFree(d_output);
+    cudaFree(d_normalized_output);
+}
+
+} // extern "C"

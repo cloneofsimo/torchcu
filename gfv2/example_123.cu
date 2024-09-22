@@ -1,0 +1,71 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <stdarg.h>  // Add this for va_list, va_start, va_end
+
+// CUDA kernel for softshrink activation function
+__global__ void softshrink_kernel(const float* input_tensor, const float* threshold, float* output, 
+                                  int num_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < num_elements) {
+        float value = input_tensor[idx];
+        float thresh = *threshold;  // Access threshold from shared memory
+
+        if (fabsf(value) > thresh) {
+            output[idx] = value - copysignf(thresh, value);
+        } else {
+            output[idx] = 0.0f;
+        }
+    }
+}
+
+extern "C" {
+
+void softshrink_fp32_function(int num_args, ...) {
+    va_list args;
+    va_start(args, num_args);
+
+    // Extract input tensor
+    const float* input_tensor = va_arg(args, const float*);
+    int input_tensor_dim0 = va_arg(args, int);
+    int input_tensor_dim1 = va_arg(args, int);
+
+    // Extract threshold value
+    const float* threshold = va_arg(args, const float*);
+
+    // Extract output tensor (assuming it's preallocated)
+    float* output = va_arg(args, float*);
+
+    va_end(args);
+
+    int num_elements = input_tensor_dim0 * input_tensor_dim1;
+
+    // Allocate device memory
+    float *d_input, *d_threshold, *d_output;
+    cudaMalloc(&d_input, num_elements * sizeof(float));
+    cudaMalloc(&d_threshold, sizeof(float));
+    cudaMalloc(&d_output, num_elements * sizeof(float));
+
+    // Copy input data to device
+    cudaMemcpy(d_input, input_tensor, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_threshold, threshold, sizeof(float), cudaMemcpyHostToDevice);
+
+    // Launch kernel
+    int threadsPerBlock = 256;
+    int numBlocks = (num_elements + threadsPerBlock - 1) / threadsPerBlock;
+
+    softshrink_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_input, d_threshold, d_output, num_elements
+    );
+
+    // Copy result back to host
+    cudaMemcpy(output, d_output, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Free device memory
+    cudaFree(d_input);
+    cudaFree(d_threshold);
+    cudaFree(d_output);
+}
+
+}  // extern "C"

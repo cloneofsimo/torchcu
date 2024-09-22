@@ -1,0 +1,75 @@
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+
+// CUDA kernel for element-wise power and adaptive max pooling 2D
+__global__ void power_adaptive_max_pool_kernel(const float* input, float* output, 
+                                             int batch_size, int channels, int input_height, int input_width,
+                                             float exponent, int output_size) {
+
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < batch_size && c < channels && h < output_size) {
+        float max_val = -FLT_MAX; 
+        for (int i = h * input_height / output_size; i < (h + 1) * input_height / output_size; ++i) {
+            for (int j = 0; j < input_width; ++j) {
+                int index = b * channels * input_height * input_width + c * input_height * input_width + i * input_width + j;
+                float val = input[index];
+                val = powf(val, exponent);  // Element-wise power operation
+                max_val = fmaxf(max_val, val); 
+            }
+        }
+        output[b * channels * output_size * output_size + c * output_size * output_size + h * output_size] = max_val;
+    }
+}
+
+extern "C" {
+    void power_adaptive_max_pool(int num_args, ...) {
+        va_list args;
+        va_start(args, num_args);
+
+        const float* input = va_arg(args, const float*);
+        int input_dim0 = va_arg(args, int);
+        int input_dim1 = va_arg(args, int);
+        int input_dim2 = va_arg(args, int);
+        int input_dim3 = va_arg(args, int);
+        float exponent = va_arg(args, float);
+        int output_size = va_arg(args, int);
+
+        float* output = va_arg(args, float*);
+
+        va_end(args);
+
+        int batch_size = input_dim0;
+        int channels = input_dim1;
+        int input_height = input_dim2;
+        int input_width = input_dim3;
+
+        // Allocate device memory
+        float *d_input, *d_output;
+        cudaMalloc(&d_input, batch_size * channels * input_height * input_width * sizeof(float));
+        cudaMalloc(&d_output, batch_size * channels * output_size * output_size * sizeof(float));
+
+        // Copy input data to device
+        cudaMemcpy(d_input, input, batch_size * channels * input_height * input_width * sizeof(float), cudaMemcpyHostToDevice);
+
+        // Launch kernel
+        dim3 threadsPerBlock(16, 16, 1);
+        dim3 numBlocks((output_size + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                       (channels + threadsPerBlock.y - 1) / threadsPerBlock.y,
+                       (batch_size + threadsPerBlock.z - 1) / threadsPerBlock.z);
+
+        power_adaptive_max_pool_kernel<<<numBlocks, threadsPerBlock>>>(
+            d_input, d_output, batch_size, channels, input_height, input_width, exponent, output_size
+        );
+
+        // Copy result back to host
+        cudaMemcpy(output, d_output, batch_size * channels * output_size * output_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Free device memory
+        cudaFree(d_input);
+        cudaFree(d_output);
+    }
+}
