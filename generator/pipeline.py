@@ -35,10 +35,10 @@ class GeneratorPipeline:
         generate_signature(filepath)
 
     def run_pytorch_file(self, filepath: str) -> torch.Tensor | tuple[torch.Tensor]:
-        function_name, signature = load_function_signature(filepath)
+        function_name, inputs_signature, _ = load_function_signature(filepath)
         pytorch_func = load_pytorch_function(filepath, function_name)
 
-        inputs = prepare_inputs(signature)
+        inputs = prepare_inputs(inputs_signature)
         output = run_pytorch_function(pytorch_func, inputs)
 
         return output
